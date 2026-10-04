@@ -1127,6 +1127,18 @@ impl InboundBuilder {
             ..
         } = self;
         crate::trace::probe("inbound fwd-transpose: after struct destructure (before any drop)");
+        // Diagnostic (HPROF_DBG_GRAPH=1): same two tables, printed on the
+        // (correct) transpose path so the rescan path's print can be compared
+        // against it.
+        if std::env::var_os("HPROF_DBG_GRAPH").is_some() {
+            eprintln!(
+                "[dbg] fwd-transpose tables: class_addr_to_hist={} field_plans_dense={} n={} total_inb={}",
+                class_addr_to_hist.len(),
+                field_plans_dense.len(),
+                n,
+                total_inb
+            );
+        }
 
         drop(id_map);
         crate::trace::probe("inbound fwd-transpose: after drop(id_map)");
@@ -1357,7 +1369,7 @@ impl InboundBuilder {
     /// Phase 4: translate node indices to pre-order numbers via `dfn`, sort,
     /// dedup, and delta-encode into the blocked inbound CSR. Shared by both
     /// the file-scan path (`build`) and the fwd-transpose path (`build_from_fwd`).
-    fn encode_phase4(
+    pub(crate) fn encode_phase4(
         n: usize,
         total_inb: u64,
         in_cursors: Vec<u32>,
@@ -1560,6 +1572,19 @@ impl InboundBuilder {
 
         let mut inb_flat = crate::chunkvec::ChunkU32::zeroed(total_inb as usize);
         t_inb!("inb_flat alloc done");
+        // Diagnostic (HPROF_DBG_GRAPH=1): the two lookup tables the
+        // instance-field branch depends on. If they are empty or
+        // index-mismatched here (but not in the fwd path), every field edge is
+        // silently skipped by `if let Some(..)`.
+        if std::env::var_os("HPROF_DBG_GRAPH").is_some() {
+            eprintln!(
+                "[dbg] rescan tables: class_addr_to_hist={} field_plans_dense={} n={} total_inb={}",
+                class_addr_to_hist.len(),
+                field_plans_dense.len(),
+                n,
+                total_inb
+            );
+        }
         if crate::trace::enabled() {
             eprintln!(
                 "[trace-rss] inbound mat-scan: total_inb={} edges, inb_flat={} MB",

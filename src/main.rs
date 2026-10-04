@@ -621,6 +621,40 @@ enum CompareCmd {
 enum DevCmd {
     /// Print the JSON Schema of the report model
     EmitSchema,
+    /// Re-run ONLY the dominator stage from a checkpoint directory written by
+    /// `HPROF_CKPT_SAVE=<dir>`, so the stage can be iterated in seconds rather
+    /// than re-running the whole pipeline. Set `HPROF_DBG_GRAPH=1` for the
+    /// dominator diagnostics.
+    DomCkpt {
+        #[arg(value_hint = ValueHint::DirPath)]
+        dir: String,
+    },
+    /// Rebuild the inbound CSR inside a checkpoint from its SAVED forward CSR
+    /// (the transpose path — the same edges `build_from_fwd` produces), so the
+    /// dominator can be re-run without re-reading the dump. The previous
+    /// `inb_data.bin` is kept as `inb_data.orig.bin`.
+    CkptRebuildInbound {
+        #[arg(value_hint = ValueHint::DirPath)]
+        dir: String,
+    },
+    /// Cross-check the stages of an `HPROF_CKPT_SAVE` directory against each
+    /// other: 2a degree counts vs the forward CSR's true in-degrees, the
+    /// prefix-summed cursors vs those counts, and the encoded inbound lists vs
+    /// both. Localises which stage of the inbound-CSR construction diverges.
+    CkptDiff {
+        #[arg(value_hint = ValueHint::DirPath)]
+        dir: String,
+    },
+    /// Compare the encoded inbound CSRs of two `HPROF_CKPT_SAVE` directories
+    /// node by node. With one dump analysed through both inbound paths (the
+    /// fwd-transpose path and the forced rescan path), the difference set is
+    /// exactly what the rescan path loses.
+    CkptCmp {
+        #[arg(value_hint = ValueHint::DirPath)]
+        a: String,
+        #[arg(value_hint = ValueHint::DirPath)]
+        b: String,
+    },
     /// Aggregate per-dump *.diff.json files into a gate report (exit 2 on gate-fail)
     SweepAggregate {
         #[arg(value_hint = ValueHint::DirPath)]
@@ -1011,6 +1045,26 @@ fn main() {
                 match serde_json::to_string_pretty(&schema) {
                     Ok(js) => println!("{js}"),
                     Err(e) => fail(e),
+                }
+            }
+            DevCmd::DomCkpt { dir } => {
+                if let Err(e) = run_dom_ckpt(&dir) {
+                    fail(e);
+                }
+            }
+            DevCmd::CkptDiff { dir } => {
+                if let Err(e) = run_ckpt_diff(&dir) {
+                    fail(e);
+                }
+            }
+            DevCmd::CkptRebuildInbound { dir } => {
+                if let Err(e) = run_ckpt_rebuild(&dir) {
+                    fail(e);
+                }
+            }
+            DevCmd::CkptCmp { a, b } => {
+                if let Err(e) = run_ckpt_cmp(&a, &b) {
+                    fail(e);
                 }
             }
             DevCmd::SweepAggregate { dir } => match sweep::run_aggregate(&dir) {
@@ -2282,6 +2336,576 @@ fn rss_mb() -> f64 {
     0.0
 }
 
+// ── Dominator checkpoint helpers (HPROF_CKPT_SAVE / dev dom-ckpt) ──────────
+
+fn write_u32s(p: &std::path::Path, v: &[u32]) -> std::io::Result<()> {
+    let mut b = Vec::with_capacity(v.len() * 4);
+    for &x in v {
+        b.extend_from_slice(&x.to_le_bytes());
+    }
+    std::fs::write(p, b)
+}
+
+fn write_u8s(p: &std::path::Path, v: &[u8]) -> std::io::Result<()> {
+    std::fs::write(p, v)
+}
+
+fn write_u64s(p: &std::path::Path, v: &[u64]) -> std::io::Result<()> {
+    let mut b = Vec::with_capacity(v.len() * 8);
+    for &x in v {
+        b.extend_from_slice(&x.to_le_bytes());
+    }
+    std::fs::write(p, b)
+}
+
+fn read_u32s(p: &std::path::Path) -> std::io::Result<Vec<u32>> {
+    let b = std::fs::read(p)?;
+    Ok(b.chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
+
+fn read_u64s(p: &std::path::Path) -> std::io::Result<Vec<u64>> {
+    let b = std::fs::read(p)?;
+    Ok(b.chunks_exact(8)
+        .map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+        .collect())
+}
+
+/// Re-run only the dominator stage from a checkpoint written by `HPROF_CKPT_SAVE`.
+fn run_dom_ckpt(dir: &str) -> std::io::Result<()> {
+    let d = std::path::Path::new(dir);
+    let n: usize = std::fs::read_to_string(d.join("meta.txt"))?
+        .trim()
+        .parse()
+        .map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("meta.txt: {e}"))
+        })?;
+    let t = std::time::Instant::now();
+    let parent_pre = read_u32s(&d.join("parent_pre.bin"))?;
+    let dfn = read_u32s(&d.join("dfn.bin"))?;
+    let vertex = read_u32s(&d.join("vertex.bin"))?;
+    let roots = read_u32s(&d.join("roots.bin"))?;
+    let inb_block_off = read_u64s(&d.join("inb_block_off.bin"))?;
+    let inb_data = std::fs::read(d.join("inb_data.bin"))?;
+    eprintln!(
+        "[ckpt] loaded n={} count={} roots={} inb_block_off={} inb_data={}B in {:.1}s",
+        n,
+        parent_pre.len(),
+        roots.len(),
+        inb_block_off.len(),
+        inb_data.len(),
+        t.elapsed().as_secs_f64()
+    );
+    let rpo = crate::rpo_dfs::RpoResult {
+        parent_pre,
+        dfn,
+        vertex,
+    };
+    let t = std::time::Instant::now();
+    let idom = crate::dominator::compute_dominators(n, rpo, &roots, &inb_block_off, &inb_data)?;
+    let vroot = n as u32;
+    let nv = idom.iter().filter(|&&x| x == vroot).count();
+    eprintln!(
+        "[ckpt] dominator done in {:.1}s  idom_len={} idom==vroot={} ({:.2}%)",
+        t.elapsed().as_secs_f64(),
+        idom.len(),
+        nv,
+        nv as f64 * 100.0 / n as f64
+    );
+    Ok(())
+}
+
+/// Decode one vbyte value at `pos`; returns (value, next_pos).
+fn decode_vbyte(buf: &[u8], mut pos: usize) -> Option<(u32, usize)> {
+    let mut v: u32 = 0;
+    let mut shift = 0;
+    loop {
+        let b = *buf.get(pos)?;
+        pos += 1;
+        v |= ((b & 0x7f) as u32) << shift;
+        if b & 0x80 == 0 {
+            return Some((v, pos));
+        }
+        shift += 7;
+        if shift > 35 {
+            return None;
+        }
+    }
+}
+
+/// Cross-check the stages of an `HPROF_CKPT_SAVE` directory. Each check
+/// localises a different stage of the inbound-CSR construction:
+///   (A) 2a degree counts      vs the forward CSR's true in-degrees
+///   (B) prefix-summed cursors vs the 2a degree counts
+///   (C) encoded inbound lists vs the 2a degree counts (+ kind of empty nodes)
+fn run_ckpt_diff(dir: &str) -> std::io::Result<()> {
+    let d = std::path::Path::new(dir);
+    let n: usize = std::fs::read_to_string(d.join("meta.txt"))?
+        .trim()
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e}")))?;
+    let t = std::time::Instant::now();
+    let in_degree = read_u32s(&d.join("d_in_degree.bin"))?;
+    let in_cursors = read_u32s(&d.join("d_in_cursors.bin"))?;
+    let fwd_tgt = read_u32s(&d.join("d_fwd_targets.bin"))?;
+    let kind = std::fs::read(d.join("d_kind.bin"))?;
+    let vertex = read_u32s(&d.join("vertex.bin"))?;
+    let inb_data = std::fs::read(d.join("inb_data.bin"))?;
+    eprintln!(
+        "[diff] loaded n={} total_edges={} count={} inb_data={}B in {:.1}s",
+        n,
+        fwd_tgt.len(),
+        vertex.len(),
+        inb_data.len(),
+        t.elapsed().as_secs_f64()
+    );
+
+    // (A) true in-degree from the forward CSR (the ground truth edge set)
+    let mut t0 = std::time::Instant::now();
+    let mut true_indeg = vec![0u32; n + 1];
+    for &tg in &fwd_tgt {
+        let i = tg as usize;
+        if i < true_indeg.len() {
+            true_indeg[i] = true_indeg[i].wrapping_add(1);
+        }
+    }
+    let mut a_bad = 0u64;
+    let mut a_true = 0u64;
+    let mut a_2a = 0u64;
+    for i in 0..n {
+        let tv = true_indeg[i] as u64;
+        let dv = *in_degree.get(i).unwrap_or(&0) as u64;
+        a_true += tv;
+        a_2a += dv;
+        if tv != dv {
+            a_bad += 1;
+        }
+    }
+    eprintln!(
+        "[diff] (A) 2a counts vs fwd truth: mismatched_nodes={} ({:.4}%)  truth_sum={} 2a_sum={} in {:.1}s",
+        a_bad,
+        a_bad as f64 * 100.0 / n as f64,
+        a_true,
+        a_2a,
+        t0.elapsed().as_secs_f64()
+    );
+    drop(true_indeg);
+
+    // (B) The cursors ARE the prefix sum of the POST-synthetic-edge counts, so
+    // their consecutive differences recover those counts. Comparing them with
+    // the pre-synthetic 2a counts isolates exactly the synthetic edges.
+    t0 = std::time::Instant::now();
+    let mut b_bad = 0u64;
+    let mut b_extra = 0u64;
+    for i in 0..n.saturating_sub(1) {
+        let c0 = *in_cursors.get(i).unwrap_or(&0) as u64;
+        let c1 = *in_cursors.get(i + 1).unwrap_or(&0) as u64;
+        let post = c1.saturating_sub(c0);
+        let pre = *in_degree.get(i).unwrap_or(&0) as u64;
+        if post != pre {
+            b_bad += 1;
+            b_extra += post.saturating_sub(pre);
+        }
+    }
+    eprintln!(
+        "[diff] (B) cursor-diff vs 2a counts: differing_nodes={} ({:.4}%)  extra_edges={}  (expect = synthetic thread->local edges) in {:.1}s",
+        b_bad,
+        b_bad as f64 * 100.0 / n as f64,
+        b_extra,
+        t0.elapsed().as_secs_f64()
+    );
+
+    // (C) Only REACHABLE nodes carry a meaningful list — the dominator runs on
+    // the reachable subgraph, and the encoder leaves unreachable nodes empty.
+    // The expected count is therefore the number of in-edges whose SOURCE is
+    // reachable, not the raw 2a in-degree.
+    t0 = std::time::Instant::now();
+    let fwd_off = read_u32s(&d.join("d_fwd_offsets.bin"))?;
+    let mut reach = vec![false; n + 1];
+    for &node in &vertex {
+        let v = node as usize;
+        if v < n {
+            reach[v] = true;
+        }
+    }
+    let mut reach_indeg = vec![0u32; n + 1];
+    for src in 0..n {
+        if !reach[src] {
+            continue;
+        }
+        let lo = *fwd_off.get(src).unwrap_or(&0) as usize;
+        let hi = *fwd_off.get(src + 1).unwrap_or(&0) as usize;
+        if let Some(sl) = fwd_tgt.get(lo..hi) {
+            for &tg in sl {
+                let tv = tg as usize;
+                if tv < reach_indeg.len() {
+                    reach_indeg[tv] = reach_indeg[tv].wrapping_add(1);
+                }
+            }
+        }
+    }
+    let count = vertex.len();
+    eprintln!(
+        "[diff] (C) reachable={} ; reachable-restricted in-degrees in {:.1}s",
+        count,
+        t0.elapsed().as_secs_f64()
+    );
+
+    t0 = std::time::Instant::now();
+    let mut pos = 0usize;
+    let mut c_bad = 0u64;
+    let mut c_total = 0u64;
+    let mut c_empty_reach = 0u64;
+    let mut first_bad: u64 = u64::MAX;
+    let mut empty_kind = [0u64; 4];
+    let mut decoded_nodes = 0u64;
+    for i in 0..n {
+        let (cnt, np) = match decode_vbyte(&inb_data, pos) {
+            Some(x) => x,
+            None => break,
+        };
+        pos = np;
+        decoded_nodes += 1;
+        c_total += cnt as u64;
+        if reach[i] {
+            if cnt as u64 != reach_indeg[i] as u64 {
+                c_bad += 1;
+                if (i as u64) < first_bad {
+                    first_bad = i as u64;
+                }
+            }
+            if cnt == 0 {
+                c_empty_reach += 1;
+                let k = *kind.get(i).unwrap_or(&0) as usize;
+                if k < 4 {
+                    empty_kind[k] += 1;
+                }
+            }
+        }
+        for _ in 0..cnt {
+            match decode_vbyte(&inb_data, pos) {
+                Some((_, np)) => pos = np,
+                None => break,
+            }
+        }
+    }
+    eprintln!(
+        "[diff] (C) encoded count vs reachable-restricted truth: mismatched_reachable={} ({:.4}% of {} reachable)  first_bad_node={}  decoded={} encoded_total={} in {:.1}s",
+        c_bad,
+        c_bad as f64 * 100.0 / count.max(1) as f64,
+        count,
+        if first_bad == u64::MAX { 0 } else { first_bad },
+        decoded_nodes,
+        c_total,
+        t0.elapsed().as_secs_f64()
+    );
+    eprintln!(
+        "[diff] (C) EMPTY lists among reachable={} ({:.4}%)  by-kind[0=inst 1=objarr 2=primarr 3=class]={:?}",
+        c_empty_reach,
+        c_empty_reach as f64 * 100.0 / count.max(1) as f64,
+        empty_kind
+    );
+
+    // (C2) The encoder translates to pre-order, then SORTS and DEDUPS each
+    // node's predecessor list, so the correct expectation is the number of
+    // DISTINCT reachable sources pointing at the node — not its raw in-degree.
+    // Reproduce that with a counting-sort transpose plus per-slice dedup.
+    t0 = std::time::Instant::now();
+    let mut exp_off: Vec<u32> = vec![0u32; n + 2];
+    let mut acc = 0u64;
+    for i in 0..n {
+        exp_off[i] = acc as u32;
+        acc += reach_indeg[i] as u64;
+    }
+    exp_off[n] = acc as u32;
+    let total = acc as usize;
+    let mut exp_src: Vec<u32> = vec![0u32; total];
+    let mut cur: Vec<u32> = exp_off.clone();
+    for src in 0..n {
+        if !reach[src] {
+            continue;
+        }
+        let lo = *fwd_off.get(src).unwrap_or(&0) as usize;
+        let hi = *fwd_off.get(src + 1).unwrap_or(&0) as usize;
+        if let Some(sl) = fwd_tgt.get(lo..hi) {
+            for &tg in sl {
+                let tv = tg as usize;
+                if tv < n {
+                    let p = cur[tv] as usize;
+                    if p < exp_src.len() {
+                        exp_src[p] = src as u32;
+                        cur[tv] += 1;
+                    }
+                }
+            }
+        }
+    }
+    let mut dedup = vec![0u32; n + 1];
+    for i in 0..n {
+        let a = exp_off[i] as usize;
+        let b = cur[i] as usize;
+        if b > a {
+            let s = &mut exp_src[a..b];
+            s.sort_unstable();
+            let mut c = 0u32;
+            let mut last: Option<u32> = None;
+            for &x in s.iter() {
+                if Some(x) != last {
+                    c += 1;
+                    last = Some(x);
+                }
+            }
+            dedup[i] = c;
+        }
+    }
+    eprintln!(
+        "[diff] (C2) deduped-distinct-source expectation built in {:.1}s ({} entries)",
+        t0.elapsed().as_secs_f64(),
+        total
+    );
+    let mut pos2 = 0usize;
+    let mut c2_bad = 0u64;
+    let mut c2_first_bad: u64 = u64::MAX;
+    let mut c2_sum_enc = 0u64;
+    let mut c2_sum_exp = 0u64;
+    for i in 0..n {
+        let (cnt, np) = match decode_vbyte(&inb_data, pos2) {
+            Some(x) => x,
+            None => break,
+        };
+        pos2 = np;
+        if reach[i] {
+            c2_sum_enc += cnt as u64;
+            c2_sum_exp += dedup[i] as u64;
+            if cnt != dedup[i] {
+                c2_bad += 1;
+                if (i as u64) < c2_first_bad {
+                    c2_first_bad = i as u64;
+                }
+            }
+        }
+        for _ in 0..cnt {
+            match decode_vbyte(&inb_data, pos2) {
+                Some((_, np)) => pos2 = np,
+                None => break,
+            }
+        }
+    }
+    eprintln!(
+        "[diff] (C2) encoded vs deduped-distinct expectation: mismatched_reachable={} ({:.4}%)  first_bad_node={}  encoded_sum={} expected_sum={}  [residual = excluded weak/finalizer edges]",
+        c2_bad,
+        c2_bad as f64 * 100.0 / count.max(1) as f64,
+        if c2_first_bad == u64::MAX {
+            0
+        } else {
+            c2_first_bad
+        },
+        c2_sum_enc,
+        c2_sum_exp
+    );
+
+    Ok(())
+}
+
+/// Compare two checkpoints' encoded inbound CSRs node by node. Run the same
+/// dump through both inbound paths (default = fwd transpose, and
+/// `HPROF_FORCE_RESCAN_INBOUND=1` = rescan) and the difference set is exactly
+/// what the rescan path loses.
+fn run_ckpt_cmp(a: &str, b: &str) -> std::io::Result<()> {
+    let (da, db) = (std::path::Path::new(a), std::path::Path::new(b));
+    let n: usize = std::fs::read_to_string(da.join("meta.txt"))?
+        .trim()
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e}")))?;
+    let inb_a = std::fs::read(da.join("inb_data.bin"))?;
+    let inb_b = std::fs::read(db.join("inb_data.bin"))?;
+    let vertex = read_u32s(&da.join("vertex.bin"))?;
+    let kind = std::fs::read(da.join("d_kind.bin"))?;
+    let mut reach = vec![false; n + 1];
+    for &v in &vertex {
+        let i = v as usize;
+        if i < n {
+            reach[i] = true;
+        }
+    }
+    let mut pa = 0usize;
+    let mut pb = 0usize;
+    let mut diff_nodes = 0u64;
+    let mut first_diff: u64 = u64::MAX;
+    let mut last_diff: u64 = 0;
+    let mut sum_a = 0u64;
+    let mut sum_b = 0u64;
+    let mut miss_kind = [0u64; 4];
+    let mut prev_kinds = [0u64; 4];
+    let mut samples = 0u32;
+    let mut ea: Vec<u32> = Vec::new();
+    let mut eb: Vec<u32> = Vec::new();
+    for i in 0..n {
+        let (ca, npa) = decode_vbyte(&inb_a, pa).unwrap_or((0, pa));
+        pa = npa;
+        let (cb, npb) = decode_vbyte(&inb_b, pb).unwrap_or((0, pb));
+        pb = npb;
+        ea.clear();
+        let mut prev = 0u32;
+        for _ in 0..ca {
+            let (d, np) = decode_vbyte(&inb_a, pa).unwrap_or((0, pa));
+            pa = np;
+            prev = prev.wrapping_add(d);
+            ea.push(prev);
+        }
+        eb.clear();
+        prev = 0;
+        for _ in 0..cb {
+            let (d, np) = decode_vbyte(&inb_b, pb).unwrap_or((0, pb));
+            pb = np;
+            prev = prev.wrapping_add(d);
+            eb.push(prev);
+        }
+        sum_a += ca as u64;
+        sum_b += cb as u64;
+        if reach[i] && ca != cb {
+            diff_nodes += 1;
+            if (i as u64) < first_diff {
+                first_diff = i as u64;
+            }
+            last_diff = i as u64;
+            // Kind census over every edge of the differing nodes, on both sides.
+            for &p in &ea {
+                let src = *vertex.get(p as usize).unwrap_or(&0) as usize;
+                let k = *kind.get(src).unwrap_or(&0) as usize;
+                prev_kinds[k.min(3)] += 1;
+            }
+            for &p in &ea {
+                if !eb.contains(&p) {
+                    let src = *vertex.get(p as usize).unwrap_or(&0) as usize;
+                    let k = *kind.get(src).unwrap_or(&0) as usize;
+                    if k < 4 {
+                        miss_kind[k] += 1;
+                    }
+                }
+            }
+            if samples < 5 {
+                println!(
+                    "[cmp] node {} kind={} A_count={} B_count={} A_pre={:?} B_pre={:?}",
+                    i,
+                    *kind.get(i).unwrap_or(&0),
+                    ca,
+                    cb,
+                    ea,
+                    eb
+                );
+                samples += 1;
+            }
+        }
+    }
+    eprintln!(
+        "[cmp] nodes_with_diff={} ({:.4}% of {} reached)  first_diff_node={} last_diff_node={}",
+        diff_nodes,
+        diff_nodes as f64 * 100.0 / vertex.len().max(1) as f64,
+        vertex.len(),
+        if first_diff == u64::MAX {
+            0
+        } else {
+            first_diff
+        },
+        last_diff
+    );
+    eprintln!(
+        "[cmp] encoded edges: A(transpose)={}  B(rescan)={}  missing={}",
+        sum_a,
+        sum_b,
+        sum_a.saturating_sub(sum_b)
+    );
+    eprintln!(
+        "[cmp] sources of ALL present edges (kind) = {:?}",
+        prev_kinds
+    );
+    eprintln!(
+        "[cmp] sources of MISSING edges  (kind) = {:?}   [0=inst 1=objarr 2=primarr 3=class]",
+        miss_kind
+    );
+    Ok(())
+}
+
+/// Rebuild the inbound CSR of a checkpoint from its SAVED forward CSR — the
+/// transpose path, i.e. exactly what `build_from_fwd` produces — so the
+/// dominator can be re-run on the real dump without re-reading it. The previous
+/// `inb_data.bin` is preserved as `inb_data.orig.bin`.
+fn run_ckpt_rebuild(dir: &str) -> std::io::Result<()> {
+    let d = std::path::Path::new(dir);
+    let n: usize = std::fs::read_to_string(d.join("meta.txt"))?
+        .trim()
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e}")))?;
+    let t = std::time::Instant::now();
+    let fwd_off = read_u32s(&d.join("d_fwd_offsets.bin"))?;
+    let fwd_tgt = read_u32s(&d.join("d_fwd_targets.bin"))?;
+    let mut cursors = read_u32s(&d.join("d_in_cursors.bin"))?;
+    let vertex = read_u32s(&d.join("vertex.bin"))?;
+    let n_nodes = fwd_off.len().saturating_sub(1);
+    let total_inb = *fwd_off.get(n_nodes).unwrap_or(&0) as u64;
+    eprintln!(
+        "[rebuild] loaded in {:.1}s: n={} nodes={} total_inb={}",
+        t.elapsed().as_secs_f64(),
+        n,
+        n_nodes,
+        total_inb
+    );
+
+    // dfn = inverse(vertex)
+    let mut dfn = vec![u32::MAX; n + 1];
+    for (pre, &node) in vertex.iter().enumerate() {
+        if (node as usize) < n {
+            dfn[node as usize] = pre as u32;
+        }
+    }
+
+    let mut inb_flat = crate::chunkvec::ChunkU32::zeroed(total_inb as usize);
+    let t = std::time::Instant::now();
+    for src in 0..n_nodes {
+        let lo = *fwd_off.get(src).unwrap_or(&0) as usize;
+        let hi = *fwd_off.get(src + 1).unwrap_or(&0) as usize;
+        if let Some(sl) = fwd_tgt.get(lo..hi) {
+            for &dst in sl {
+                let dv = dst as usize;
+                if dv < cursors.len() {
+                    inb_flat.set(cursors[dv] as usize, src as u32);
+                    cursors[dv] += 1;
+                }
+            }
+        }
+    }
+    eprintln!(
+        "[rebuild] transpose done in {:.1}s",
+        t.elapsed().as_secs_f64()
+    );
+    drop(fwd_tgt);
+    drop(fwd_off);
+
+    let t = std::time::Instant::now();
+    let (block_off, data) =
+        crate::pass2::InboundBuilder::encode_phase4(n, total_inb, cursors, inb_flat, &dfn)?;
+    eprintln!(
+        "[rebuild] encode done in {:.1}s: {} block offsets, {} bytes",
+        t.elapsed().as_secs_f64(),
+        block_off.len(),
+        data.len()
+    );
+
+    let orig = d.join("inb_data.bin");
+    if orig.exists() {
+        let _ = std::fs::rename(&orig, d.join("inb_data.orig.bin"));
+    }
+    std::fs::write(&orig, &data)?;
+    write_u64s(&d.join("inb_block_off.bin"), &block_off)?;
+    eprintln!(
+        "[rebuild] wrote {} (previous kept as inb_data.orig.bin)",
+        orig.display()
+    );
+    Ok(())
+}
+
 /// Log a phase name, elapsed seconds, and (Linux) RSS when `verbose`.
 fn log(verbose: bool, phase: &str, elapsed: f64) {
     if verbose {
@@ -3065,6 +3689,17 @@ fn run(
     let truncated_input = p1.truncated_input;
     let redacted = p1.redacted;
     log(verbose, "pass1", t.elapsed().as_secs_f64());
+    // ── Checkpoint (HPROF_CKPT_SAVE): the object directory built by pass1 —
+    // per-object class index / kind / array element count. Offline this answers
+    // "what kind of object is each node whose inbound list is broken".
+    if let Some(dir) = std::env::var_os("HPROF_CKPT_SAVE") {
+        let d = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&d)?;
+        write_u32s(&d.join("d_class_ids.bin"), &p1.class_ids)?;
+        write_u8s(&d.join("d_kind.bin"), &p1.kind)?;
+        write_u32s(&d.join("d_elem_count.bin"), &p1.elem_count)?;
+        eprintln!("[ckpt] saved pass1 object directory to {}", d.display());
+    }
 
     // The entire analysis works in u32 pre-order / node-index space (dfn,
     // vertex, forward/inbound CSR, idom). A dump with more than u32::MAX
@@ -3518,7 +4153,9 @@ fn run(
             &rpo.dfn,
             |_src, _fwd| Ok(()), // outbound collected later via HPROF rescan
         )?
-    } else if inbound.total_inb > 1_000_000_000 {
+    } else if inbound.total_inb > 1_000_000_000
+        || std::env::var_os("HPROF_FORCE_RESCAN_INBOUND").is_some()
+    {
         // Large dump: drop fwd_targets before inb_flat alloc so both ~N×4B
         // arrays never coexist. Costs one extra HPROF rescan but cuts the
         // inbound peak by ~7-10 GB on 30G+ production dumps.
@@ -3588,8 +4225,56 @@ fn run(
     progress::phase("computing dominators");
     // rpo moved by value; vertex/parent_pre owned through translation. dfn
     // already freed above. No separate drop(rpo).
+    // ── Diagnostic (HPROF_DBG_GRAPH=1): graph stats around the dominator run.
+    // Behaviour is unchanged when the variable is unset.
+    let dbg_graph = std::env::var_os("HPROF_DBG_GRAPH").is_some();
+    if dbg_graph {
+        eprintln!(
+            "[dbg] before dominator: n={} roots={} inb_block_off={} inb_data_bytes={}",
+            g.n,
+            g.gc_root_indices.len(),
+            inb_block_off.len(),
+            inb_data.len()
+        );
+    }
+    // ── Checkpoint the dominator's inputs (HPROF_CKPT_SAVE=<dir>) so the
+    // dominator stage can be re-run in seconds instead of re-running the whole
+    // ~40 min pipeline. Paired with `dev dom-ckpt <dir>`.
+    if let Some(dir) = std::env::var_os("HPROF_CKPT_SAVE") {
+        let d = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&d)?;
+        write_u32s(&d.join("parent_pre.bin"), &rpo.parent_pre)?;
+        write_u32s(&d.join("dfn.bin"), &rpo.dfn)?;
+        write_u32s(&d.join("vertex.bin"), &rpo.vertex)?;
+        write_u32s(&d.join("roots.bin"), &g.gc_root_indices)?;
+        write_u64s(&d.join("inb_block_off.bin"), &inb_block_off)?;
+        std::fs::write(d.join("inb_data.bin"), &inb_data)?;
+        std::fs::write(d.join("meta.txt"), format!("{}", g.n))?;
+        eprintln!("[ckpt] saved dominator inputs to {}", d.display());
+    }
     g.idom =
         dominator::compute_dominators(g.n, rpo, &g.gc_root_indices, &inb_block_off, &inb_data)?;
+    if dbg_graph {
+        let n = g.n;
+        let vroot = n as u32;
+        let mut n_vroot = 0u64;
+        let mut n_undef = 0u64;
+        for &d in g.idom.iter() {
+            if d == vroot {
+                n_vroot += 1;
+            } else if d == u32::MAX {
+                n_undef += 1;
+            }
+        }
+        eprintln!(
+            "[dbg] after dominator: idom_len={} idom==vroot={} ({:.2}%) undef={} ({:.2}%)",
+            g.idom.len(),
+            n_vroot,
+            n_vroot as f64 * 100.0 / n as f64,
+            n_undef,
+            n_undef as f64 * 100.0 / n as f64
+        );
+    }
     log(verbose, "dominator", t.elapsed().as_secs_f64());
     t_dark!("dominator done");
     crate::trace::probe("main: after dominator");

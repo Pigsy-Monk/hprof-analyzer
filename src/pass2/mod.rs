@@ -44,6 +44,24 @@ pub(crate) use scan::*;
 pub use sizing::*;
 pub use strings::*;
 
+// ── Checkpoint helpers (HPROF_CKPT_SAVE=<dir>) ─────────────────────────────
+// Multi-stage dumps so the inbound-CSR construction can be bisected offline
+// instead of by re-running the ~40 min pipeline. Pairs with `dev dom-ckpt`.
+fn ckpt_write_u32s(p: &std::path::Path, v: &[u32]) -> std::io::Result<()> {
+    let mut b = Vec::with_capacity(v.len() * 4);
+    for &x in v {
+        b.extend_from_slice(&x.to_le_bytes());
+    }
+    std::fs::write(p, b)
+}
+
+fn ckpt_dir() -> Option<std::path::PathBuf> {
+    let d = std::env::var_os("HPROF_CKPT_SAVE")?;
+    let d = std::path::PathBuf::from(d);
+    let _ = std::fs::create_dir_all(&d);
+    Some(d)
+}
+
 // ── Pass2 main logic ───────────────────────────────────────────────────────
 
 /// Zero-sized entry point for the second parse pass; see [`Pass2::build`].
@@ -662,6 +680,15 @@ impl Pass2 {
         }
         crate::trace::probe("pass2: after 2a scan (out+in_degree filled)");
         t_phase!("2a scan done");
+
+        // ── Checkpoint (HPROF_CKPT_SAVE): the raw 2a degree counts, captured
+        // before they are turned into CSR cursors. Offline, this is the
+        // "expected in-degree" side of the inbound-CSR diff.
+        if let Some(d) = ckpt_dir() {
+            let _ = ckpt_write_u32s(&d.join("d_out_degree.bin"), &out_degree);
+            let _ = ckpt_write_u32s(&d.join("d_in_degree.bin"), &in_degree);
+            eprintln!("[ckpt] saved 2a degree counts to {}", d.display());
+        }
 
         // Always-on field-decode views (collections, arrays, references). The
         // state was populated inline during the 2a scan above (fused pass),
@@ -1338,6 +1365,61 @@ impl Pass2 {
         }
         fwd_offsets[0] = 0;
 
+        // ── Checkpoint (HPROF_CKPT_SAVE): the forward CSR. This is the
+        // independent oracle for the inbound CSR — the two must be exact
+        // transposes, and a divergence is a correctness bug.
+        if let Some(d) = ckpt_dir() {
+            let _ = ckpt_write_u32s(&d.join("d_fwd_offsets.bin"), &fwd_offsets);
+            let total = fwd_offsets[n] as usize;
+            if let Ok(f) = std::fs::File::create(d.join("d_fwd_targets.bin")) {
+                use std::io::Write as _;
+                let mut w = std::io::BufWriter::with_capacity(1 << 22, f);
+                let mut buf: Vec<u8> = Vec::with_capacity(1 << 22);
+                for i in 0..total {
+                    buf.extend_from_slice(&fwd_targets.get(i).to_le_bytes());
+                    if buf.len() >= (1 << 22) {
+                        let _ = w.write_all(&buf);
+                        buf.clear();
+                    }
+                }
+                let _ = w.write_all(&buf);
+                let _ = w.flush();
+            }
+            eprintln!("[ckpt] saved fwd CSR ({} edges) to {}", total, d.display());
+        }
+
+        // ── Diagnostic (HPROF_DBG_GRAPH=1): forward-CSR self-check.
+        // Behaviour is unchanged when the variable is unset.
+        if std::env::var_os("HPROF_DBG_GRAPH").is_some() {
+            let total = fwd_offsets[n] as u64;
+            let mut mono = true;
+            let mut zero_out = 0u64;
+            let mut max_out = 0u64;
+            for i in 0..n {
+                let a = fwd_offsets[i] as u64;
+                let b = fwd_offsets[i + 1] as u64;
+                if b < a {
+                    mono = false;
+                }
+                let d = b - a;
+                if d == 0 {
+                    zero_out += 1;
+                }
+                if d > max_out {
+                    max_out = d;
+                }
+            }
+            eprintln!(
+                "[dbg] fwd CSR: n={} total_edges={} monotonic={} zero_outdeg_nodes={} max_outdeg={} avg_outdeg={:.3}",
+                n,
+                total,
+                mono,
+                zero_out,
+                max_out,
+                total as f64 / n as f64
+            );
+        }
+
         // Restore in_degree from compressed blob (if compressed above).
         if let Some(c) = in_degree_c {
             in_degree = c.restore()?;
@@ -1361,6 +1443,13 @@ impl Pass2 {
             "inbound edge total {total_inb} exceeds u32::MAX"
         );
         let in_cursors = in_degree; // renamed for clarity: prefix-summed START cursors
+        // ── Checkpoint (HPROF_CKPT_SAVE): the prefix-summed start cursors — the
+        // state the inbound scatter writes through. Paired with the raw 2a counts
+        // this isolates a prefix-sum defect from a scatter/encoder defect.
+        if let Some(d) = ckpt_dir() {
+            let _ = ckpt_write_u32s(&d.join("d_in_cursors.bin"), &in_cursors);
+            eprintln!("[ckpt] saved inbound start cursors to {}", d.display());
+        }
 
         // Precompute source_name before moving p1.id_map into InboundBuilder.
         let source_name = source.display_name().to_string();
