@@ -115,9 +115,6 @@ pub fn compute_dominators(
     //   Exhausted: return an io::Error so the caller exits cleanly with a clear
     //              message rather than emitting a silently-wrong dominator tree.
     let mut recovered_index: Option<Vec<u64>> = None;
-    // Diagnostic (HPROF_DBG_GRAPH=1): count of LT-invariant violations, computed
-    // while `semi` is still alive (it is freed before the translate loop).
-    let mut semi_bad_count: u64 = 0;
     // Diagnostic (HPROF_DBG_EXACT_OFF=1): force the Tier-2 exact per-node offset
     // index so the blocked seek/skip framing is bypassed entirely. Lets us A/B
     // "blocked decode is wrong" against "the algorithm is wrong". No behaviour
@@ -157,7 +154,6 @@ pub fn compute_dominators(
                     let bad = (1..count)
                         .filter(|&i| (semi[i] as usize) > (rpo.parent_pre[i] as usize))
                         .count();
-                    semi_bad_count = bad as u64;
                     // For sampled violators of semi<=parent_pre, decode the node's
                     // predecessor list and check whether the DFS parent edge is in it.
                     // If it is missing, the DFS tree (built from the forward CSR) and
@@ -247,6 +243,7 @@ pub fn compute_dominators(
                         bad as f64 * 100.0 / count as f64
                     );
                 }
+
                 break;
             }
             Err(desync) => {
@@ -284,6 +281,42 @@ pub fn compute_dominators(
         }
     }
     drop(recovered_index);
+
+    // ── Production guard: the Lengauer-Tarjan invariant ──────────────────────
+    // A node's DFS parent is always one of its predecessors (the DFS tree is
+    // built from the graph's own out-edges) and `semi[w]` is the minimum over
+    // predecessors, so `semi[w] <= preorder(parent[w])` is a theorem, not a
+    // heuristic — it needs no external oracle to check. A violation PROVES the
+    // predecessor lists and the DFS tree disagree about where the edges are
+    // attached, hence that any dominator tree built from them is wrong. That is
+    // the silent-wrong-answer failure mode the recovery ladder above exists to
+    // prevent — and note the ladder cannot catch it, because it only fires on a
+    // decode that runs out of bounds, while this disagreement stays in bounds.
+    // So check it here and fail loudly rather than emit the tree. One O(count)
+    // integer scan, no allocation; never fires for a consistent graph.
+    //
+    // Runs after the loop (i.e. after the HPROF_DBG_GRAPH=1 diagnostic block, so
+    // a debug run still gets its full violator breakdown before failing).
+    let semi_bad_count = (1..count)
+        .filter(|&i| (semi[i] as usize) > (rpo.parent_pre[i] as usize))
+        .count();
+    if semi_bad_count > 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "dominator: the Lengauer-Tarjan invariant semi[w] <= preorder(parent[w]) \
+                 is violated by {} of {} reachable nodes ({:.3}%). The predecessor lists \
+                 disagree with the DFS tree, so the dominator tree — and every retained \
+                 size derived from it — would be wrong. This means the inbound CSR was \
+                 not built from the same edge set as the graph; compare the transpose \
+                 path against the rescan path (HPROF_FORCE_RESCAN_INBOUND=1 reproduces \
+                 inbound-path divergence on a small dump).",
+                semi_bad_count,
+                count,
+                semi_bad_count as f64 * 100.0 / count as f64
+            ),
+        ));
+    }
 
     // Phase 1 done: `ancestor` and `label` are dead. Reuse `ancestor`'s
     // buffer as `idom_pre` (no new allocation) and free `label`.
@@ -680,13 +713,14 @@ mod tests {
         assert_eq!(idom[2], 1);
     }
 
-    /// L2 probe: the inbound CSR must be the exact transpose of the forward CSR
-    /// that the DFS ran on. This builds the two *inconsistently* — node 1's
-    /// predecessor is omitted from the inbound even though the forward graph has
-    /// the edge 0 -> 1 — and reports what the dominator pass does with it.
-    /// Run with `--nocapture` to see both trees.
+    /// Regression for the silent-wrong-tree failure mode: the inbound CSR must be
+    /// the exact transpose of the forward CSR the DFS ran on. Building the two
+    /// *inconsistently* — node 1's predecessor omitted even though the forward
+    /// graph has the edge 0 -> 1 — used to produce a plausible but wrong tree
+    /// with no error and no warning. The production invariant guard
+    /// (`semi[w] <= preorder(parent[w])`) must refuse it instead.
     #[test]
-    fn inconsistent_inbound_vs_forward() {
+    fn inconsistent_inbound_vs_forward_is_rejected() {
         let fwd_off = vec![0u32, 1, 2, 2];
         let fwd_tgt = make_fwd_tgt(vec![1u32, 2u32]);
         let roots = vec![0u32];
@@ -695,18 +729,23 @@ mod tests {
             let mut rpo = rpo_dfs(3, &roots, &fwd_off, &fwd_tgt);
             rpo.vertex = rebuild_vertex(&rpo.dfn, rpo.parent_pre.len());
             let (o, d) = build_inb(3, &preds, &rpo.dfn);
-            compute_dominators(3, rpo, &roots, &o, &d).unwrap()
+            compute_dominators(3, rpo, &roots, &o, &d)
         };
 
         // Consistent: node 1's predecessor is 0; node 2's is 1.
-        let consistent = run(vec![vec![], vec![0u32], vec![1u32]]);
-        // Inconsistent: node 1's predecessor is missing although fwd has 0 -> 1.
-        let broken = run(vec![vec![], vec![], vec![1u32]]);
-
-        println!("consistent   idom = {consistent:?}");
-        println!("inconsistent idom = {broken:?}");
-        // With a consistent pair, node 1 is dominated by node 0.
+        let consistent = run(vec![vec![], vec![0u32], vec![1u32]]).expect("consistent pair");
         assert_eq!(consistent[1], 0, "consistent: 1 dominated by 0");
+
+        // Inconsistent: node 1's predecessor is missing although fwd has 0 -> 1,
+        // so node 1's decoded predecessor list is empty even though its DFS
+        // parent is node 0. semi[1] therefore stays 1, above preorder(parent[1]).
+        let err = run(vec![vec![], vec![], vec![1u32]])
+            .expect_err("inconsistent inbound must be rejected, not silently used");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Lengauer-Tarjan invariant"),
+            "unexpected error message: {msg}"
+        );
     }
 
     #[test]
