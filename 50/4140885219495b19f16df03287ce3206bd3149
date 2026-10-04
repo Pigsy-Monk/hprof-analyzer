@@ -1,0 +1,19 @@
+src/query/server.rs
+  s_2657705f64973b::t_76ec8d0c456ba9 1280
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.45-trip",
+  "base_commit_sha": "504140885219495b19f16df03287ce3206bd3149",
+  "prompts": {},
+  "sessions": {
+    "s_2657705f64973b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1acf2de9-ae97-4d4f-968c-22003e8377ea",
+        "model": "deepseek/deepseek-flash"
+      },
+      "human_author": "zwsong <zwsong@trip.com>"
+    }
+  }
+}
