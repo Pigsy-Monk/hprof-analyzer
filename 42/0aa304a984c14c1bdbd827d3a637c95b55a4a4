@@ -1,0 +1,19 @@
+Cargo.lock
+  s_2657705f64973b::t_b4674175259a67 928
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.45-trip",
+  "base_commit_sha": "420aa304a984c14c1bdbd827d3a637c95b55a4a4",
+  "prompts": {},
+  "sessions": {
+    "s_2657705f64973b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1acf2de9-ae97-4d4f-968c-22003e8377ea",
+        "model": "deepseek/deepseek-flash"
+      },
+      "human_author": "zwsong <zwsong@trip.com>"
+    }
+  }
+}
