@@ -1,0 +1,22 @@
+src/pass2/mod.rs
+  s_2657705f64973b::t_0ad8240c307d11 1533-1541,1549-1550
+src/pass2/model.rs
+  s_2657705f64973b::t_86bc593917b2b7 1795
+  s_2657705f64973b::t_b1cb4eaa70c8ba 1784,1796-1806
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.45-trip",
+  "base_commit_sha": "04d9493fe7795d79a68f107559fced74abf81c89",
+  "prompts": {},
+  "sessions": {
+    "s_2657705f64973b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1acf2de9-ae97-4d4f-968c-22003e8377ea",
+        "model": "deepseek/deepseek-flash"
+      },
+      "human_author": "zwsong <zwsong@trip.com>"
+    }
+  }
+}
