@@ -1,0 +1,29 @@
+src/dominator.rs
+  s_2657705f64973b::t_2be26f3373c60e 68-93,118-128,149-251,324-357,683-709
+src/pass2/mod.rs
+  s_2657705f64973b::t_2be26f3373c60e 47-64,684-692,1368-1422,1446-1452
+src/main.rs
+  s_2657705f64973b::t_2be26f3373c60e 624-657,1050-1069,2339-2486,2492-2698,2704-2772,2778-2806,2812-2901,2906-2908,3692-3702,4156-4158,4228-4254,4257-4277
+  s_2657705f64973b::t_6440003d3ca769 2487-2491,2699-2703,2807-2811,2902-2905
+  s_2657705f64973b::t_a7b733a4811dd3 2773-2777
+src/pass2/model.rs
+  s_2657705f64973b::t_c4d5d1f0c1fc18 1575-1587
+  s_2657705f64973b::t_0b10e0fe525869 1130-1141
+  s_2657705f64973b::t_2be26f3373c60e 1372
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.45-trip",
+  "base_commit_sha": "19566eb7554b107e8fed7f6458c7c4f5c8e04966",
+  "prompts": {},
+  "sessions": {
+    "s_2657705f64973b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1acf2de9-ae97-4d4f-968c-22003e8377ea",
+        "model": "deepseek/deepseek-flash"
+      },
+      "human_author": "zwsong <zwsong@trip.com>"
+    }
+  }
+}
