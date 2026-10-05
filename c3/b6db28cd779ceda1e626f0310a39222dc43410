@@ -1,0 +1,20 @@
+src/dominator.rs
+  s_847174c2ec171e::t_46c5a8ad569b77 14-23
+  s_847174c2ec171e::t_ef575bd824bf51 335-339
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.45-trip",
+  "base_commit_sha": "c3b6db28cd779ceda1e626f0310a39222dc43410",
+  "prompts": {},
+  "sessions": {
+    "s_847174c2ec171e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4a13ee19-6543-4c9f-b281-4f848ebf9b79",
+        "model": "unknown"
+      },
+      "human_author": "zwsong <zwsong@trip.com>"
+    }
+  }
+}
