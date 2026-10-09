@@ -466,6 +466,12 @@ enum MatCmd {
         /// `.index` header. When omitted, common installation paths are tried.
         #[arg(long, value_hint = ValueHint::FilePath)]
         mat_binary: Option<String>,
+        /// Also write the analysis report here (`.md` / `.html` / `.json`,
+        /// inferred from the extension). Omit to get only the MAT index —
+        /// which is the old behaviour, and skips `build_model` + `render` +
+        /// `alloc_sites` entirely.
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        report: Option<String>,
     },
 }
 
@@ -1204,6 +1210,7 @@ fn main() {
                 input,
                 dir,
                 mat_binary,
+                report,
             } => {
                 if !input_is_hprof(&input) {
                     fail(format!(
@@ -1235,14 +1242,22 @@ fn main() {
                         Ok(e) => e,
                         Err(e) => fail(format!("cannot create MAT index dir '{mat_dir}': {e}")),
                     };
+                // With `--report <path>`: write the report there, and let the
+                // pipeline build it. Without it: skip `build_model` + `render`
+                // + `alloc_sites` and send the (never-built) output to
+                // /dev/null — i.e. the original `mat caches` behaviour.
+                let (out_path, skip_report) = match report.as_deref() {
+                    Some(p) => (p, false),
+                    None => ("/dev/null", true),
+                };
                 if let Err(e) = run(
                     &input,
-                    Some("/dev/null"),
-                    OutputFormat::Md,
+                    Some(out_path),
+                    resolve_format(None, Some(out_path)),
                     false,
                     cvec::Codec::Deflate1,
                     AnalyzeOptions {
-                        skip_report: true,
+                        skip_report,
                         ..DetailLevel::Default.options()
                     },
                     Some(mat_emitter),
