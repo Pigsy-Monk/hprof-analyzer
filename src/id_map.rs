@@ -21,6 +21,12 @@ use crate::vbyte;
 /// the per-object cost (4 bytes vs 8) — the dominant array at 500M+ objects.
 ///
 /// Usage: push all addresses, call sort_and_dedup(), then index_of()/addr_at().
+///
+/// `Clone` exists for the server's OQL-cache handover: the analysis keeps a
+/// copy of the id map so the first query can be served without re-running
+/// Pass1+Pass2. It is a deep copy (all four fields are `Vec`s). `Default` is the
+/// existing hand-written impl further down this file.
+#[derive(Clone)]
 pub struct IdMap {
     /// Ascending base address of each block (block b covers
     /// offsets[block_start[b]..block_start[b+1]], each addr = base + offset).

@@ -152,6 +152,13 @@ pub struct AnalyzeOptions {
     pub bundle_path: Option<std::path::PathBuf>,
     /// Skip build_model + render. Used by `mat caches` which discards the report.
     pub skip_report: bool,
+    /// Keep the tables the OQL `ReplCache` needs alive through the analysis and
+    /// hand them back with the report, so a server's **first** query can be
+    /// served without re-running Pass1+Pass2 (which costs ~30 min on a 30 GB+
+    /// dump). Only the server sets this; it raises the analysis peak by roughly
+    /// the size of those tables (kind + class_ids + class_map + strings), since
+    /// Pass2 would otherwise free them before the rpo peak. See `src/serve.rs`.
+    pub keep_oql_cache: bool,
     /// Compute per-class reference-field statistics (null/non-null counts, total
     /// retained size of pointees). Opt-in; off by default. Adds O(n) pass.
     pub field_stats: bool,
@@ -205,6 +212,7 @@ impl DetailLevel {
             dev_report: false,
             bundle_path: None,
             skip_report: false,
+            keep_oql_cache: false,
             field_stats: false,
         }
     }

@@ -55,6 +55,13 @@ pub struct ClassInfo {
 
 /// Result of pass 1: interned strings, class/thread metadata, the `id_map`, and
 /// the parallel per-object arrays (all 1:1 by index) that pass 2 consumes.
+///
+/// `Default` exists for the server's OQL-cache handover (see
+/// `AnalyzeOptions::keep_oql_cache`): the handover fills only the five fields the
+/// query cache actually reads (`class_map`, `strings`, `id_map`, `kind`,
+/// `class_addr_table`) and leaves the rest empty, because Pass2 consumes the
+/// originals. No query path reads any other field.
+#[derive(Default)]
 pub struct Pass1 {
     /// String id → decoded UTF-8 (lossy) from STRING_IN_UTF8 records.
     pub strings: HashMap<u64, String>,

@@ -4,17 +4,33 @@
 
 #![allow(dead_code)]
 
+use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static TRACE: AtomicBool = AtomicBool::new(false);
 
 /// Enable or disable RSS tracing process-wide (set once from `--trace-rss`).
 pub fn set_enabled(on: bool) {
-    TRACE.store(on, Ordering::Relaxed);
+    TRACE.store(
+        on || std::env::var_os("HPROF_TRACE_RSS").is_some(),
+        Ordering::Relaxed,
+    );
 }
 
 /// Whether RSS tracing is currently on (cheap atomic load on the hot path).
+///
+/// Also honours the `HPROF_TRACE_RSS` env var, so paths that never call
+/// [`set_enabled`] can still turn it on — notably `server`, which is exactly
+/// where the per-stage curve is worth having (a long-lived process whose peak
+/// nobody can see until it dies). Checked once; the hot path stays an atomic
+/// load.
 pub fn enabled() -> bool {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        if std::env::var_os("HPROF_TRACE_RSS").is_some() {
+            TRACE.store(true, Ordering::Relaxed);
+        }
+    });
     TRACE.load(Ordering::Relaxed)
 }
 

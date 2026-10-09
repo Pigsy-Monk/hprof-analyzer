@@ -58,13 +58,13 @@ impl ServeState {
             let path = self.path.clone();
             let opts = self.opts.clone();
             std::thread::spawn(move || {
-                let result = crate::analyze_to_report_with_retained(
+                let result = crate::analyze_to_report_with_retained_and_cache(
                     &crate::source::HprofSource::from(path.as_str()),
                     &opts,
                 );
                 let mut g = state_arc.lock().unwrap_or_else(|e| e.into_inner());
                 match result {
-                    Ok((r, retained_vec)) => {
+                    Ok((r, retained_vec, oql_cache)) => {
                         *g = AnalysisState::Done(Arc::new(r));
                         drop(g);
                         // Store the retained-size array so OQL queries can use
@@ -74,13 +74,13 @@ impl ServeState {
                             let mut rg = retained_arc.lock().unwrap_or_else(|e| e.into_inner());
                             *rg = Some(Arc::clone(&retained_shared));
                         }
-                        oql_arc.set_full_analysis_with_retained(retained_shared);
+                        oql_arc.set_full_analysis_with_retained(retained_shared, oql_cache);
                     }
                     Err(e) => {
                         *g = AnalysisState::Failed(e.to_string());
                         drop(g);
                         // Still unlock OQL (analysis failed but partial pipeline ran).
-                        oql_arc.set_full_analysis_with_retained(Arc::new(Vec::new()));
+                        oql_arc.set_full_analysis_with_retained(Arc::new(Vec::new()), None);
                     }
                 }
             });
@@ -393,8 +393,24 @@ pub fn run_server(path: &str, port: u16, opts: AnalyzeOptions) -> io::Result<()>
     println!("(loopback only; Ctrl-C to stop)");
 
     let state = Arc::new(ServeState::new(path, opts)?);
-    // Prewarm the OQL ReplCache in the background so the first query is fast.
-    state.oql.prewarm();
+    // NOTE: we deliberately do NOT call `state.oql.prewarm()` here.
+    //
+    // It spawns a background thread that runs the full Pass1+Pass2 over the
+    // dump — *concurrently* with the analysis that `POST /analyze` starts.
+    // Both parse the same file at the same time, so peak memory is roughly
+    // double. And the prewarmed cache is thrown away anyway:
+    // `set_full_analysis_with_retained` (run when the analysis completes)
+    // lowers `reachable_only` and drops the cache, so a query arriving after
+    // the analysis rebuilds from scratch regardless.
+    //
+    // Measured on a 37.9 GB dump, same binary: pass1 peaked at 22.5 GiB with
+    // the prewarm and 11.3 GiB without it. The doubled peak is what OOM'd a
+    // 32 GiB machine in server mode while the same binary finished the same
+    // dump in CLI mode.
+    //
+    // The only queries the prewarm could have helped are ones issued *before*
+    // the analysis finishes (they run in reachable-only mode and could reuse
+    // it); the skill never issues those — it waits for `ready`.
     let server = Arc::new(server);
     let n_workers = std::thread::available_parallelism()
         .map(|n| n.get())

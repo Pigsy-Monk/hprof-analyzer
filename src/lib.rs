@@ -98,6 +98,22 @@ pub fn analyze_to_report_with_retained(
     source: &crate::source::HprofSource,
     opts: &AnalyzeOptions,
 ) -> std::io::Result<(crate::report::Report, Vec<u64>)> {
+    let (report, retained, _oql_cache) = analyze_to_report_inner(source, opts, &mut |_, _| {})?;
+    Ok((report, retained))
+}
+
+/// Like `analyze_to_report_with_retained`, but also hands back the warm OQL
+/// `ReplCache` when `opts.keep_oql_cache` is set — so the server's **first**
+/// query is served from it instead of re-running Pass1+Pass2 (~30 min on a
+/// 30 GB+ dump). See `AnalyzeOptions::keep_oql_cache`.
+pub fn analyze_to_report_with_retained_and_cache(
+    source: &crate::source::HprofSource,
+    opts: &AnalyzeOptions,
+) -> std::io::Result<(
+    crate::report::Report,
+    Vec<u64>,
+    Option<crate::query::run::ReplCache>,
+)> {
     analyze_to_report_inner(source, opts, &mut |_, _| {})
 }
 
@@ -109,7 +125,8 @@ pub fn analyze_to_report_with_progress(
     opts: &AnalyzeOptions,
     progress: &mut dyn FnMut(&str, f32),
 ) -> std::io::Result<(crate::report::Report, Vec<u64>)> {
-    analyze_to_report_inner(source, opts, progress)
+    let (report, retained, _oql_cache) = analyze_to_report_inner(source, opts, progress)?;
+    Ok((report, retained))
 }
 
 /// Data retained after `build_exploration`, used for per-object BFS queries.
@@ -276,7 +293,11 @@ fn analyze_to_report_inner(
     source: &crate::source::HprofSource,
     opts: &AnalyzeOptions,
     progress: &mut dyn FnMut(&str, f32),
-) -> std::io::Result<(crate::report::Report, Vec<u64>)> {
+) -> std::io::Result<(
+    crate::report::Report,
+    Vec<u64>,
+    Option<crate::query::run::ReplCache>,
+)> {
     use std::io;
     // Wall-clock timing of the post-pass2 "dark phase" (dominators/retained/leak/
     // build_model) to localize the runtime sink. Gated on HPROF_TIMING like the
@@ -314,6 +335,25 @@ fn analyze_to_report_inner(
     }
 
     let compress = cvec::Codec::Deflate1;
+
+    // Server path: keep copies of the five Pass1 tables the OQL cache reads
+    // (`class_map`, `strings`, `id_map`, `kind`, `class_addr_table`) plus
+    // `class_ids`, because `Pass2::build` takes `p1` by value and frees them
+    // before the rpo peak. Cloning just these — rather than retaining all of
+    // `p1` — bounds the extra peak to those tables. Off unless the server asked.
+    let oql_handover = if opts.keep_oql_cache {
+        Some(crate::query::run::OqlCacheHandover {
+            class_map: p1.class_map.clone(),
+            strings: p1.strings.clone(),
+            id_map: p1.id_map.clone(),
+            kind: p1.kind.clone(),
+            class_addr_table: p1.class_addr_table.clone(),
+            class_ids: p1.class_ids.clone(),
+            id_size: p1.id_size,
+        })
+    } else {
+        None
+    };
 
     let mut no_in_sets = std::collections::HashMap::new();
     let mut no_exists_bools = std::collections::HashMap::new();
@@ -387,11 +427,26 @@ fn analyze_to_report_inner(
     } else {
         None
     };
-    let (inb_block_off, inb_data) = inbound.build_from_fwd(
-        std::mem::take(&mut g.fwd_offsets),
-        std::mem::take(&mut g.fwd_targets),
-        &rpo.dfn,
-    )?;
+    // Large dumps: drop fwd_targets first and rescan HPROF to avoid the
+    // inb_flat+fwd_targets peak (saves ~7-10 GB on 30G+ dumps).
+    //
+    // Ported from `src/main.rs` so the **server** path gets the same trade:
+    // it costs one extra HPROF scan but never holds `fwd_targets` and the
+    // inbound structures at the same time. Before this, the server always
+    // took the transpose path and paid the double peak — which is why a
+    // 37.9 GB dump OOM'd a 32 GiB box in server mode while the same binary
+    // finished it in CLI mode. See references/how-it-works.md §3.4.
+    let (inb_block_off, inb_data) = if inbound.total_inb > 1_000_000_000 {
+        drop(std::mem::take(&mut g.fwd_targets));
+        drop(std::mem::take(&mut g.fwd_offsets));
+        inbound.build_mat_scan(&rpo.dfn, |_src, _fwd| Ok(()))?
+    } else {
+        inbound.build_from_fwd(
+            std::mem::take(&mut g.fwd_offsets),
+            std::mem::take(&mut g.fwd_targets),
+            &rpo.dfn,
+        )?
+    };
     progress("inbound", 1.0);
     t_pipe!("inbound done");
 
@@ -488,7 +543,23 @@ fn analyze_to_report_inner(
     // The caller (analyze_to_report_with_retained) stores this for OQL reuse.
     let retained = std::mem::take(&mut g.retained);
 
-    Ok((report, retained))
+    // Server path: assemble the warm OQL cache from the handover plus the arrays
+    // the pipeline already restored into `g`. `g` is dead after this point, so
+    // the two big arrays move rather than copy.
+    let oql_cache = oql_handover.map(|h| {
+        h.into_cache(
+            source.clone(),
+            g.n,
+            std::mem::take(&mut g.shallow),
+            std::mem::take(&mut g.class_idx),
+            g.class_names
+                .iter()
+                .map(|n| crate::report::format::pretty_class_name(n))
+                .collect(),
+        )
+    });
+
+    Ok((report, retained, oql_cache))
 }
 
 /// Run full analysis with disk caching (native only).

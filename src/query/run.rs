@@ -1778,6 +1778,61 @@ pub struct ReplCache {
     pub class_names: Vec<String>,
 }
 
+/// The slice of a `Pass1` that a [`ReplCache`] actually reads — plus the cache's
+/// own `class_ids` — carried out of the analysis pipeline so a server can serve
+/// its **first** query from a warm cache instead of re-running Pass1+Pass2
+/// (~30 min on a 30 GB+ dump). Built by `analyze_to_report_inner` when
+/// `AnalyzeOptions::keep_oql_cache` is set; see `src/serve.rs`.
+///
+/// `Pass1` itself cannot be handed over: `Pass2::build` takes it by value and
+/// deliberately frees these tables before the rpo peak.
+pub struct OqlCacheHandover {
+    pub class_map: std::collections::HashMap<u64, crate::pass1::ClassInfo>,
+    pub strings: std::collections::HashMap<u64, String>,
+    pub id_map: crate::id_map::IdMap,
+    pub kind: Vec<u8>,
+    pub class_addr_table: Vec<u64>,
+    pub class_ids: Vec<u32>,
+    pub id_size: u8,
+}
+
+impl OqlCacheHandover {
+    /// Assemble the warm cache. `shallow` / `class_idx` / `class_names` / `n`
+    /// come from the graph the pipeline just built.
+    ///
+    /// Scope is `reachable_only: false` with `dfn: None` — bit-for-bit the cache
+    /// the first query builds today, so query semantics are unchanged.
+    pub fn into_cache(
+        self,
+        source: crate::source::HprofSource,
+        n: usize,
+        shallow: Vec<u32>,
+        class_idx: Vec<u32>,
+        class_names: Vec<String>,
+    ) -> ReplCache {
+        ReplCache {
+            p1: crate::pass1::Pass1 {
+                class_map: self.class_map,
+                strings: self.strings,
+                id_map: self.id_map,
+                kind: self.kind,
+                class_addr_table: self.class_addr_table,
+                id_size: self.id_size,
+                ..Default::default()
+            },
+            n,
+            shallow,
+            class_ids: self.class_ids,
+            dfn: None,
+            id_size: self.id_size as usize,
+            reachable_only: false,
+            source,
+            class_idx,
+            class_names,
+        }
+    }
+}
+
 impl ReplCache {
     pub fn build(
         source: &crate::source::HprofSource,

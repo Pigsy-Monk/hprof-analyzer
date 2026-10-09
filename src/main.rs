@@ -1086,6 +1086,10 @@ fn main() {
             }
             let opts = AnalyzeOptions {
                 reachable_only: true,
+                // Hand the OQL cache over with the report so the first query
+                // after `ready` is served from it instead of re-running
+                // Pass1+Pass2 (~30 min on a 30 GB+ dump).
+                keep_oql_cache: true,
                 ..DetailLevel::Default.options()
             };
             if let Err(e) = serve::run_server(&input, port.unwrap_or(serve::DEFAULT_PORT), opts) {
@@ -1917,13 +1921,33 @@ pub(crate) fn analyze_to_report_with_retained(
     source: &crate::source::HprofSource,
     opts: &AnalyzeOptions,
 ) -> std::io::Result<(crate::report::Report, Vec<u64>)> {
+    let (report, retained, _oql_cache) = analyze_to_report_inner(source, opts)?;
+    Ok((report, retained))
+}
+
+/// Like `analyze_to_report_with_retained`, but also hands back the warm OQL
+/// `ReplCache` when `opts.keep_oql_cache` is set — so the server's **first**
+/// query is served from it instead of re-running Pass1+Pass2 (~30 min on a
+/// 30 GB+ dump). See `AnalyzeOptions::keep_oql_cache`.
+pub(crate) fn analyze_to_report_with_retained_and_cache(
+    source: &crate::source::HprofSource,
+    opts: &AnalyzeOptions,
+) -> std::io::Result<(
+    crate::report::Report,
+    Vec<u64>,
+    Option<crate::query::run::ReplCache>,
+)> {
     analyze_to_report_inner(source, opts)
 }
 
 fn analyze_to_report_inner(
     source: &crate::source::HprofSource,
     opts: &AnalyzeOptions,
-) -> std::io::Result<(crate::report::Report, Vec<u64>)> {
+) -> std::io::Result<(
+    crate::report::Report,
+    Vec<u64>,
+    Option<crate::query::run::ReplCache>,
+)> {
     // Wall-clock timing of the post-pass2 "dark phase" (obj-graph capture,
     // dominators, retained, build_model) to localize the runtime sink. The pass2
     // t_phase! markers reset to 0 at Pass2::build start, so "2b scan done" is
@@ -1958,6 +1982,25 @@ fn analyze_to_report_inner(
     }
 
     let compress = cvec::Codec::Deflate1;
+
+    // Server path: keep copies of the five Pass1 tables the OQL cache reads
+    // (`class_map`, `strings`, `id_map`, `kind`, `class_addr_table`) plus
+    // `class_ids`, because `Pass2::build` takes `p1` by value and frees them
+    // before the rpo peak. Cloning just these — rather than retaining all of
+    // `p1` — bounds the extra peak to those tables. Off unless the server asked.
+    let oql_handover = if opts.keep_oql_cache {
+        Some(crate::query::run::OqlCacheHandover {
+            class_map: p1.class_map.clone(),
+            strings: p1.strings.clone(),
+            id_map: p1.id_map.clone(),
+            kind: p1.kind.clone(),
+            class_addr_table: p1.class_addr_table.clone(),
+            class_ids: p1.class_ids.clone(),
+            id_size: p1.id_size,
+        })
+    } else {
+        None
+    };
 
     let mut no_in_sets = std::collections::HashMap::new();
     let mut no_exists_bools = std::collections::HashMap::new();
@@ -2145,7 +2188,23 @@ fn analyze_to_report_inner(
     // The caller (analyze_to_report_with_retained) stores this for OQL reuse.
     let retained = std::mem::take(&mut g.retained);
 
-    Ok((report, retained))
+    // Server path: assemble the warm OQL cache from the handover plus the arrays
+    // the pipeline already restored into `g`. `g` is dead after this point, so
+    // the two big arrays move rather than copy.
+    let oql_cache = oql_handover.map(|h| {
+        h.into_cache(
+            source.clone(),
+            g.n,
+            std::mem::take(&mut g.shallow),
+            std::mem::take(&mut g.class_idx),
+            g.class_names
+                .iter()
+                .map(|n| crate::report::format::pretty_class_name(n))
+                .collect(),
+        )
+    });
+
+    Ok((report, retained, oql_cache))
 }
 
 /// Decide whether `input` should run the analyze pipeline. True when the path

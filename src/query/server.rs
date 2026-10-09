@@ -393,18 +393,27 @@ impl ServerState {
 
     /// Called once the full analysis pipeline completes. Lowers `reachable_only`
     /// to `false` so subsequent queries can use `@retainedHeapSize`, dominators,
-    /// etc. Also invalidates the warm cache: it was built with `reachable_only=true`
-    /// (which affects dfn and reachable filtering), so a fresh build is needed.
-    /// Stores the retained-size array for use in fast `@retainedHeapSize` queries.
-    pub fn set_full_analysis_with_retained(&self, retained: Arc<Vec<u64>>) {
+    /// etc. Stores the retained-size array for use in fast `@retainedHeapSize`
+    /// queries.
+    ///
+    /// `warm` is the OQL cache the analysis handed over when
+    /// `AnalyzeOptions::keep_oql_cache` was set (`src/serve.rs`). It is built with
+    /// the same scope the queries now use, so it stays valid across the flip
+    /// above and the first query is served from it — no Pass1+Pass2 rebuild.
+    /// `None` is the old behaviour: clear whatever is cached so the next query
+    /// rebuilds at the lowered scope.
+    pub fn set_full_analysis_with_retained(
+        &self,
+        retained: Arc<Vec<u64>>,
+        warm: Option<crate::query::run::ReplCache>,
+    ) {
         // Store retained data first (non-empty only — an empty vec signals failure).
         if !retained.is_empty() {
             let _ = self.retained_data.set(retained);
         }
         self.reachable_only.store(false, Ordering::Relaxed);
-        // Drop the stale cache so the next query rebuilds with reachable_only=false.
         let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = None;
+        *guard = warm;
         self.analysis_state.store(2, Ordering::Relaxed);
     }
 
@@ -430,7 +439,7 @@ impl ServerState {
                 &opts,
             ) {
                 Ok((_report, retained)) => {
-                    this.set_full_analysis_with_retained(Arc::new(retained));
+                    this.set_full_analysis_with_retained(Arc::new(retained), None);
                 }
                 Err(e) => {
                     this.analysis_state.store(3, Ordering::Relaxed);
@@ -463,7 +472,7 @@ impl ServerState {
     /// Backward-compatible version (no retained data). Used by `query --server`.
     #[allow(dead_code)]
     pub fn set_full_analysis(&self) {
-        self.set_full_analysis_with_retained(Arc::new(Vec::new()));
+        self.set_full_analysis_with_retained(Arc::new(Vec::new()), None);
     }
 
     /// Route (method, url, body) -> (http_status, body_string, content_type). Pure enough
