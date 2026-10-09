@@ -1,0 +1,59 @@
+src/lib.rs
+  s_e21ba0d4b8567f::t_e51d60ff25d006 101-116
+  s_e21ba0d4b8567f::t_82e85e64640b43 128-129
+  s_e21ba0d4b8567f::t_142369e34f42fe 339-357
+  s_e21ba0d4b8567f::t_9a654b77280472 546-562
+  s_b743ddbcb1632a::t_7a80033d707def 430-449
+  s_e21ba0d4b8567f::t_8f7f9e1f3311c5 296-300
+src/trace.rs
+  s_b743ddbcb1632a::t_885521385b8b58 7,14-17,21-26,28-33
+src/serve.rs
+  s_e21ba0d4b8567f::t_be1366db4512b3 61
+  s_e21ba0d4b8567f::t_23545745ddbdc9 77
+  s_e21ba0d4b8567f::t_4473bb060cd7d5 67
+  s_e21ba0d4b8567f::t_35cea63c7b50ae 83
+  s_b743ddbcb1632a::t_a3632a8b8fb20c 396-413
+src/query/server.rs
+  s_e21ba0d4b8567f::t_f111009cc52004 475
+  s_e21ba0d4b8567f::t_22ed2cc241a7d3 396-409,416
+  s_e21ba0d4b8567f::t_028c200780304e 442
+src/pass1.rs
+  s_e21ba0d4b8567f::t_71e05d48dea64a 58-64
+src/opts.rs
+  s_e21ba0d4b8567f::t_9a21bfe0ccf8ff 155-161
+  s_e21ba0d4b8567f::t_6a580440f89add 215
+src/query/run.rs
+  s_e21ba0d4b8567f::t_62c854d8ac893e 1781-1835
+src/id_map.rs
+  s_e21ba0d4b8567f::t_9f9025033fae3a 27-29
+  s_e21ba0d4b8567f::t_a4fbb75214cc00 24-26
+src/main.rs
+  s_e21ba0d4b8567f::t_52ca170c65a802 2191-2207
+  s_e21ba0d4b8567f::t_9994631c47113d 1986-2004
+  s_e21ba0d4b8567f::t_37616000384200 1089-1092
+  s_e21ba0d4b8567f::t_72824e0619713f 1924-1939,1946-1950
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.45-trip",
+  "base_commit_sha": "18d45f6feb2ca291b066b4ff70bb76a92aab198f",
+  "prompts": {},
+  "sessions": {
+    "s_b743ddbcb1632a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2060689e-1a9e-4cd5-b4e4-0b5e2d422fa2",
+        "model": "deepseek-v4-1-flash-260910"
+      },
+      "human_author": "zwsong <zwsong@trip.com>"
+    },
+    "s_e21ba0d4b8567f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "638e97ce-6776-44f6-b537-9602ce323894",
+        "model": "deepseek-v4-1-flash-260910"
+      },
+      "human_author": "zwsong <zwsong@trip.com>"
+    }
+  }
+}
