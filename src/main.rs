@@ -3848,8 +3848,8 @@ fn run(
     let t = Instant::now();
     progress::phase("building object graph (pass 2)");
     // Capture MAT class metadata from p1 before it is consumed by Pass2::build.
-    let mat_class_meta: Option<mat::MatClassMeta> = if mat.is_some() {
-        Some(mat::MatClassMeta::from_pass1(&p1))
+    let mut mat_class_meta: Option<mat::MatClassMeta> = if mat.is_some() {
+        Some(mat::MatClassMeta::from_pass1(&p1, input))
     } else {
         None
     };
@@ -4391,6 +4391,37 @@ fn run(
         g.idom = Vec::new();
         crate::trace::trim();
         crate::trace::probe("main: after MatIdMap::build + drop(idom)");
+        // Resolve the class-object and class-loader addresses that the MAT
+        // `.index` ClassImpl objects need (they carry MAT *ids*, not addresses).
+        // Both sets are small (~number of classes / loaders), so the lookups are
+        // built here while `addrs` is still resident and then dropped with it.
+        if let Some(ref mut meta) = mat_class_meta {
+            for &coid in g.class_obj_class_idx.keys() {
+                let mid = mm.translate(coid as i32);
+                if mid > 0 {
+                    let a = addrs[coid as usize];
+                    meta.class_addr_to_mat.insert(a, mid);
+                    meta.class_mat_to_addr.insert(mid, a);
+                }
+            }
+            let mut loaders: Vec<u64> = g
+                .class_loader_id
+                .iter()
+                .copied()
+                .filter(|&a| a != 0)
+                .collect();
+            loaders.sort_unstable();
+            loaders.dedup();
+            for la in loaders {
+                if let Ok(i) = mm
+                    .sorted()
+                    .binary_search_by_key(&la, |&old| addrs[old as usize])
+                {
+                    meta.loader_addr_to_mat.insert(la, (i + 1) as i32);
+                }
+            }
+            crate::trace::probe("main: mat class/loader address maps built");
+        }
         // emit idx: mat-id 0 = address 0x0 (synthetic root), then in mat-id order.
         // Stream addresses from addrs[sorted[i]] — no extra Vec<i64> needed.
         if let Some(ref m) = mat {
@@ -4438,6 +4469,11 @@ fn run(
     }
     crate::trace::probe("main: after emit o2hprof");
     crate::trace::probe("main: before mat_inv (free_addrs done at idx emission)");
+    // `ref_size` is only known once the graph exists; SnapshotInfo's
+    // `$useCompressedOops` property needs it.
+    if let Some(ref mut m) = mat_class_meta {
+        m.ref_size = g.ref_size;
+    }
     // Build the row→class-object id inverse table now that mm is available, so
     // we can prefer reachable class-objects when multiple map to the same row.
     let mut mat_inv: Option<Vec<i32>> =
@@ -4470,6 +4506,81 @@ fn run(
         }
         let _ = mm; // mm borrow ends here
     };
+    // MAT id 0 is MAT's synthetic system-class-loader object, whose class is
+    // java.lang.ClassLoader. Both `o2c[0]` and `outbound[0]` must reference that
+    // class object's MAT id, so compute it once here and share it with the two
+    // emitters below.
+    let mat_classloader_mat: Option<i32> = match (mat_map.as_ref(), mat_inv.as_ref()) {
+        (Some(mm), Some(inv)) => Some(
+            g.class_names
+                .iter()
+                .position(|n| n == "java.lang.ClassLoader" || n == "java/lang/ClassLoader")
+                .map(|row| mm.translate(inv[row]))
+                .filter(|&v| v > 0)
+                .or_else(|| inv.iter().map(|&v| mm.translate(v)).find(|&v| v > 0))
+                .unwrap_or(0),
+        ),
+        _ => None,
+    };
+    // ── Option B: the missing "object → its own class object" inbound edges ──
+    // MAT materialises an "object → its own class object" edge for EVERY object.
+    // Our internal graph has it only for plain instances (HPROF INSTANCE_DUMP's
+    // class id) and object arrays (OBJ_ARRAY_DUMP's element-class id, which for
+    // an object array IS the array's own class object). Primitive arrays and
+    // class objects carry no such record, so their class edge is absent from
+    // `inb_data` — and `inb_data` also feeds the retained/dominator computation,
+    // which is verified digit-for-digit against MAT and must not gain edges. The
+    // missing referrers are therefore collected during the outbound emission
+    // below (`class_edge_refs`) and merged into the emitted `inbound` only.
+    //
+    // The affected targets are exactly the primitive-array class objects
+    // (`[B`, `[C`, `[S`, `[I`, `[J`, `[F`, `[D`, `[Z`) and the class object of
+    // `java.lang.Class`. Object-array class objects need no injection (their
+    // arrays already carry the edge), and instances of `java.lang.Class` are
+    // handled by the dedup in the inbound emitter.
+    let class_edge_class_mats: Option<std::collections::HashSet<i32>> =
+        mat_inv.as_ref().map(|inv| {
+            let mm = mat_map.as_ref().expect("mat_map built with mat");
+            let mut set = std::collections::HashSet::new();
+            for (row, name) in g.class_names.iter().enumerate() {
+                let n = name.as_str();
+                let bytes = n.as_bytes();
+                let prim_array = bytes.len() == 2
+                    && bytes[0] == b'['
+                    && matches!(
+                        bytes[1],
+                        b'Z' | b'B' | b'C' | b'S' | b'I' | b'J' | b'F' | b'D'
+                    );
+                if prim_array || n == "java/lang/Class" || n == "java.lang.Class" {
+                    let d = inv[row];
+                    if d >= 0 {
+                        let m = mm.translate(d);
+                        if m > 0 {
+                            set.insert(m);
+                        }
+                    }
+                }
+            }
+            set
+        });
+    // Referrers of each such class object, filled in during the outbound
+    // emission (where `class_obj_ids` is live) and merged into `inbound` after.
+    let mut class_edge_refs: std::collections::HashMap<i32, Vec<i32>> =
+        std::collections::HashMap::new();
+    // MAT records a `thread → itself` edge when a thread object appears as one of
+    // its own stack-frame locals. Our graph omits self-loops (they cannot affect
+    // dominators or retained size, but the graph is kept as-is), so the emitters
+    // inject them out of band here.
+    let mut mat_self_ref: Option<crate::bitset::Bitset> = if mat.is_some() {
+        Some(crate::bitset::Bitset::with_len(g.n))
+    } else {
+        None
+    };
+    if let (Some(z), Some(ctx)) = (mat_self_ref.as_mut(), mat_outbound_rescan_ctx.as_ref()) {
+        for &d in &ctx.synthetic_self_edges {
+            z.set(d as usize);
+        }
+    }
     // Resolve class_obj_ids from the raw class_idx rows now that mat_inv is ready.
     // mat_fwd_snap.1 holds the compressed class_idx; restore, map through inv,
     // then re-compress so the 45 MB array doesn't inflate the emit_outbound peak.
@@ -4496,6 +4607,18 @@ fn run(
     // mat_outbound_rescan_ctx (id_map + class info). fwd_off is restored from
     // mat_fwd_snap.0 and used as per-object write cursors (modified in-place):
     // after scatter, fwd_off[d] = end position; start[d] = fwd_off[d-1].
+    // MAT's synthetic object 0 (the system class loader) receives an edge from
+    // every class object whose HPROF `super_id` or `loader_id` is 0: MAT
+    // materialises those null references as edges to object 0, whereas our
+    // graph drops them (`add_edge_inner!` skips `dst_addr == 0`). The outbound
+    // rescan records the affected class objects here so BOTH the `outbound` and
+    // `inbound` emitters can reproduce MAT's shape (without it, `outbound` and
+    // `inbound` come out 852 edges short of MAT's on the tiny dump).
+    let mut mat_zero_ref: Option<crate::bitset::Bitset> = if mat.is_some() {
+        Some(crate::bitset::Bitset::with_len(g.n))
+    } else {
+        None
+    };
     if let Some(ref m) = mat {
         let mm = mat_map.as_ref().expect("mat_map built with mat");
         if let (Some((fwd_off_c, _class_idx_c)), Some(rescan_ctx)) =
@@ -4511,7 +4634,12 @@ fn run(
             // Pre-allocate fwd_tgt and scatter-fill via HPROF rescan.
             let mut fwd_tgt: Vec<u32> = vec![0u32; total_edges];
             crate::trace::probe("main: before outbound rescan (fwd_off+fwd_tgt allocated)");
-            crate::pass2::rescan_outbound(rescan_ctx, &mut fwd_off, &mut fwd_tgt)?;
+            crate::pass2::rescan_outbound(
+                rescan_ctx,
+                &mut fwd_off,
+                &mut fwd_tgt,
+                mat_zero_ref.as_mut().expect("mat_zero_ref built with mat"),
+            )?;
             crate::trace::probe("main: after outbound rescan");
             // id_map was live during rescan (2 GB) and is now freed; trim to return
             // freed pages before restoring class_obj_ids, saving ~2 GB from emit peak.
@@ -4529,12 +4657,21 @@ fn run(
             let n_entries = mm.mat_count();
             let sorted = mm.sorted();
             let mut idx = 0usize;
+            // MAT id 0 (the synthetic system-class-loader object) has an outbound
+            // list of exactly one element: its class object. Emitting an empty
+            // entry there left `outbound` one edge short of MAT's and broke the
+            // in == out invariant at the root.
+            let root_class = mat_classloader_mat.unwrap_or(0);
             m.emit_outbound_cb(n_entries, |push| {
                 if idx == 0 {
                     idx += 1;
+                    push(root_class)?;
                     return Ok(());
                 }
                 let old_id = sorted[idx - 1];
+                // MAT id of `old_id` (`sorted()` is in MAT-id order, entry 0 is
+                // the synthetic root).
+                let mat_id = idx as i32;
                 idx += 1;
                 let lo = if old_id == 0 {
                     0
@@ -4548,6 +4685,14 @@ fn run(
                 } else {
                     mm.translate(coid as i32).max(0)
                 };
+                // Option B: record this object as a referrer of its own class
+                // object when the internal graph lacks that edge (primitive
+                // arrays and class objects). Merged into `inbound` below.
+                if let Some(set) = class_edge_class_mats.as_ref() {
+                    if set.contains(&class_mat) {
+                        class_edge_refs.entry(class_mat).or_default().push(mat_id);
+                    }
+                }
                 // Translate dense ids to MAT ids in-place; compact reachable ones to front.
                 let mut count = 0usize;
                 for i in lo..hi {
@@ -4561,11 +4706,45 @@ fn run(
                 // Emit class_mat first, then remaining edges (dedup, skip class_mat).
                 let class_u = class_mat as u32;
                 push(class_mat)?;
+                // MAT: a class object with a zero super/loader also references
+                // object 0. `0` sorts before every real target, so it is emitted
+                // first (matching MAT's `[class_obj] ++ sorted(refs)` layout).
                 let mut prev = u32::MAX;
+                if mat_zero_ref
+                    .as_ref()
+                    .is_some_and(|z| z.get(old_id as usize))
+                {
+                    push(0i32)?;
+                    prev = 0;
+                }
+                // A synthetic thread self-edge (`thread → itself`) is not part of
+                // the graph, so it is spliced into the sorted window here.
+                let mut pending_self = if mat_self_ref
+                    .as_ref()
+                    .is_some_and(|z| z.get(old_id as usize))
+                {
+                    Some(mat_id as u32)
+                } else {
+                    None
+                };
                 for &v in &fwd_tgt[lo..lo + count] {
+                    if let Some(sm) = pending_self {
+                        if sm < v {
+                            if sm != class_u && sm != prev {
+                                push(sm as i32)?;
+                                prev = sm;
+                            }
+                            pending_self = None;
+                        }
+                    }
                     if v != class_u && v != prev {
                         push(v as i32)?;
                         prev = v;
+                    }
+                }
+                if let Some(sm) = pending_self {
+                    if sm != class_u && sm != prev {
+                        push(sm as i32)?;
                     }
                 }
                 Ok(())
@@ -4590,72 +4769,199 @@ fn run(
     // Using u64 avoids overflow when inb_data exceeds 4 GB on large dumps.
     // dfn[dense] = pre_order; vertex[pre_order] = dense_id.
     const INB_BLOCK_MAT: usize = 16;
-    let mat_inb_ctx: Option<(Vec<u32>, Vec<u64>, Vec<u32>)> =
-        if let (Some(dfn_c), Some(vertex_c)) = (mat_dfn_save_c, mat_vertex_save_c) {
-            let dfn = dfn_c.restore()?;
-            let vertex = vertex_c.restore()?;
-            let n = g.n;
-            let mut off: Vec<u64> = Vec::with_capacity(n / INB_BLOCK_MAT + 2);
-            let mut pos = 0usize;
-            for pre in 0..n {
-                if pre % INB_BLOCK_MAT == 0 {
-                    off.push(pos as u64);
-                }
-                let (count, c0) = vbyte::decode_one(&inb_data[pos..]);
-                pos += c0;
-                for _ in 0..count {
-                    let (_, c1) = vbyte::decode_one(&inb_data[pos..]);
-                    pos += c1;
-                }
+    let mat_inb_ctx: Option<(Vec<u32>, Vec<u64>, Vec<u32>)> = if let (Some(dfn_c), Some(vertex_c)) =
+        (mat_dfn_save_c, mat_vertex_save_c)
+    {
+        let dfn = dfn_c.restore()?;
+        let vertex = vertex_c.restore()?;
+        let n = g.n;
+        let mut off: Vec<u64> = Vec::with_capacity(n / INB_BLOCK_MAT + 2);
+        let mut pos = 0usize;
+        for pre in 0..n {
+            if pre % INB_BLOCK_MAT == 0 {
+                off.push(pos as u64);
             }
-            crate::trace::probe("main: after inb_pre_off build");
-            Some((dfn, off, vertex))
-        } else {
-            None
-        };
+            let (count, c0) = vbyte::decode_one(&inb_data[pos..]);
+            pos += c0;
+            for _ in 0..count {
+                let (_, c1) = vbyte::decode_one(&inb_data[pos..]);
+                pos += c1;
+            }
+        }
+        crate::trace::probe("main: after inb_pre_off build");
+        if std::env::var_os("HPROF_MAT_DBG").is_some() {
+            // Diagnostic: inb_data entry structure + dfn/vertex shape.
+            let mut p = 0usize;
+            let mut sum = 0u64;
+            let mut zeros = 0usize;
+            let mut entries_with_zero = 0usize;
+            let mut max_len = 0u32;
+            let mut max_at = 0usize;
+            let mut lens: Vec<u32> = Vec::with_capacity(n);
+            for e in 0..n {
+                let (count, c0) = vbyte::decode_one(&inb_data[p..]);
+                p += c0;
+                lens.push(count);
+                if count == 0 {
+                    zeros += 1;
+                }
+                if count > max_len {
+                    max_len = count;
+                    max_at = e;
+                }
+                let mut prev = 0u32;
+                let mut saw_zero = false;
+                for _ in 0..count {
+                    let (d, c1) = vbyte::decode_one(&inb_data[p..]);
+                    p += c1;
+                    prev = prev.wrapping_add(d);
+                    if prev == 0 {
+                        saw_zero = true;
+                    }
+                }
+                if saw_zero {
+                    entries_with_zero += 1;
+                }
+                sum += count as u64;
+            }
+            eprintln!(
+                "[mat-dbg] inb_data: n={n} consumed={p}/{} entries={} zero_entries={} sum_counts={} max_len={} (entry {max_at}) entries_with_zero_val={}",
+                inb_data.len(),
+                n,
+                zeros,
+                sum,
+                max_len,
+                entries_with_zero
+            );
+            let sorted: &[u32] = mat_map.as_ref().map(|m| m.sorted()).unwrap_or(&[]);
+            if let Ok(mut f) = std::fs::File::create("/tmp/mat-inbcounts.txt") {
+                use std::io::Write;
+                let mut s = String::with_capacity(lens.len() * 4);
+                for v in &lens {
+                    s.push_str(&v.to_string());
+                    s.push('\n');
+                }
+                let _ = f.write_all(s.as_bytes());
+            }
+            let mut mism = 0usize;
+            let mut minp = u32::MAX;
+            let mut maxp = 0u32;
+            for &old in sorted {
+                let pr = dfn[old as usize];
+                if pr != old {
+                    mism += 1;
+                }
+                minp = minp.min(pr);
+                maxp = maxp.max(pr);
+            }
+            eprintln!(
+                "[mat-dbg] dfn.len={} vertex.len={} dfn[n]={} vertex[0]={} pre!=dense: {}/{} pre_range={}..{}",
+                dfn.len(),
+                vertex.len(),
+                dfn.get(n).copied().unwrap_or(u32::MAX),
+                vertex[0],
+                mism,
+                sorted.len(),
+                minp,
+                maxp
+            );
+        }
+        Some((dfn, off, vertex))
+    } else {
+        None
+    };
     // MAT: emit `inbound` IntArray1N in MAT id order. Decode each object's
     // referrers on demand from inb_data using the block-offset table.
     if let Some(ref m) = mat {
         let mm = mat_map.as_ref().expect("mat_map built with mat");
-        if let Some((dfn, inb_pre_off, vertex)) = mat_inb_ctx.as_ref() {
-            let iter = std::iter::once(Vec::new()) // entry 0 = synthetic root
-                .chain(mm.sorted().iter().map(|&old_id| {
-                    let pre = dfn[old_id as usize] as usize;
-                    // Seek to block start, then skip (pre % INB_BLOCK_MAT) entries.
-                    let block_start = pre - (pre % INB_BLOCK_MAT);
-                    let mut pos = inb_pre_off[block_start / INB_BLOCK_MAT] as usize;
-                    for _skip in block_start..pre {
-                        let (skip_count, c0) = vbyte::decode_one(&inb_data[pos..]);
-                        pos += c0;
-                        for _ in 0..skip_count {
-                            let (_, c1) = vbyte::decode_one(&inb_data[pos..]);
-                            pos += c1;
-                        }
-                    }
-                    let (count, c0) = vbyte::decode_one(&inb_data[pos..]);
+        if let Some((_dfn, inb_pre_off, vertex)) = mat_inb_ctx.as_ref() {
+            // Entry 0 is MAT's synthetic system-class-loader object: its inbound
+            // list is exactly the class objects whose super/loader reference was
+            // 0 (see `mat_zero_ref`). `mm.sorted()` is in MAT-id order, so the
+            // list comes out sorted, as MAT stores it.
+            let root_inb: Vec<i32> = match mat_zero_ref.as_ref() {
+                Some(z) => mm
+                    .sorted()
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &old)| z.get(old as usize))
+                    .map(|(i, _)| (i + 1) as i32)
+                    .collect(),
+                None => Vec::new(),
+            };
+            // MAT also records an inbound edge from object 0 into the class-loader
+            // class object (object 0's own class edge). Our graph has no node for
+            // object 0, so inject it here.
+            let root_class = mat_classloader_mat.filter(|&v| v > 0);
+            let iter = std::iter::once(root_inb).chain(mm.sorted().iter().map(|&old_id| {
+                // `inb_data` is indexed by DENSE id: `encode_phase4` writes one
+                // count-prefixed entry per dense node, and `dominator.rs` seeks
+                // to `vertex[i]` (the dense id) for the node at pre-order `i`.
+                // The body values, by contrast, ARE pre-orders — hence the
+                // `vertex[prev]` mapping below. Seeking by pre-order (the old
+                // `dfn[old_id]`) returned a permutation of MAT's referrer lists.
+                let entry = old_id as usize;
+                // Seek to block start, then skip (entry % INB_BLOCK_MAT) entries.
+                let block_start = entry - (entry % INB_BLOCK_MAT);
+                let mut pos = inb_pre_off[block_start / INB_BLOCK_MAT] as usize;
+                for _skip in block_start..entry {
+                    let (skip_count, c0) = vbyte::decode_one(&inb_data[pos..]);
                     pos += c0;
-                    let mut e: Vec<i32> = Vec::with_capacity(count as usize);
-                    let mut prev: u32 = 0;
-                    for _ in 0..count {
-                        let (delta, c1) = vbyte::decode_one(&inb_data[pos..]);
+                    for _ in 0..skip_count {
+                        let (_, c1) = vbyte::decode_one(&inb_data[pos..]);
                         pos += c1;
-                        prev += delta;
-                        if prev > 0 {
-                            let dense = vertex[prev as usize] as i32;
-                            let mid = mm.translate(dense);
-                            if mid >= 0 {
-                                e.push(mid);
-                            }
+                    }
+                }
+                let (count, c0) = vbyte::decode_one(&inb_data[pos..]);
+                pos += c0;
+                let mut e: Vec<i32> = Vec::with_capacity(count as usize);
+                let mut prev: u32 = 0;
+                for _ in 0..count {
+                    let (delta, c1) = vbyte::decode_one(&inb_data[pos..]);
+                    pos += c1;
+                    prev += delta;
+                    if prev > 0 {
+                        let dense = vertex[prev as usize] as i32;
+                        let mid = mm.translate(dense);
+                        if mid >= 0 {
+                            e.push(mid);
                         }
                     }
-                    e.sort_unstable();
-                    e
-                }));
+                }
+                let mat_id = mm.translate(old_id as i32);
+                // Option B: merge in the referrers whose class edge our graph
+                // lacks (primitive arrays → their array class object; class
+                // objects → the java.lang.Class class object). The internal
+                // graph already carries the edge for instances and object
+                // arrays, so the dedup below absorbs those duplicates.
+                if let Some(extra) = class_edge_refs.get(&mat_id) {
+                    e.extend_from_slice(extra);
+                }
+                // Synthetic thread self-edge (`thread → itself`).
+                if mat_self_ref
+                    .as_ref()
+                    .is_some_and(|z| z.get(old_id as usize))
+                {
+                    e.push(mat_id);
+                }
+                e.sort_unstable();
+                e.dedup();
+                if let Some(rc) = root_class {
+                    if mat_id == rc {
+                        // 0 is the smallest value, so it stays sorted.
+                        e.insert(0, 0);
+                    }
+                }
+                e
+            }));
             m.emit_inbound_iter(iter)?;
             crate::trace::trim();
         }
     }
     drop(mat_inb_ctx);
+    drop(mat_zero_ref);
+    drop(mat_self_ref);
+    drop(class_edge_refs);
     // Restore g.idom from compressed blob (it was compressed before emit_outbound
     // to save ~1.3 GB of RSS during the outbound + inbound emission window).
     if let Some(c) = mat_idom_c {
@@ -4753,9 +5059,15 @@ fn run(
         let shallow_vec: Vec<u32> = shallow_c.restore()?;
         let mc = mm.mat_count();
 
-        // o2c: mat-id 0 (synthetic root) → class-id 0
+        // o2c: mat-id 0 is MAT's synthetic system-class-loader object, whose
+        // class is java.lang.ClassLoader. o2c[0] must be THAT class object's
+        // MAT id, never 0: SnapshotImpl.getObject(0) misses the class cache and
+        // falls into HeapObjectCache.load(0) -> getObject(o2class().get(0)) ->
+        // ... which, with o2c[0] == 0, recurses until StackOverflowError (this
+        // is what killed MAT's top_components report on a reopened cache).
+        let classloader_mat = mat_classloader_mat.unwrap_or(0);
         let mut o2c_vals: Vec<i32> = Vec::with_capacity(mc);
-        o2c_vals.push(0i32);
+        o2c_vals.push(classloader_mat);
         for &old_id in mm.sorted() {
             let row = class_idx_vec[old_id as usize];
             let class_obj_old = inv[row as usize]; // old dense class-object id (-1 = missing)

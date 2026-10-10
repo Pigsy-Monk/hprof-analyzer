@@ -1030,6 +1030,10 @@ pub struct InboundBuilder {
     pub(crate) total_inb: u64,
     /// Synthetic thread->local edges (src,dst), already deduped.
     pub(crate) synthetic_edges: Vec<(u32, u32)>,
+    /// Dense ids of thread objects that are one of their own stack-frame locals.
+    /// MAT records these as a self-edge; we omit them from the graph and let the
+    /// MAT index emitters re-inject them (see `main.rs`).
+    pub(crate) synthetic_self_edges: Vec<u32>,
 }
 
 /// Captured from `InboundBuilder` before it is consumed by `build_mat_scan`,
@@ -1043,6 +1047,15 @@ pub struct MatOutboundRescanCtx {
     pub id_map_codec: crate::cvec::Codec,
     pub class_addr_to_hist: HashMap<u64, u32>,
     pub field_plans_dense: Vec<super::FieldPlan>,
+    /// Synthetic thread→local edges, counted into the forward CSR by the
+    /// forward fill. The rescan must re-emit them or the per-object write
+    /// cursors (`fwd_off`) end short and every later object's edge range is read
+    /// from the wrong window.
+    pub synthetic_edges: Vec<(u32, u32)>,
+    /// Dense ids of thread objects with a synthetic self-edge (see
+    /// `InboundBuilder::synthetic_self_edges`). Not part of the graph, so the
+    /// emitters inject them out of band.
+    pub synthetic_self_edges: Vec<u32>,
 }
 
 impl InboundBuilder {
@@ -1058,6 +1071,8 @@ impl InboundBuilder {
             id_map_codec: self.id_map_codec,
             class_addr_to_hist: self.class_addr_to_hist.clone(),
             field_plans_dense: self.field_plans_dense.clone(),
+            synthetic_edges: self.synthetic_edges.clone(),
+            synthetic_self_edges: self.synthetic_self_edges.clone(),
         }
     }
 
@@ -1900,6 +1915,7 @@ pub fn rescan_outbound(
     ctx: &MatOutboundRescanCtx,
     fwd_off: &mut Vec<u32>,
     fwd_tgt: &mut Vec<u32>,
+    zero_ref: &mut crate::bitset::Bitset,
 ) -> io::Result<()> {
     use crate::types::tags;
     use std::io::ErrorKind;
@@ -1942,6 +1958,7 @@ pub fn rescan_outbound(
                     &id_map,
                     &ctx.class_addr_to_hist,
                     &ctx.field_plans_dense,
+                    zero_ref,
                     fwd_off,
                     fwd_tgt,
                     &mut scratch,
@@ -1955,17 +1972,75 @@ pub fn rescan_outbound(
             },
         }
     }
+
+    // Re-emit the synthetic thread→local edges the forward fill counted. They
+    // are not derivable from the HPROF heap records, so without this the rescan
+    // writes fewer edges than `fwd_off` reserved for the affected thread
+    // objects; `fwd_off[d]` then ends short of object d's real end, and the
+    // emitter reads `fwd_off[d-1]..fwd_off[d]` — a window shifted left by the
+    // deficit — for every subsequent object. On the tiny dump that mis-attributed
+    // 14 outbound edges across 7 objects (6329/6330, 14944/14945,
+    // 17715/17724/17725).
+    for &(src, dst) in &ctx.synthetic_edges {
+        scatter_edge(fwd_off, fwd_tgt, src as usize, dst as usize);
+    }
     Ok(())
 }
 
-/// Skip one CLASS_DUMP sub-record, returning the number of bytes consumed.
-fn skip_class_dump(r: &mut HprofReader, id_size: u8, ids: u64) -> io::Result<u64> {
-    use super::scan::value_size;
+/// Scatter one CLASS_DUMP sub-record's outbound edges into `fwd_tgt` (using
+/// `fwd_off[d]` as the per-object write cursor), returning bytes consumed.
+///
+/// Mirrors [`Pass2::fill_class_dump_edges`] with `do_fwd = true`: a class
+/// object's outbound edges are → its superclass and → its class loader (each
+/// only when non-zero, matching `add_edge_inner!`), plus → every Object-typed
+/// static field.
+fn scan_class_dump_edges(
+    r: &mut HprofReader,
+    id_size: u8,
+    ids: u64,
+    id_map: &crate::id_map::IdMap,
+    cache: &mut crate::id_map::IndexCache,
+    zero_ref: &mut crate::bitset::Bitset,
+    fwd_off: &mut Vec<u32>,
+    fwd_tgt: &mut Vec<u32>,
+) -> io::Result<u64> {
     let mut consumed = 0u64;
     // class_addr (id) + stack_trace_serial (u32) + super_id (id) + loader_id (id)
     //   + signers_id + domain_id + reserved1 + reserved2 (4×ids) + instance_size (u32)
-    r.skip(ids + 4 + ids + ids + ids * 4 + 4)?;
-    consumed += ids + 4 + ids + ids + ids * 4 + 4;
+    let class_addr = r.id()?;
+    consumed += ids;
+    r.skip(4)?;
+    consumed += 4;
+    let super_id = r.id()?;
+    consumed += ids;
+    let loader_id = r.id()?;
+    consumed += ids;
+    r.skip(ids * 4 + 4)?;
+    consumed += ids * 4 + 4;
+
+    let src_idx = id_map.index_of(class_addr);
+    if let Some(src) = src_idx {
+        // MAT maps a zero-valued class super/loader reference onto its synthetic
+        // object 0 (the system class loader), so such a class object gains an
+        // extra `0` element in MAT's `outbound` and appears in MAT's
+        // `inbound[0]`. `fill_heap_2b` drops these edges entirely
+        // (`add_edge_inner!` skips `dst_addr == 0`), so this flag is the only
+        // place the information survives into the MAT emitters.
+        if super_id == 0 || loader_id == 0 {
+            zero_ref.set(src);
+        }
+        if super_id != 0 {
+            if let Some(dst) = cache.index_of(id_map, super_id) {
+                scatter_edge(fwd_off, fwd_tgt, src, dst);
+            }
+        }
+        if loader_id != 0 {
+            if let Some(dst) = cache.index_of(id_map, loader_id) {
+                scatter_edge(fwd_off, fwd_tgt, src, dst);
+            }
+        }
+    }
+
     // constant pool
     let cp = r.u2()? as u64;
     consumed += 2;
@@ -1974,7 +2049,7 @@ fn skip_class_dump(r: &mut HprofReader, id_size: u8, ids: u64) -> io::Result<u64
         consumed += 2; // cp_index
         let tp = r.u1()?;
         consumed += 1;
-        let vs = value_size(tp, id_size);
+        let vs = super::value_size(tp, id_size);
         r.skip(vs)?;
         consumed += vs;
     }
@@ -1986,9 +2061,23 @@ fn skip_class_dump(r: &mut HprofReader, id_size: u8, ids: u64) -> io::Result<u64
         consumed += ids; // name_id
         let tp = r.u1()?;
         consumed += 1;
-        let vs = value_size(tp, id_size);
-        r.skip(vs)?;
-        consumed += vs;
+        let vs = super::value_size(tp, id_size);
+        if tp == 2 {
+            // Object-typed static field — the same edge `fill_class_dump_edges`
+            // adds (it reads the value rather than skipping it).
+            let ref_val = super::read_id_from_reader(r, id_size)?;
+            consumed += vs;
+            if ref_val != 0 {
+                if let Some(src) = src_idx {
+                    if let Some(dst) = cache.index_of(id_map, ref_val) {
+                        scatter_edge(fwd_off, fwd_tgt, src, dst);
+                    }
+                }
+            }
+        } else {
+            r.skip(vs)?;
+            consumed += vs;
+        }
     }
     // instance fields (just descriptors, no values)
     let ic = r.u2()? as u64;
@@ -2010,6 +2099,7 @@ fn scan_fwd_segment(
     id_map: &crate::id_map::IdMap,
     class_addr_to_hist: &HashMap<u64, u32>,
     field_plans_dense: &[super::FieldPlan],
+    zero_ref: &mut crate::bitset::Bitset,
     fwd_off: &mut Vec<u32>,
     fwd_tgt: &mut Vec<u32>,
     scratch: &mut Vec<u8>,
@@ -2061,9 +2151,16 @@ fn scan_fwd_segment(
                 checked_sub!(remaining, skip);
             }
             heap::CLASS_DUMP => {
-                // Class dumps don't contribute outbound edges in the MAT model.
-                // Skip by parsing the variable-length structure.
-                let consumed = skip_class_dump(r, id_size, ids)?;
+                // Mirror `fill_heap_2b` -> `fill_class_dump_edges(do_fwd=true)`:
+                // a class object's outbound edges are → its superclass, → its
+                // loader, and → each Object-typed static field. Skipping class
+                // dumps here made the rescan write fewer edges for every class
+                // object than the forward CSR counted, so the shared `fwd_off`
+                // cursors drifted and every later object's edge range was read
+                // from the wrong window.
+                let consumed = scan_class_dump_edges(
+                    r, id_size, ids, id_map, cache, zero_ref, fwd_off, fwd_tgt,
+                )?;
                 checked_sub!(remaining, consumed);
             }
             heap::INSTANCE_DUMP => {
@@ -2105,7 +2202,7 @@ fn scan_fwd_segment(
                 let addr = r.id()?;
                 r.skip(4)?;
                 let count = r.u4()? as u64;
-                let _elem_class_id = r.id()?;
+                let elem_class_id = r.id()?;
                 let byte_len = count.saturating_mul(ids);
                 r.read_bytes_reuse(scratch, byte_len as usize)?;
                 checked_sub!(remaining, ids + 4 + 4 + ids + byte_len);
@@ -2114,6 +2211,13 @@ fn scan_fwd_segment(
                     Some(i) => i,
                     None => continue,
                 };
+
+                // Edge: object array → element class object (`fill_heap_2b`
+                // emits this before the element edges). Discarding it left every
+                // object array one edge short of the forward CSR count.
+                if let Some(dst) = cache.index_of(id_map, elem_class_id) {
+                    scatter_edge(fwd_off, fwd_tgt, src_idx, dst);
+                }
 
                 for i in 0..count as usize {
                     let off = i * id_size as usize;

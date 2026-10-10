@@ -1136,6 +1136,15 @@ impl Pass2 {
 
         // ── Resolve thread→local synthetic edges ─────────────────────────
         let mut synthetic_edges: Vec<(u32, u32)> = Vec::new();
+        // Self-referencing thread-local pairs: a thread object that appears as
+        // one of its own stack-frame locals. MAT materialises these as a
+        // `thread → itself` edge. Our graph deliberately omits self-loops (the
+        // retained/dominator computation is verified against MAT and must not
+        // gain edges), so they are collected here as *dense source ids only* and
+        // re-injected by the MAT index emitters (see `main.rs`). Keeping them out
+        // of `synthetic_edges` means the forward CSR — and therefore the
+        // dominator tree — is byte-for-byte what it was before.
+        let mut synthetic_self_edges: Vec<u32> = Vec::new();
         // Per-thread count of local roots that resolve to a live object. Sized
         // by #threads only (bounded), so it stays off the per-object RSS budget.
         let mut thread_local_counts: std::collections::HashMap<u32, u64> =
@@ -1165,7 +1174,10 @@ impl Pass2 {
                 Some(i) => i as u32,
                 None => continue,
             };
-            if thread_idx != local_idx {
+            if thread_idx == local_idx {
+                // Thread is one of its own locals: MAT records a self-edge.
+                synthetic_self_edges.push(thread_idx);
+            } else {
                 synthetic_edges.push((thread_idx, local_idx));
                 *thread_local_counts.entry(thread_serial).or_insert(0) += 1;
                 let sample = thread_local_samples.entry(thread_serial).or_default();
@@ -1183,6 +1195,8 @@ impl Pass2 {
         // Dedup synthetic edges (same thread may reference same local multiple times)
         synthetic_edges.sort_unstable();
         synthetic_edges.dedup();
+        synthetic_self_edges.sort_unstable();
+        synthetic_self_edges.dedup();
 
         // Add synthetic edge degrees to out_degree/in_degree
         for &(src, dst) in &synthetic_edges {
@@ -1640,6 +1654,7 @@ impl Pass2 {
             in_cursors,
             total_inb,
             synthetic_edges,
+            synthetic_self_edges,
         };
 
         t_phase!("2b scan done");

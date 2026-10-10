@@ -26,15 +26,57 @@ pub struct MatClassMeta {
     pub file_size: u64,
     /// HPROF format string (e.g. "JAVA PROFILE 1.0.2")
     pub format: String,
+    /// HPROF object-id byte width (8 for modern dumps).
+    pub id_size: u8,
+    /// Object-reference byte width detected by pass 2 (`ref_size < id_size`
+    /// means compressed oops). Set after the graph is built.
+    pub ref_size: u8,
+    /// Absolute path of the heap dump, written into SnapshotInfo.path/prefix.
+    pub dump_path: String,
+    /// class-object address → MAT id (reachable class objects only). Filled in
+    /// after the id map is built; lets ClassImpl emit a real `address` and
+    /// resolve `superClassId`/`classLoaderId` (both are MAT ids, not addresses).
+    pub class_addr_to_mat: HashMap<u64, i32>,
+    /// class-object MAT id → its address (reverse of the above).
+    pub class_mat_to_addr: HashMap<i32, u64>,
+    /// class-loader object address → MAT id.
+    pub loader_addr_to_mat: HashMap<u64, i32>,
+    /// class-object address → its declared instance fields, as
+    /// `(name, HPROF typecode)` in HPROF dump order.
+    ///
+    /// MAT's `FieldDescriptor.type` is `IObject.Type`, whose constants are
+    /// numerically identical to the HPROF basic typecodes (OBJECT=2,
+    /// BOOLEAN=4 … LONG=11), so the HPROF typecode can be written straight
+    /// through.
+    pub class_fields: HashMap<u64, Vec<(String, u8)>>,
 }
 
 impl MatClassMeta {
     /// Extract the fields we need from Pass1 before it is moved into Pass2::build.
-    pub fn from_pass1(p1: &crate::pass1::Pass1) -> Self {
+    pub fn from_pass1(p1: &crate::pass1::Pass1, dump_path: &str) -> Self {
         let class_info = p1
             .class_map
             .iter()
             .map(|(&addr, ci)| (addr, (ci.super_id, ci.loader_id, ci.instance_size)))
+            .collect();
+        // Instance field names per class, for MAT's ClassImpl.fields
+        // (FieldDescriptor[]). ~40k classes x ~10 fields on a large dump.
+        let class_fields: HashMap<u64, Vec<(String, u8)>> = p1
+            .class_map
+            .iter()
+            .map(|(&addr, ci)| {
+                let v: Vec<(String, u8)> = ci
+                    .fields
+                    .iter()
+                    .map(|&(name_id, ty)| {
+                        (
+                            p1.strings.get(&name_id).cloned().unwrap_or_default(),
+                            ty.code(),
+                        )
+                    })
+                    .collect();
+                (addr, v)
+            })
             .collect();
         MatClassMeta {
             class_info,
@@ -42,6 +84,13 @@ impl MatClassMeta {
             timestamp_ms: p1.header_timestamp_ms,
             file_size: p1.file_size,
             format: p1.format.clone(),
+            id_size: p1.id_size,
+            ref_size: p1.id_size,
+            dump_path: dump_path.to_string(),
+            class_addr_to_mat: HashMap::new(),
+            class_mat_to_addr: HashMap::new(),
+            loader_addr_to_mat: HashMap::new(),
+            class_fields,
         }
     }
 }
@@ -622,9 +671,30 @@ impl MatEmitter {
 
         // --- 1. XSnapshotInfo ---
         // XSnapshotInfo extends SnapshotInfo (uid=4) which extends nothing.
-        // SnapshotInfo fields: creationDate:Date, properties:HashMap<String,Serializable>
-        // XSnapshotInfo fields (none declared beyond super).
+        // XSnapshotInfo declares no fields of its own.
         // We write: XSnapshotInfo → SnapshotInfo → null
+        //
+        // SnapshotInfo's declared field list must match MAT's exactly. MAT 1.17
+        // declares 11 (6 primitives + 5 objects) — see
+        // org.eclipse.mat.snapshot.SnapshotInfo. A stream that omits them leaves
+        // the corresponding MAT fields at their Java defaults (0 / null), which
+        // silently zeroes "number of objects", "used heap size" etc. in every
+        // MAT report, so the whole list is emitted here.
+        let snapshot_fields = || {
+            vec![
+                f_int("identifierSize"),
+                f_int("numberOfClassLoaders"),
+                f_int("numberOfClasses"),
+                f_int("numberOfGCRoots"),
+                f_int("numberOfObjects"),
+                f_long("usedHeapSize"),
+                f_obj("creationDate", "Ljava/util/Date;"),
+                f_obj("jvmInfo", "Ljava/lang/String;"),
+                f_obj("path", "Ljava/lang/String;"),
+                f_obj("prefix", "Ljava/lang/String;"),
+                f_obj("properties", "Ljava/util/Map;"),
+            ]
+        };
         let snapshot_chain = vec![
             ClassDesc {
                 name: "org.eclipse.mat.parser.model.XSnapshotInfo".into(),
@@ -636,44 +706,104 @@ impl MatEmitter {
                 name: "org.eclipse.mat.snapshot.SnapshotInfo".into(),
                 uid: uid::SNAPSHOT_INFO,
                 flags: SC_SERIALIZABLE,
-                fields: vec![
-                    f_obj("creationDate", "Ljava/util/Date;"),
-                    f_obj("properties", "Ljava/util/Map;"),
-                ],
+                fields: snapshot_fields(),
             },
         ];
-        // SnapshotInfo field values (superclass first, i.e. SnapshotInfo layer written second):
-        // primitives in alpha order (none here), then object fields in alpha order: creationDate, properties.
-        // MAT's `hprof.version` property holds the *name* of its
-        // `org.eclipse.mat.hprof.describer.Version` enum, not the dump's header
-        // string: on reopen it does `Version.valueOf(prop)`, so the raw header
-        // ("JAVA PROFILE 1.0.1") throws
-        //   IllegalArgumentException: No enum constant
-        //   org.eclipse.mat.hprof.describer.Version.JAVA PROFILE 1.0.1
-        // The enum's labels are exactly the header strings (JDK12BETA3 =
-        // "JAVA PROFILE 1.0", JDK12BETA4 = "JAVA PROFILE 1.0.1", JDK6 =
-        // "JAVA PROFILE 1.0.2"), which is what MAT's own index stores.
+
+        // --- SnapshotInfo counters (MAT recomputes none of these on reopen) ---
+        // `numberOfObjects` must count the synthetic id-0 root too: MAT sizes its
+        // object-marking arrays from this value and then indexes them with real
+        // object ids (0..N), so writing N instead of N+1 makes
+        // `ObjectMarkerOld.markSingleThreaded` throw
+        // `ArrayIndexOutOfBoundsException: Index N out of bounds for length N`
+        // and silently drop every `getRetainedSet`-based result from the report.
+        let n_objects = mm.mat_count() as i32;
+        // MAT counts distinct *class objects*, not class-histogram rows: several
+        // rows (a canonical one plus per-loader "alias" rows) can map to the same
+        // class object, and MAT's own index reports 853 for this dump where a
+        // row count gives 854.
+        let n_classes = {
+            let mut seen = std::collections::HashSet::new();
+            for row in 0..num_rows {
+                let old_cobj = inv[row];
+                if old_cobj >= 0 {
+                    let m = mm.translate(old_cobj);
+                    if m > 0 {
+                        seen.insert(m);
+                    }
+                }
+            }
+            seen.len() as i32
+        };
+        let n_loaders = {
+            let mut seen = std::collections::HashSet::new();
+            for &l in class_loader_id {
+                if l != 0 {
+                    seen.insert(l);
+                }
+            }
+            seen.len() as i32
+        };
+        // MAT counts distinct root *objects*; two root records can name the same
+        // object, and MAT's own index reports 838 here against 839 records.
+        let n_roots = {
+            let mut seen = std::collections::HashSet::new();
+            for &a in &meta.gc_root_addrs {
+                seen.insert(a);
+            }
+            seen.len() as i32
+        };
+        // usedHeapSize = sum of shallow sizes over reachable objects (MAT's own
+        // index records exactly this, and it is not recomputable from the rest
+        // of the cache).
+        let used_heap_size: i64 = mm
+            .sorted()
+            .iter()
+            .map(|&old| shallow[old as usize] as i64)
+            .sum();
+        let id_size = meta.id_size as i32;
+        let compressed_oops = meta.ref_size < meta.id_size;
+        let dump_path = meta.dump_path.clone();
+        let prefix = {
+            // MAT's prefix is the dump path with the final extension removed,
+            // plus a '.':  /tmp/x.hprof -> /tmp/x.
+            let p = std::path::Path::new(&dump_path);
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("dump");
+            match p.parent().and_then(|d| d.to_str()) {
+                Some(d) if !d.is_empty() => format!("{d}/{stem}."),
+                _ => format!("{stem}."),
+            }
+        };
+        // `hprof.version` is NOT the HPROF header string. MAT's
+        // HprofHeapObjectReader.open() does
+        //   Version.valueOf(snapshotInfo.getProperty("hprof.version"))
+        // against org.eclipse.mat.hprof.describer.Version, whose constants are
+        // the enum NAMES JDK12BETA3 / JDK12BETA4 / JDK6 — their describe strings
+        // are "JAVA PROFILE 1.0" / "1.0.1" / "1.0.2". Writing the header string
+        // throws IllegalArgumentException and aborts the snapshot open.
         let hprof_version = match meta.format.as_str() {
             "JAVA PROFILE 1.0" => "JDK12BETA3",
             "JAVA PROFILE 1.0.1" => "JDK12BETA4",
-            _ => "JDK6",
-        }
-        .to_string();
+            _ => "JDK6", // "JAVA PROFILE 1.0.2" and anything newer
+        };
         let file_size = meta.file_size;
         let ts_ms = meta.timestamp_ms as i64;
         let snapshot_layers = vec![
-            // XSnapshotInfo layer (subclass, written second in reverse — actually first since we iterate layers.rev())
+            // XSnapshotInfo layer (subclass)
             LayerData {
                 fields: vec![],
                 values: vec![],
             },
-            // SnapshotInfo layer (superclass, written first in stream = last in layers.rev())
+            // SnapshotInfo layer (superclass)
             LayerData {
-                fields: vec![
-                    f_obj("creationDate", "Ljava/util/Date;"),
-                    f_obj("properties", "Ljava/util/Map;"),
-                ],
+                fields: snapshot_fields(),
                 values: vec![
+                    ("identifierSize".into(), FieldVal::Int(id_size)),
+                    ("numberOfClassLoaders".into(), FieldVal::Int(n_loaders)),
+                    ("numberOfClasses".into(), FieldVal::Int(n_classes)),
+                    ("numberOfGCRoots".into(), FieldVal::Int(n_roots)),
+                    ("numberOfObjects".into(), FieldVal::Int(n_objects)),
+                    ("usedHeapSize".into(), FieldVal::Long(used_heap_size)),
                     (
                         "creationDate".into(),
                         FieldVal::ObjRef(Box::new(move |s: &mut Ser| {
@@ -681,9 +811,25 @@ impl MatEmitter {
                         })),
                     ),
                     (
+                        "jvmInfo".into(),
+                        FieldVal::ObjRef(Box::new(|s: &mut Ser| s.null())),
+                    ),
+                    (
+                        "path".into(),
+                        FieldVal::ObjRef(Box::new(move |s: &mut Ser| {
+                            s.string(&dump_path);
+                        })),
+                    ),
+                    (
+                        "prefix".into(),
+                        FieldVal::ObjRef(Box::new(move |s: &mut Ser| {
+                            s.string(&prefix);
+                        })),
+                    ),
+                    (
                         "properties".into(),
                         FieldVal::ObjRef(Box::new(move |s: &mut Ser| {
-                            // Properties map: known MAT keys from the real .index.
+                            // Properties map: the keys MAT's own index carries.
                             // $heapFormat, $useCompressedOops, hprof.version, hprof.length
                             let entries: Vec<(
                                 i32,
@@ -704,8 +850,8 @@ impl MatEmitter {
                                     Box::new(|s: &mut Ser| {
                                         s.string("$useCompressedOops");
                                     }),
-                                    Box::new(|s: &mut Ser| {
-                                        s.write_boolean(false);
+                                    Box::new(move |s: &mut Ser| {
+                                        s.write_boolean(compressed_oops);
                                     }),
                                 ),
                                 (
@@ -714,7 +860,7 @@ impl MatEmitter {
                                         s.string("hprof.version");
                                     }),
                                     Box::new(move |s: &mut Ser| {
-                                        s.string(&hprof_version);
+                                        s.string(hprof_version);
                                     }),
                                 ),
                                 (
@@ -805,33 +951,57 @@ impl MatEmitter {
             &hm,
             |s, val_idx| {
                 let (mat_id, row) = class_entries[val_idx];
-                let old_cobj = inv[row];
-                let addr = if old_cobj >= 0 {
-                    mm.addr_at_mat(mat_id)
-                } else {
-                    0
-                };
+                // Real class-object address (resolved in main.rs while the
+                // address array was still resident).
+                let addr = meta.class_mat_to_addr.get(&mat_id).copied().unwrap_or(0);
                 let name = &class_names[row];
                 let loader_addr = class_loader_id[row];
-                let loader_mid = if loader_addr != 0 {
-                    // find old_id for loader address: translate addr → dense id → mat-id
-                    // We don't have a reverse addr→dense map here, so store 0 (boot loader).
-                    // MAT ignores loader_id=0 (treats as bootstrap).
-                    0i32
+                // MAT records the bootstrap loader as address 0 / id 0 (id 0 is
+                // its synthetic address-0 loader), so an unresolved loader falls
+                // back to 0 rather than -1.
+                let loader_mid = if loader_addr == 0 {
+                    0
                 } else {
-                    0i32
+                    meta.loader_addr_to_mat
+                        .get(&loader_addr)
+                        .copied()
+                        .unwrap_or(0)
                 };
                 let (super_addr, _loader_addr_ci, inst_size) =
                     meta.class_info.get(&addr).copied().unwrap_or((0, 0, 0));
-                // Find super's mat-id by looking it up via its address.
-                let super_mat_id = 0i32; // placeholder: requires addr→mat-id reverse lookup
+                // superClassId is a MAT id, resolved from the super's address.
+                // Keep the (address, id) pair consistent: if the super's class
+                // object is not in the cache, emit "no superclass" rather than a
+                // dangling id — ClassImpl.getSuperClass() keys off the address.
+                let super_mat_id = meta
+                    .class_addr_to_mat
+                    .get(&super_addr)
+                    .copied()
+                    .unwrap_or(-1);
+                let super_addr = if super_mat_id < 0 { 0 } else { super_addr };
                 let is_array = name.starts_with('[');
+                // MAT stores the source form of the name, not the HPROF
+                // descriptor form.
+                let mat_name = mat_class_name(name);
                 let inst_count_val = instance_count[row];
                 let used_heap_val = used_heap[row];
-                let total_size = used_heap_val; // approximate: same as shallow sum
+                // ClassImpl.totalSize = sum of the shallow sizes of the class's
+                // instances (MAT: ClassImpl.addInstance adds each instance size).
+                let total_size = used_heap_val;
+                // ClassImpl.usedHeapSize is the shallow size of the CLASS OBJECT
+                // itself, not of its instances (MAT's own index records e.g. 40
+                // for a class with 12493 instances at 72 bytes each).
+                let class_obj_shallow = {
+                    let old_cobj = inv[row];
+                    if old_cobj >= 0 {
+                        shallow[old_cobj as usize] as i64
+                    } else {
+                        0
+                    }
+                };
 
                 let key_str = format!("class_0x{:x}", addr);
-                let name_clone = name.clone();
+                let name_clone = mat_name;
                 s.write_object_keyed(
                     &class_impl_chain,
                     // `layers` must be ordered subclass-first, parallel to `chain`:
@@ -880,33 +1050,31 @@ impl MatEmitter {
                                 ("totalSize".into(), FieldVal::Long(total_size)),
                                 (
                                     "usedHeapSize".into(),
-                                    FieldVal::Int(used_heap_val.min(i32::MAX as i64) as i32),
+                                    FieldVal::Int(class_obj_shallow.min(i32::MAX as i64) as i32),
                                 ),
                                 (
                                     "cacheEntry".into(),
                                     FieldVal::ObjRef(Box::new(|s: &mut Ser| s.null())),
                                 ),
-                                // `fields` / `staticFields` / `subClasses` must be
-                                // non-null even though we do not carry the data:
-                                // MAT's `ClassImpl.setSnapshot()` walks
-                                // `staticFields` while restoring the snapshot and
-                                // throws "NullPointerException: Cannot read the
-                                // array length because \"this.staticFields\" is
-                                // null", and the field / subclass views dereference
-                                // the other two. Empty means "no declared fields /
-                                // no static fields / no known subclasses".
-                                // (Carrying the real `FieldDescriptor`s is a
-                                // separate fidelity gap — see the report.)
+                                // `fields`, `staticFields` and `subClasses` must be
+                                // non-null: MAT's ClassImpl.setSnapshot() iterates
+                                // `staticFields` while restoring the snapshot (NPE
+                                // otherwise), and the field / subclass views
+                                // dereference the other two. Empty arrays/lists mean
+                                // "no declared fields / no static fields / no known
+                                // subclasses".
                                 (
                                     "fields".into(),
-                                    FieldVal::ObjRef(Box::new(|s: &mut Ser| {
-                                        s.write_object_array(
-                                            "[Lorg.eclipse.mat.snapshot.model.FieldDescriptor;",
-                                            uid::FIELD_DESCRIPTOR_ARRAY,
-                                            0,
-                                            |_| {},
-                                        );
-                                    })),
+                                    FieldVal::ObjRef({
+                                        let cf = meta
+                                            .class_fields
+                                            .get(&addr)
+                                            .cloned()
+                                            .unwrap_or_default();
+                                        Box::new(move |s: &mut Ser| {
+                                            write_field_descriptors(s, &cf);
+                                        })
+                                    }),
                                 ),
                                 (
                                     "name".into(),
@@ -1017,16 +1185,20 @@ impl MatEmitter {
         }
         ser.u8(TC_OBJECT);
         {
+            // MAT's BitField (org.eclipse.mat.collect.BitField, uid 1) declares
+            // exactly ONE field: `private int[] bits`. There is no `size` field —
+            // the bit count is implied by the array length. Writing a `size`/`words`
+            // pair leaves MAT's `bits` field null, and every later
+            // BitField.get(id) NPEs.
             let bf_cd = ClassDesc {
                 name: "org.eclipse.mat.collect.BitField".into(),
                 uid: uid::BIT_FIELD,
                 flags: SC_SERIALIZABLE,
-                fields: vec![f_int("size"), f_arr("words", "[I")],
+                fields: vec![f_arr("bits", "[I")],
             };
             ser.write_class_desc_chain(&[bf_cd]);
         }
         let _bf_handle = ser.assign_handle_pub();
-        ser.i32(mat_n as i32); // size
         // words: TC_ARRAY of int
         ser.write_int_array(&words);
 
@@ -1037,6 +1209,76 @@ impl MatEmitter {
         f.into_inner().map_err(|e| e.into_error())?.sync_all()?;
         Ok(())
     }
+}
+
+/// Convert an HPROF class name to the form MAT's `ClassImpl.getName()` uses.
+///
+/// HPROF stores JVM-internal names (`java/lang/String`, `[Ljava/lang/String;`);
+/// MAT normalises them to the source form (`java.lang.String`,
+/// `java.lang.String[]`, `int[][]`). MAT's class lookup by name
+/// (`getClassesByName`, OQL `FROM java.lang.String`) keys off this form, so a
+/// raw HPROF name makes those lookups miss.
+pub fn mat_class_name(name: &str) -> String {
+    let dims = name.chars().take_while(|&c| c == '[').count();
+    if dims == 0 {
+        return name.replace('/', ".");
+    }
+    let base = &name[dims..];
+    let comp = match base {
+        "I" => "int",
+        "J" => "long",
+        "S" => "short",
+        "B" => "byte",
+        "C" => "char",
+        "F" => "float",
+        "D" => "double",
+        "Z" => "boolean",
+        s if s.starts_with('L') && s.ends_with(';') && s.len() > 2 => &s[1..s.len() - 1],
+        _ => return name.replace('/', "."),
+    };
+    format!("{}{}", comp.replace('/', "."), "[]".repeat(dims))
+}
+
+/// Write a MAT `FieldDescriptor[]` (TC_ARRAY of
+/// `org.eclipse.mat.snapshot.model.FieldDescriptor`, uid 2, fields
+/// `type:int` + `name:String`).
+///
+/// `fields` is `(name, HPROF typecode)`; the typecode is numerically identical
+/// to MAT's `IObject.Type`, so it goes through unchanged.
+fn write_field_descriptors(s: &mut serial::Ser, fields: &[(String, u8)]) {
+    use serial::{FieldVal, LayerData, Ser, f_int, f_obj};
+    let chain = vec![serial::ClassDesc {
+        name: "org.eclipse.mat.snapshot.model.FieldDescriptor".into(),
+        uid: 2,
+        flags: serial::SC_SERIALIZABLE,
+        fields: vec![f_int("type"), f_obj("name", "Ljava/lang/String;")],
+    }];
+    let mut it = fields.iter();
+    s.write_object_array(
+        "[Lorg.eclipse.mat.snapshot.model.FieldDescriptor;",
+        serial::uid::FIELD_DESCRIPTOR_ARRAY,
+        fields.len() as i32,
+        move |s: &mut Ser| {
+            for (name, ty) in it.by_ref() {
+                let n = name.clone();
+                s.write_object(
+                    &chain,
+                    vec![LayerData {
+                        fields: vec![f_int("type"), f_obj("name", "Ljava/lang/String;")],
+                        values: vec![
+                            ("type".into(), FieldVal::Int(*ty as i32)),
+                            (
+                                "name".into(),
+                                FieldVal::ObjRef(Box::new(move |s: &mut Ser| {
+                                    s.string(&n);
+                                })),
+                            ),
+                        ],
+                    }],
+                );
+            }
+        },
+    );
 }
 
 /// MAT `SizeIndexCollectorUncompressed.compress`

@@ -100,6 +100,25 @@ impl HprofType {
             Self::Double | Self::Long => 8,
         }
     }
+
+    /// The raw HPROF basic type code. These are numerically identical to
+    /// Eclipse MAT's `org.eclipse.mat.snapshot.model.IObject.Type` constants
+    /// (OBJECT=2, BOOLEAN=4, CHAR=5, FLOAT=6, DOUBLE=7, BYTE=8, SHORT=9,
+    /// INT=10, LONG=11), so the code can be written straight into a MAT
+    /// `FieldDescriptor.type`.
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Object => 2,
+            Self::Boolean => 4,
+            Self::Char => 5,
+            Self::Float => 6,
+            Self::Double => 7,
+            Self::Byte => 8,
+            Self::Short => 9,
+            Self::Int => 10,
+            Self::Long => 11,
+        }
+    }
 }
 
 #[cfg(test)]
