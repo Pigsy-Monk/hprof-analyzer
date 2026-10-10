@@ -728,6 +728,22 @@ impl<'a, R: ClassResolver> SingleScanExecutor<'a, R> {
         if self.from_regex.is_some() {
             return true;
         }
+        // `FROM INSTANCEOF T` matches T and every subtype, and every array type is
+        // a subtype of Object, Cloneable and Serializable (JLS 4.10.3 / 10.7) —
+        // so an INSTANCEOF of one of those must deliver arrays even though the
+        // spec text carries no `[]`. Without this, `FROM INSTANCEOF
+        // java.lang.Object` silently drops every array: on the 44 GB fare dump
+        // that hid `Object[]` (29.6M instances) and `byte[]` (19.7M) — the top
+        // two classes by shallow size — from every histogram built that way, and
+        // made hprof's counts disagree with MAT's.
+        if self.query.from.instanceof()
+            && matches!(
+                from,
+                "java.lang.Object" | "java.lang.Cloneable" | "java.io.Serializable"
+            )
+        {
+            return true;
+        }
         from.ends_with("[]") || from.contains('*')
     }
 
@@ -1371,7 +1387,14 @@ impl<'a, R: ClassResolver> SingleScanExecutor<'a, R> {
                     || self.array_eval_pred(b, src_idx, class_name, length)
             }
             P::Not(a) => !self.array_eval_pred(a, src_idx, class_name, length),
-            P::InstanceOf(cname) => class_name_matches(class_name, cname),
+            // `x INSTANCEOF C` follows Java semantics — C and every subtype. An
+            // array `x` is an instance of Object/Cloneable/Serializable even
+            // though the target name matches no array class, so apply the same
+            // array-supertypes rule the FROM side uses (see
+            // `array_supertype_match`).
+            P::InstanceOf(cname) => {
+                class_name_matches(class_name, cname) || array_supertype_match(class_name, cname)
+            }
             P::InSubquery { lhs, .. } => self.eval_in_subquery(lhs, src_idx),
             P::Exists { .. } => {
                 let idx = self.exists_cursor.get();
@@ -1899,6 +1922,37 @@ pub fn compile_from_regex(
     }
 }
 
+/// The three supertypes EVERY array type has, whatever its element type — an
+/// array type's direct superclass is `Object` and it implements `Cloneable` and
+/// `java.io.Serializable` (JLS 4.10.3 / 10.7). Compared with [`sep_eq`] so a
+/// target written with `/` separators (`java/lang/Object`) matches too.
+const ARRAY_SUPERTYPES: [&str; 3] = [
+    "java.lang.Object",
+    "java.lang.Cloneable",
+    "java.io.Serializable",
+];
+
+/// True when `name` names an array type, in either the pretty form `classof()`
+/// prints and the scan hands to `visit_array` (`byte[]`, `java.lang.Object[]`)
+/// or the raw HPROF descriptor form (`[B`, `[Ljava.lang.Object;`).
+fn is_array_type_name(name: &str) -> bool {
+    name.ends_with("[]") || name.starts_with('[')
+}
+
+/// True when the array type `name` satisfies `INSTANCEOF target` because the
+/// target is one of the three supertypes every array type has (see
+/// [`ARRAY_SUPERTYPES`]). A `target` naming the array class itself is NOT
+/// handled here: both callers reach this only after their ordinary name match
+/// already failed.
+///
+/// HPROF records no superclass for an array class, so the `super_id` walk in
+/// `LiveResolver::is_instance_of` can never reach those three. Both array-aware
+/// INSTANCEOF entry points are name-only (the `visit_array` path carries no
+/// class id to walk), so the rule is applied here instead.
+fn array_supertype_match(name: &str, target: &str) -> bool {
+    is_array_type_name(name) && ARRAY_SUPERTYPES.iter().any(|p| sep_eq(target, p))
+}
+
 /// Match a dotted class `name_dotted` against a FROM [`ClassSpec`]. When the spec
 /// is a quoted-regex target, `from_regex` MUST be the pre-compiled regex for that
 /// spec (compiled once via [`compile_from_regex`]); the name matches iff the
@@ -1906,6 +1960,14 @@ pub fn compile_from_regex(
 /// through to the exact/glob [`class_name_matches`]. `from_regex` being `None`
 /// for a regex spec means the caller failed to compile it — treated as no match
 /// (the actionable error is raised earlier at plan/construction time).
+///
+/// `FROM INSTANCEOF T` also matches every subtype of `T`, and every array type
+/// is a subtype of `Object`, `Cloneable` and `Serializable` — so an INSTANCEOF
+/// of one of those must match array classes. Without that, `FROM INSTANCEOF
+/// java.lang.Object` silently dropped every array: on the 44 GB fare dump that
+/// hid `Object[]` (29.6M instances) and `byte[]` (19.7M), the top two classes by
+/// shallow size, from every histogram built that way, and made hprof's counts
+/// disagree with MAT's.
 pub fn class_name_matches_spec(
     name_dotted: &str,
     spec: &crate::query::ast::ClassSpec,
@@ -1918,6 +1980,7 @@ pub fn class_name_matches_spec(
         };
     }
     class_name_matches(name_dotted, &spec.class_name)
+        || (spec.instanceof && array_supertype_match(name_dotted, &spec.class_name))
 }
 
 /// Byte-wise equality treating `/` and `.` as the same separator.
@@ -2777,6 +2840,89 @@ mod tests {
         assert!(!class_name_matches_spec("org.other.Foo", &spec, None));
     }
 
+    fn instanceof_spec(src: &str) -> crate::query::ast::ClassSpec {
+        crate::query::ast::ClassSpec {
+            instanceof: true,
+            class_name: src.into(),
+            is_regex: false,
+        }
+    }
+
+    #[test]
+    fn instanceof_object_cloneable_serializable_match_arrays() {
+        // Every array type is a subtype of Object, Cloneable and Serializable
+        // (JLS 4.10.3 / 10.7). HPROF records no superclass for an array class,
+        // so the super-chain walk cannot reach those three — the name-only
+        // entry point must apply the rule itself.
+        for target in [
+            "java.lang.Object",
+            "java.lang.Cloneable",
+            "java.io.Serializable",
+        ] {
+            let spec = instanceof_spec(target);
+            for array in [
+                "java.lang.Object[]",
+                "byte[]",
+                "char[][]",
+                "[B",
+                "[Ljava/lang/Object;",
+            ] {
+                assert!(
+                    class_name_matches_spec(array, &spec, None),
+                    "{array} must be an instance of {target}"
+                );
+            }
+        }
+        // HPROF's own `/`-separated spelling matches too.
+        assert!(class_name_matches_spec(
+            "byte[]",
+            &instanceof_spec("java/lang/Object"),
+            None
+        ));
+    }
+
+    #[test]
+    fn instanceof_array_rule_does_not_widen_other_targets() {
+        // Negative controls: only the three array supertypes gain the rule.
+        // `String[]` is an array but is NOT a String, and `Thread[]` is not a
+        // Thread.
+        assert!(!class_name_matches_spec(
+            "java.lang.String[]",
+            &instanceof_spec("java.lang.String"),
+            None
+        ));
+        assert!(!class_name_matches_spec(
+            "java.lang.Thread[]",
+            &instanceof_spec("java.lang.Thread"),
+            None
+        ));
+        // An array target still matches only that array class (no covariance:
+        // `byte[]` is not an `Object[]`).
+        assert!(class_name_matches_spec(
+            "java.lang.Object[]",
+            &instanceof_spec("java.lang.Object[]"),
+            None
+        ));
+        assert!(!class_name_matches_spec(
+            "byte[]",
+            &instanceof_spec("java.lang.Object[]"),
+            None
+        ));
+        // A plain `FROM C` is exact — the INSTANCEOF rule must not leak into it.
+        assert!(!class_name_matches_spec(
+            "java.lang.Object[]",
+            &glob_spec("java.lang.Object"),
+            None
+        ));
+        // Non-array names are untouched here (the resolver's super-chain walk
+        // owns those).
+        assert!(!class_name_matches_spec(
+            "java.lang.String",
+            &instanceof_spec("java.lang.Object"),
+            None
+        ));
+    }
+
     #[test]
     fn compile_from_regex_bad_pattern_is_actionable_error() {
         let spec = regex_spec("[");
@@ -3591,6 +3737,52 @@ mod tests {
     }
 
     // --- Array path (@length projection + array WHERE) ---
+
+    #[test]
+    fn from_instanceof_object_delivers_arrays() {
+        // `FROM INSTANCEOF java.lang.Object` must match array objects too. The
+        // scan hands arrays to `visit_array` by class NAME (there is no class id
+        // to walk), so the array-supertypes rule has to live in the name matcher.
+        let q = parse("SELECT @objectId FROM INSTANCEOF java.lang.Object").unwrap();
+        let plan = pq(&q);
+        let sc = schema(&[(10, "java.lang.Object")]);
+        let mut ex = SingleScanExecutor::new(&q, &plan, &sc);
+        ex.visit_instance(1, 10, &[]);
+        ex.visit_array(2, "byte[]", 4);
+        ex.visit_array(3, "java.lang.Object[]", 2);
+        let res = ex.finish("q1");
+        assert_eq!(res.row_count, 3, "instance + both arrays must match");
+    }
+
+    #[test]
+    fn from_instanceof_other_class_ignores_arrays() {
+        // Negative control at the executor level: an INSTANCEOF of a class that
+        // is not an array supertype must still reject every array.
+        let q = parse("SELECT @objectId FROM INSTANCEOF java.lang.String").unwrap();
+        let plan = pq(&q);
+        let sc = schema(&[(10, "java.lang.String")]);
+        let mut ex = SingleScanExecutor::new(&q, &plan, &sc);
+        ex.visit_array(2, "byte[]", 4);
+        ex.visit_array(3, "java.lang.Object[]", 2);
+        ex.visit_instance(1, 10, &[]);
+        let res = ex.finish("q1");
+        assert_eq!(res.row_count, 1, "only the String instance may match");
+    }
+
+    #[test]
+    fn where_instanceof_object_matches_arrays() {
+        // The `WHERE x INSTANCEOF C` predicate is the same rule on the array
+        // path and must agree with the FROM side.
+        let q =
+            parse("SELECT @length FROM byte[] s WHERE s INSTANCEOF java.lang.Cloneable").unwrap();
+        let plan = pq(&q);
+        let sc = schema(&[]);
+        let mut ex = SingleScanExecutor::new(&q, &plan, &sc);
+        ex.visit_array(1, "byte[]", 4);
+        let res = ex.finish("q1");
+        assert_eq!(res.row_count, 1);
+        assert_eq!(res.rows[0][0], QueryValue::Int(4));
+    }
 
     #[test]
     fn array_length_projects_real_count() {

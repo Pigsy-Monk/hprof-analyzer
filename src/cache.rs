@@ -58,7 +58,13 @@ pub struct ArraysForCache<'a> {
     pub n_objects: usize,
 }
 
-/// Graph-mode extras (opt-in with --with-graph).
+/// The forward half of the graph cache (opt-in with --with-graph).
+///
+/// `graph.bin` is assembled in two phases because its halves exist at different
+/// points in the pipeline: the forward CSR must be streamed out *before*
+/// `build_from_fwd` consumes it (that is what lets it borrow the chunked store
+/// instead of flattening it), while the inbound CSR is only produced by that
+/// call. See `CacheDir::graph_writer`.
 pub struct GraphForCache<'a> {
     pub fwd_off: &'a [u32],
     /// Forward edge targets. Held as the chunked store rather than a flat
@@ -67,8 +73,6 @@ pub struct GraphForCache<'a> {
     /// original is still live) was the bulk of the ~50 GiB `--with-graph` peak.
     /// The writer streams it straight into the compressor instead.
     pub fwd_tgt: &'a ChunkU32,
-    pub inb_off: &'a [u32],
-    pub inb_tgt: &'a [u32],
     /// Only when --ref-paths was used.
     pub fwd_field_idx: Option<&'a [u16]>,
 }
@@ -204,9 +208,19 @@ impl CacheDir {
 
     // ── Graph layer ───────────────────────────────────────────────────────────
 
-    pub fn write_graph(&self, g: &GraphForCache) -> io::Result<()> {
-        let n_arrays = if g.fwd_field_idx.is_some() { 5 } else { 4 };
-        let mut w = IndexedWriter::create(&self.path.join("graph.bin"), n_arrays)?;
+    /// Start a `graph.bin` write. See [`CacheDir::add_forward_to_graph`] and
+    /// [`CacheDir::add_inbound_to_graph`] for what to add, and in which order.
+    pub fn graph_writer(&self, has_fwd_field_idx: bool) -> io::Result<IndexedWriter> {
+        // fwd_off + fwd_tgt (+ fwd_field_idx) + inb_block_off + inb_data
+        let n_arrays = 2 + usize::from(has_fwd_field_idx) + 2;
+        IndexedWriter::create(&self.path.join("graph.bin"), n_arrays)
+    }
+
+    /// Add the forward half: `fwd_off`, `fwd_tgt` (+ `fwd_field_idx`).
+    ///
+    /// Must run *before* `build_from_fwd` consumes the CSR, which is what lets
+    /// `fwd_tgt` stream out of the chunked store without being flattened.
+    pub fn add_forward_to_graph(w: &mut IndexedWriter, g: &GraphForCache) -> io::Result<()> {
         w.add_u32("fwd_off", g.fwd_off.iter().copied())?;
         // `fwd_off` is the CSR offset table, so its last entry is the edge count.
         let total_edges = g.fwd_off.last().copied().unwrap_or(0) as usize;
@@ -218,12 +232,42 @@ impl CacheDir {
                 .copied()
                 .take(total_edges),
         )?;
-        w.add_u32("inb_off", g.inb_off.iter().copied())?;
-        w.add_delta_u32("inb_tgt", g.inb_tgt.iter().copied())?;
         if let Some(fi) = g.fwd_field_idx {
             w.add_delta_u16("fwd_field_idx", fi.iter().copied())?;
         }
-        w.finish()
+        Ok(())
+    }
+
+    /// Add the inbound half: `inb_block_off` + `inb_data`, straight from
+    /// `InboundBuilder::build_from_fwd`'s return value.
+    ///
+    /// These used to be written as empty arrays ("inbound CSR omitted for now"),
+    /// which is why the one reader that wanted an inbound CSR
+    /// (`read_inbound_csr`) always came back empty. They are stored in the
+    /// engine's own block format rather than as a flat CSR: that is what
+    /// `compute_dominators` and the query engine's edge hook consume, so a
+    /// cache-backed session can use them without a second conversion.
+    pub fn add_inbound_to_graph(
+        w: &mut IndexedWriter,
+        inb_block_off: &[u64],
+        inb_data: &[u8],
+    ) -> io::Result<()> {
+        w.add_u64("inb_block_off", inb_block_off.iter().copied())?;
+        w.add_bytes("inb_data", inb_data)
+    }
+
+    /// Read the inbound CSR written by [`CacheDir::add_inbound_to_graph`].
+    ///
+    /// Returns `(inb_block_off, inb_data)` or `None` when the cache predates
+    /// the inbound half (or has no graph at all).
+    pub fn read_inbound_blocks(&self) -> io::Result<Option<(Vec<u64>, Vec<u8>)>> {
+        let path = self.path.join("graph.bin");
+        let off = read_u64_array(&path, "inb_block_off")?;
+        let data = read_raw_array(&path, "inb_data")?;
+        Ok(match (off, data) {
+            (Some(o), Some(d)) if !o.is_empty() => Some((o, d)),
+            _ => None,
+        })
     }
 
     /// Rebuild an OQL query session straight from this cache.
@@ -535,6 +579,29 @@ impl IndexedWriter {
         })
     }
 
+    /// Little-endian u64s, no delta.
+    pub fn add_u64<I: IntoIterator<Item = u64>>(&mut self, name: &str, it: I) -> io::Result<()> {
+        self.add_frame(name, |enc| {
+            let mut buf: Vec<u8> = Vec::with_capacity(STAGE_BYTES);
+            for v in it {
+                buf.extend_from_slice(&v.to_le_bytes());
+                if buf.len() >= STAGE_BYTES {
+                    enc.write_all(&buf)?;
+                    buf.clear();
+                }
+            }
+            if !buf.is_empty() {
+                enc.write_all(&buf)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Raw bytes, no transform — for opaque payloads like `inb_data`.
+    pub fn add_bytes(&mut self, name: &str, data: &[u8]) -> io::Result<()> {
+        self.add_frame(name, |enc| enc.write_all(data))
+    }
+
     /// Patch the index and move the finished file into place.
     pub fn finish(mut self) -> io::Result<()> {
         if self.entries.len() != self.n_arrays {
@@ -645,6 +712,15 @@ fn read_delta_u32_array(path: &Path, name: &str) -> io::Result<Option<Vec<u32>>>
     let raw = decompress_zstd_frame(f, len)?;
     let deltas = le_bytes_to_i32(&raw);
     Ok(Some(undelta_zigzag_i32(&deltas)))
+}
+
+/// Read an entry as opaque bytes, with no byte-order interpretation — the
+/// counterpart of `IndexedWriter::add_bytes`.
+fn read_raw_array(path: &Path, name: &str) -> io::Result<Option<Vec<u8>>> {
+    let Some((f, len)) = seek_to_entry(path, name)? else {
+        return Ok(None);
+    };
+    Ok(Some(decompress_zstd_frame(f, len)?))
 }
 
 // ── Compression helpers ───────────────────────────────────────────────────────
@@ -768,4 +844,63 @@ fn dir_size(path: &Path) -> u64 {
         .filter(|m| m.is_file())
         .map(|m| m.len())
         .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_path(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join("hprof-cache-tests");
+        let _ = fs::create_dir_all(&dir);
+        dir.join(name)
+    }
+
+    /// Every array kind the graph writer uses must survive a write/read round
+    /// trip. `add_bytes`/`read_raw_array` in particular exist only for the
+    /// inbound payload, which is opaque vbyte data.
+    #[test]
+    fn indexed_writer_round_trips_every_array_kind() {
+        let path = tmp_path("roundtrip.bin");
+        let mut w = IndexedWriter::create(&path, 5).unwrap();
+        w.add_u32("fwd_off", [0u32, 2, 5]).unwrap();
+        w.add_delta_u32("fwd_tgt", [1u32, 4, 4, 9, 2]).unwrap();
+        w.add_delta_u16("fwd_field_idx", [3u16, 3, 0]).unwrap();
+        w.add_u64("inb_block_off", [0u64, 7]).unwrap();
+        w.add_bytes("inb_data", &[1, 2, 3, 4, 5, 6, 7]).unwrap();
+        w.finish().unwrap();
+
+        assert_eq!(
+            read_u32_array(&path, "fwd_off").unwrap().unwrap(),
+            [0, 2, 5]
+        );
+        assert_eq!(
+            read_delta_u32_array(&path, "fwd_tgt").unwrap().unwrap(),
+            [1, 4, 4, 9, 2]
+        );
+        assert_eq!(
+            read_u64_array(&path, "inb_block_off").unwrap().unwrap(),
+            [0, 7]
+        );
+        assert_eq!(
+            read_raw_array(&path, "inb_data").unwrap().unwrap(),
+            [1, 2, 3, 4, 5, 6, 7]
+        );
+    }
+
+    /// The index sits ahead of the data, so the array count has to be declared
+    /// up front. A mismatch must fail loudly rather than leave a file whose
+    /// index points into the wrong frame — `graph.bin` is two-phase (forward
+    /// before `build_from_fwd`, inbound after), so the count is easy to get
+    /// wrong, and it was.
+    #[test]
+    fn indexed_writer_rejects_a_missing_array() {
+        let path = tmp_path("short.bin");
+        let mut w = IndexedWriter::create(&path, 4).unwrap();
+        w.add_u32("a", [1u32]).unwrap();
+        w.add_u32("b", [2u32]).unwrap();
+        w.add_u32("c", [3u32]).unwrap();
+        let err = w.finish().unwrap_err().to_string();
+        assert!(err.contains("expected 4 arrays, got 3"), "{err}");
+    }
 }
