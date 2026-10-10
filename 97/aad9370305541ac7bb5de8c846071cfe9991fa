@@ -1,0 +1,32 @@
+src/query/repl.rs
+  s_d88b882af55fa9::t_f917e5cbc88713 5241-5244,5281-5294,5303-5308
+  s_d88b882af55fa9::t_1413718dec950f 6047-6071
+src/query/execute.rs
+  s_d88b882af55fa9::t_965aab63b67059 918-919,921
+  s_d88b882af55fa9::t_eda16e1d17da0a 647-765,767-784
+src/query/run.rs
+  s_d88b882af55fa9::t_965f2536f13e5a 856-860
+  s_d88b882af55fa9::t_b3dd1c02dbfa9e 2416-2462
+  s_d88b882af55fa9::t_fcb5909ed57a66 986-990
+  s_d88b882af55fa9::t_867922678e3895 794-831,851-854
+  s_d88b882af55fa9::t_26aee9c275f6e9 901,908-909,911
+  s_d88b882af55fa9::t_80f19e6de2ffda 910
+src/query/server.rs
+  s_d88b882af55fa9::t_49c9e7b9920099 459-464
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.45-trip",
+  "base_commit_sha": "97aad9370305541ac7bb5de8c846071cfe9991fa",
+  "prompts": {},
+  "sessions": {
+    "s_d88b882af55fa9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "99417d7d-eefa-47ba-a772-d0c0f9c0d8ed",
+        "model": "deepseek-v4-1-flash-260910"
+      },
+      "human_author": "zwsong <zwsong@trip.com>"
+    }
+  }
+}
