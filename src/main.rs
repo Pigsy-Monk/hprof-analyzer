@@ -5452,47 +5452,59 @@ fn run(
     //   * object 0's dominator is the superroot (domIn[0] == 1), so 0 is one of
     //     the superroot's children — without it MAT's dominator traversal never
     //     reaches the synthetic root and Top Consumers collapses;
-    //   * the superroot's children are sorted by retained size DESCENDING
-    //     (`DominatorTree.sortByTotalSize`), because `TopConsumersQuery` walks
-    //     that list as a prefix and stops at the first entry under the
-    //     threshold. An id-ordered list makes it stop immediately and report
-    //     "no objects bigger than 1%".
+    //   * EVERY parent's child list is sorted by retained size DESCENDING, not
+    //     just the superroot's. MAT's `DominatorTree.writeIndexFiles` calls
+    //     `tree.sortByTotalSize(successors)` inside the loop over all parents
+    //     (MAT 1.16.1 `DominatorTree.java:405-410`), so each domOut entry is
+    //     ordered by `ts[child]` descending. `ArrayUtils.sortDesc` is a stable
+    //     sort for entry sizes below `USE_RADIX` (1e6), and the upstream
+    //     `ArrayUtils.sort(dom, objectIds, ...)` that produced MAT's child order
+    //     is likewise stable, so ties keep ascending mat-id order — which is
+    //     exactly our `dc_tgt` order, so a stable `Reverse(retained)` sort
+    //     reproduces MAT byte-for-byte.
     // Emitted here, after `compute_retained`, because the sort needs the
     // retained sizes.
     if let Some(ref m) = mat {
         let mm = mat_map.as_ref().expect("mat_map built with mat");
         let n = g.n;
-        // entry 0: the superroot's dom-children, biggest retained first
+        // entry 0: the superroot's dom-children, biggest retained first.
+        // The synthetic mat-id 0 is dominated by the superroot too and is NOT
+        // forced last: MAT sorts it in by its retained size (which is
+        // `mat_root_instance_size`, the same value o2ret[0] carries). It is
+        // seeded FIRST so that, being the smallest object id, it wins the
+        // ascending-id tie-break the stable sort preserves.
         let lo0 = dc_off[n] as usize;
         let hi0 = dc_off[n + 1] as usize;
-        let mut vroot_children: Vec<(i32, u64)> = dc_tgt[lo0..hi0]
-            .iter()
-            .filter_map(|&v| {
-                let mid = mm.translate(v as i32);
-                if mid >= 0 {
-                    Some((mid, g.retained[v as usize]))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let mut vroot_children: Vec<(i32, u64)> = Vec::with_capacity(hi0 - lo0 + 1);
+        vroot_children.push((0, mat_root_instance_size as u64));
+        vroot_children.extend(dc_tgt[lo0..hi0].iter().filter_map(|&v| {
+            let mid = mm.translate(v as i32);
+            if mid >= 0 {
+                Some((mid, g.retained[v as usize]))
+            } else {
+                None
+            }
+        }));
         vroot_children.sort_by_key(|b| std::cmp::Reverse(b.1));
-        let mut vroot_children: Vec<i32> = vroot_children.into_iter().map(|(mid, _)| mid).collect();
-        // The synthetic object 0 is dominated by the superroot too; its
-        // retained size is the smallest of the lot, so it sorts last.
-        vroot_children.push(0);
+        let vroot_children: Vec<i32> = vroot_children.into_iter().map(|(mid, _)| mid).collect();
         let iter = std::iter::once(vroot_children)
             .chain(std::iter::once(Vec::new())) // entry 1: mat-id 0 synthetic root
             .chain(mm.sorted().iter().map(|&old_id| {
                 let lo = dc_off[old_id as usize] as usize;
                 let hi = dc_off[old_id as usize + 1] as usize;
-                dc_tgt[lo..hi]
+                let mut kids: Vec<(i32, u64)> = dc_tgt[lo..hi]
                     .iter()
                     .filter_map(|&v| {
                         let mid = mm.translate(v as i32);
-                        if mid >= 0 { Some(mid) } else { None }
+                        if mid >= 0 {
+                            Some((mid, g.retained[v as usize]))
+                        } else {
+                            None
+                        }
                     })
-                    .collect::<Vec<i32>>()
+                    .collect();
+                kids.sort_by_key(|b| std::cmp::Reverse(b.1));
+                kids.into_iter().map(|(mid, _)| mid).collect::<Vec<i32>>()
             }));
         m.emit_dom_out_iter(iter)?;
         crate::trace::trim();
