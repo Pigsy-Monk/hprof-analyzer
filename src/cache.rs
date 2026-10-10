@@ -226,6 +226,68 @@ impl CacheDir {
         w.finish()
     }
 
+    /// Rebuild an OQL query session straight from this cache.
+    ///
+    /// The analysis pipeline hands the OQL engine an `OqlCacheHandover`
+    /// assembled from `Pass1` plus the graph it just built (see
+    /// `keep_oql_cache`). Every one of that handover's fields is either in
+    /// `pass1.bin.zst` — `id_map` via `IdMapPages`, the rest verbatim — or
+    /// derivable from it, and `arrays.bin` carries `shallow` / `class_idx`, so
+    /// the same session can be reconstructed from disk. That is what lets a
+    /// server come up warm in seconds instead of re-running a pipeline that
+    /// costs ~50 minutes and ~20 GiB on a 44 GB dump.
+    ///
+    /// Scope matches the pipeline's handover exactly: `reachable_only: false`
+    /// with `dfn: None`, i.e. bit-for-bit the cache the first query builds today.
+    ///
+    /// Lives here rather than in the library's free functions because both
+    /// `main.rs` and `lib.rs` declare a module tree and compile this file into
+    /// each; keeping the assembly in one file keeps the types on both sides
+    /// identical. Returns `Ok(None)` when the cache is absent or undecodable.
+    pub fn read_query_cache(
+        &self,
+        source: crate::source::HprofSource,
+    ) -> io::Result<Option<crate::query::run::ReplCache>> {
+        if !self.is_valid(CacheMode::Full) {
+            return Ok(None);
+        }
+        // A cache can pass `is_valid` (magic bytes and file presence only) and
+        // still fail to decode — bincode is not self-describing — so every read
+        // here is best-effort: anything missing or undecodable means "no warm
+        // start", never a hard error.
+        let Some(snap) = self.read_pass1().ok().flatten() else {
+            return Ok(None);
+        };
+        let (Some(shallow), Some(class_idx)) = (
+            self.read_shallow().ok().flatten(),
+            self.read_class_idx().ok().flatten(),
+        ) else {
+            return Ok(None);
+        };
+        if shallow.len() != class_idx.len() {
+            return Ok(None);
+        }
+        let class_names = self.read_class_names().ok().flatten().unwrap_or_default();
+
+        let handover = crate::query::run::OqlCacheHandover {
+            class_map: snap.class_map,
+            strings: snap.strings,
+            id_map: crate::id_map::IdMap::from_pages(snap.id_map_pages),
+            kind: snap.kind,
+            class_addr_table: snap.class_addr_table,
+            class_ids: snap.class_ids,
+            id_size: snap.id_size,
+        };
+        let n = shallow.len();
+        Ok(Some(handover.into_cache(
+            source,
+            n,
+            shallow,
+            class_idx,
+            class_names,
+        )))
+    }
+
     // ── Seek-based reads ──────────────────────────────────────────────────────
 
     pub fn read_shallow(&self) -> io::Result<Option<Vec<u32>>> {

@@ -57,6 +57,16 @@ impl ServeState {
             *guard = AnalysisState::Running;
             drop(guard); // release lock before spawning
 
+            // Warm start: if this dump already has a disk cache (written by any
+            // `heap` subcommand), rebuild the report + retained array + OQL
+            // session from it and skip the pipeline entirely. On a 44 GB dump
+            // that is the difference between ~50 minutes / ~20 GiB and a few
+            // seconds — and a server that dies is otherwise unrecoverable
+            // without paying that cost again.
+            if self.try_warm_start() {
+                return true;
+            }
+
             let state_arc = Arc::clone(&self.state);
             let oql_arc = Arc::clone(&self.oql);
             let retained_arc = Arc::clone(&self.retained);
@@ -93,6 +103,56 @@ impl ServeState {
         } else {
             false
         }
+    }
+
+    /// Come up from the disk cache instead of running the analysis pipeline.
+    ///
+    /// The cache is written by the `heap` subcommand group; a server started on
+    /// a dump that has one skips the pipeline entirely. Returns `true` only when
+    /// report, retained array and OQL session all came from disk — in that case
+    /// `state` is already `Done` and the caller must not spawn the pipeline.
+    /// Anything missing or undecodable returns `false` and the pipeline runs as
+    /// before, so this is purely an optimisation.
+    fn try_warm_start(&self) -> bool {
+        use crate::cache::{CacheDir, CacheMode};
+        use crate::source::HprofSource;
+
+        let dump = std::path::Path::new(&self.path);
+        let Ok(cache) = CacheDir::for_dump(dump) else {
+            return false;
+        };
+        if !cache.is_valid(CacheMode::Full) {
+            return false;
+        }
+        // A cache can pass `is_valid` (magic bytes only) and still fail to
+        // decode, so treat every read as best-effort.
+        let Some(dump_str) = dump.to_str() else {
+            return false;
+        };
+        let (Ok(Some(report)), Ok(Some(retained)), Ok(Some(warm))) = (
+            cache.read_report(),
+            cache.read_retained(),
+            cache.read_query_cache(HprofSource::from(dump_str)),
+        ) else {
+            return false;
+        };
+
+        let retained_shared = Arc::new(retained);
+        {
+            let mut rg = self.retained.lock().unwrap_or_else(|e| e.into_inner());
+            *rg = Some(Arc::clone(&retained_shared));
+        }
+        {
+            let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            *g = AnalysisState::Done(Arc::new(report));
+        }
+        self.oql
+            .set_full_analysis_with_retained(retained_shared, Some(warm));
+        eprintln!(
+            "hprof-analyzer server: warm start from disk cache ({})",
+            self.path
+        );
+        true
     }
 
     /// Read the cached report, if available. Returns None while running/not started.

@@ -652,6 +652,22 @@ pub fn analyze_with_cache(
     })
 }
 
+/// Rebuild an OQL query session straight from the disk cache.
+///
+/// Thin wrapper over [`cache::CacheDir::read_query_cache`], which holds the
+/// actual assembly (it lives there so `main.rs` and `lib.rs` — which each
+/// declare a module tree and compile `cache.rs` into both — get identical
+/// types). Returns `Ok(None)` when there is no cache or it does not decode;
+/// the caller should then fall back to running the pipeline.
+#[cfg(feature = "native")]
+pub fn load_query_cache(dump: &std::path::Path) -> std::io::Result<Option<query::run::ReplCache>> {
+    let cache = cache::CacheDir::for_dump(dump)?;
+    let Some(dump_str) = dump.to_str() else {
+        return Ok(None);
+    };
+    cache.read_query_cache(HprofSource::from(dump_str))
+}
+
 /// Parse and run an OQL query string against a dump file (native only).
 ///
 /// Handles parse → plan → optimize → execute. Returns one `QueryResult` per

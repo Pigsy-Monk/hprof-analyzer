@@ -13,6 +13,12 @@
 //! peak-RSS budget on multi-GB dumps; see the inline notes before changing it.
 
 mod bitset;
+// Compiled into both module trees. The binary only *reads* the cache (warm
+// start in `serve.rs`); the write-side API is exercised by the library's
+// `analyze_with_cache`, so it is dead code here. The attribute is scoped to
+// this declaration, so it does not mask anything in the library's copy.
+#[allow(dead_code)]
+mod cache;
 mod chunkvec;
 mod collection_config;
 mod cvec;
