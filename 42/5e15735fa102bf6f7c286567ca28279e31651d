@@ -1,0 +1,19 @@
+src/lib.rs
+  s_d88b882af55fa9::t_74b59a7ec9f9ff 690-702
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.45-trip",
+  "base_commit_sha": "425e15735fa102bf6f7c286567ca28279e31651d",
+  "prompts": {},
+  "sessions": {
+    "s_d88b882af55fa9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "99417d7d-eefa-47ba-a772-d0c0f9c0d8ed",
+        "model": "unknown"
+      },
+      "human_author": "zwsong <zwsong@trip.com>"
+    }
+  }
+}
