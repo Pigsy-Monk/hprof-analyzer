@@ -585,6 +585,12 @@ enum HeapCmd {
         /// Emit JSON.
         #[arg(long)]
         json: bool,
+        /// Build the object-offset table (`offsets.bin`) first if this cache
+        /// lacks it. Costs one pass-1 scan of the dump (~pass1's memory, which
+        /// on a multi-GB dump means a multi-GB RSS spike) — only needed for
+        /// caches created before offset capture existed.
+        #[arg(long)]
+        build_offsets: bool,
     },
     /// Print OQL documentation.
     Docs {
@@ -1615,7 +1621,12 @@ fn run_heap_cmd(cmd: HeapCmd) -> anyhow::Result<()> {
                 print_dom_tree(&tree, 0);
             }
         }
-        HeapCmd::Inspect { dump, index, json } => {
+        HeapCmd::Inspect {
+            dump,
+            index,
+            json,
+            build_offsets,
+        } => {
             let sess = load(&dump, CacheMode::Full)?;
             let shallow = sess
                 .cache
@@ -1639,16 +1650,39 @@ fn run_heap_cmd(cmd: HeapCmd) -> anyhow::Result<()> {
                 .get(cidx)
                 .map(|s| s.as_str())
                 .unwrap_or("<unknown>");
-            let obj = serde_json::json!({
-                "object_index": idx,
-                "class": class_name,
-                "shallow_bytes": shallow[idx],
-                "retained_bytes": retained[idx],
-            });
+
+            // ── Field values ─────────────────────────────────────────────────
+            // Read straight out of the dump at this object's recorded record
+            // offset. One seek, a few dozen bytes — NOT a rescan (which is what
+            // makes OQL `toString(s)` cost ~50 minutes and stall the server).
+            let (fields, address, note) =
+                inspect_fields(&dump, &sess, &class_idx, idx, build_offsets)?;
+
             if json {
+                let mut obj = serde_json::json!({
+                    "object_index": idx,
+                    "class": class_name,
+                    "shallow_bytes": shallow[idx],
+                    "retained_bytes": retained[idx],
+                });
+                if let Some(a) = &address {
+                    obj["address"] = serde_json::Value::String(a.clone());
+                }
+                match fields {
+                    Some(f) => obj["fields"] = f,
+                    None => {
+                        obj["fields"] = serde_json::Value::Null;
+                        obj["fields_note"] = serde_json::Value::String(
+                            note.unwrap_or_else(|| "field values unavailable".into()),
+                        );
+                    }
+                }
                 println!("{}", serde_json::to_string_pretty(&obj)?);
             } else {
                 println!("Object #{idx}");
+                if let Some(a) = &address {
+                    println!("  Address:  {a}");
+                }
                 println!("  Class:    {class_name}");
                 println!("  Shallow:  {} bytes", shallow[idx]);
                 println!(
@@ -1656,6 +1690,15 @@ fn run_heap_cmd(cmd: HeapCmd) -> anyhow::Result<()> {
                     retained[idx],
                     retained[idx] as f64 / 1_000_000.0
                 );
+                match fields {
+                    Some(f) => {
+                        println!("  Fields:");
+                        for (k, v) in f.as_object().into_iter().flatten() {
+                            println!("    {k} = {}", render_field(v));
+                        }
+                    }
+                    None => println!("  Fields:   (unavailable) {}", note.unwrap_or_default()),
+                }
             }
         }
         HeapCmd::Docs { topic } => {
@@ -5908,6 +5951,163 @@ fn dump_pass1_json(path: &str) -> io::Result<()> {
 
     println!("}}");
     Ok(())
+}
+
+/// Read one object's field values straight out of the dump and render them as a
+/// JSON object. See `objread` for why this is a seek rather than a rescan.
+///
+/// Returns `(fields, address, note)`. `fields` is `None` — with `note` saying
+/// why — whenever the values cannot be read, so the caller reports the reason
+/// instead of quietly printing an empty object.
+fn inspect_fields(
+    dump: &str,
+    sess: &hprof_analyzer::cache::CachedSession,
+    class_idx: &[u32],
+    idx: usize,
+    build_offsets: bool,
+) -> anyhow::Result<(Option<serde_json::Value>, Option<String>, Option<String>)> {
+    use hprof_analyzer::objread;
+    let kind = sess.pass1.kind.get(idx).copied().unwrap_or(0);
+
+    // 1. The object-offset table. Present on any cache this version wrote.
+    let mut offsets = sess.cache.read_hprof_offsets()?;
+    if offsets.is_none() && build_offsets {
+        eprintln!("[hprof] offsets.bin missing; building it (one pass-1 scan of the dump)…");
+        let src = hprof_analyzer::HprofSource::from(dump);
+        let p1 = hprof_analyzer::Pass1::run(&src, true)?;
+        sess.cache.write_hprof_offsets(&p1.hprof_offsets)?;
+        drop(p1);
+        offsets = sess.cache.read_hprof_offsets()?;
+    }
+    let Some(offsets) = offsets else {
+        return Ok((
+            None,
+            None,
+            Some(
+                "this cache has no object-offset table (it predates offset capture). \
+                 Re-analyze the dump, or pass --build-offsets (one pass-1 scan)."
+                    .into(),
+            ),
+        ));
+    };
+
+    // 2. Only plain instances have an INSTANCE_DUMP record to decode.
+    if kind != 0 {
+        return Ok((
+            None,
+            None,
+            Some(format!(
+                "object kind {kind} is not a plain instance (0=instance, 1=object \
+                 array, 2=primitive array, 3=class object); field values are decoded \
+                 for instances only"
+            )),
+        ));
+    }
+    let offset = offsets.get(idx).copied().unwrap_or(0);
+    if offset == 0 {
+        return Ok((
+            None,
+            None,
+            Some("no HPROF record offset recorded for this object".into()),
+        ));
+    }
+
+    // 3. Offsets index the decompressed stream; that is a file offset only for
+    //    an uncompressed dump. Refuse rather than silently rescan a gzip stream.
+    let path = std::path::Path::new(dump);
+    if !objread::is_seekable(path)? {
+        return Ok((
+            None,
+            None,
+            Some(
+                "the dump is compressed (gzip/zip), so record offsets are not \
+                 directly seekable; uncompress it and re-analyze to read fields."
+                    .into(),
+            ),
+        ));
+    }
+
+    let Some((addr, _class_addr, fields)) = objread::read_instance_at(
+        path,
+        offset,
+        &sess.pass1.class_map,
+        &sess.pass1.strings,
+        sess.pass1.id_size as usize,
+    )?
+    else {
+        return Ok((
+            None,
+            None,
+            Some("no INSTANCE_DUMP record at the recorded offset".into()),
+        ));
+    };
+
+    // 4. A subclass field may shadow an inherited one of the same simple name;
+    //    qualify those with their declaring class so none is lost.
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for f in &fields {
+        *counts.entry(f.name.as_str()).or_insert(0) += 1;
+    }
+    let mut map = serde_json::Map::new();
+    for f in &fields {
+        let key = if counts[f.name.as_str()] > 1 {
+            format!("{}.{}", f.owner.replace('/', "."), f.name)
+        } else {
+            f.name.clone()
+        };
+        map.insert(key, field_json(f, sess, class_idx));
+    }
+    Ok((
+        Some(serde_json::Value::Object(map)),
+        Some(format!("0x{addr:x}")),
+        None,
+    ))
+}
+
+/// Render one field value. Object references become
+/// `{"@ref": "0x…", "@index": N, "@class": "…"}` — the target's address plus its
+/// dense index (so it can be fed back to `heap inspect`), never a recursive
+/// expansion.
+fn field_json(
+    f: &hprof_analyzer::objread::InstanceField,
+    sess: &hprof_analyzer::cache::CachedSession,
+    class_idx: &[u32],
+) -> serde_json::Value {
+    use hprof_analyzer::objread;
+    match &f.value {
+        objread::FieldValue::Prim(v) => v.clone(),
+        objread::FieldValue::Null => serde_json::Value::Null,
+        objread::FieldValue::Ref(addr) => {
+            let mut o = serde_json::Map::new();
+            o.insert("@ref".into(), serde_json::json!(format!("0x{addr:x}")));
+            if let Some(i) = sess.index_of_addr(*addr) {
+                o.insert("@index".into(), serde_json::json!(i));
+                if let Some(&ci) = class_idx.get(i) {
+                    if let Some(n) = sess.class_names.get(ci as usize) {
+                        o.insert("@class".into(), serde_json::json!(n));
+                    }
+                }
+            }
+            serde_json::Value::Object(o)
+        }
+    }
+}
+
+/// One-line rendering of a field value for the non-JSON output.
+fn render_field(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Object(o) if o.contains_key("@ref") => {
+            let r = o.get("@ref").and_then(|x| x.as_str()).unwrap_or("?");
+            match (
+                o.get("@class").and_then(|x| x.as_str()),
+                o.get("@index").and_then(|x| x.as_u64()),
+            ) {
+                (Some(c), Some(i)) => format!("{c} @ {r} (index {i})"),
+                _ => format!("ref {r}"),
+            }
+        }
+        other => other.to_string(),
+    }
 }
 
 #[cfg(test)]

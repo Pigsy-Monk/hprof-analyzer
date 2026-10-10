@@ -90,6 +90,15 @@ pub struct CachedSession {
     pub class_names: Vec<String>,
 }
 
+impl CachedSession {
+    /// Dense object index (0-based) for an object address, or `None` when the
+    /// address is not a heap object (or is null). Searches the cached id-map
+    /// pages in place — no `IdMap` rebuild and no multi-GB page clone.
+    pub fn index_of_addr(&self, addr: u64) -> Option<usize> {
+        crate::id_map::IdMap::index_of_in_pages(&self.pass1.id_map_pages, addr)
+    }
+}
+
 // ── CacheDir ──────────────────────────────────────────────────────────────────
 
 pub struct CacheDir {
@@ -268,6 +277,42 @@ impl CacheDir {
             (Some(o), Some(d)) if !o.is_empty() => Some((o, d)),
             _ => None,
         })
+    }
+
+    // ── Object-offset layer ───────────────────────────────────────────────────
+
+    /// Write the per-object HPROF record offsets (`Pass1::hprof_offsets`, in
+    /// dense-object-index order) to `offsets.bin`.
+    ///
+    /// These are what let `heap inspect` read one object's field values with a
+    /// single seek into the dump instead of a full rescan — the rescan is what
+    /// makes `toString(s)` cost ~50 minutes and stall the whole server.
+    ///
+    /// Stored as `i64` deltas (the offsets are close to monotonic in dense-id
+    /// order) streamed straight through zstd, so the 8-bytes-per-object array
+    /// never has to exist twice.
+    ///
+    /// This lives in its own file rather than as a 7th `arrays.bin` entry on
+    /// purpose: `write_arrays` runs at the very end of the pipeline, and
+    /// carrying the raw `Vec<u64>` (~4.9 GB on a 44 GB dump) that far would
+    /// raise the whole run's peak RSS. Here it is written and dropped right
+    /// after pass 1.
+    pub fn write_hprof_offsets(&self, offs: &[u64]) -> io::Result<()> {
+        let frame = encode_delta_u64_zstd(offs)?;
+        write_indexed_file(&self.path.join("offsets.bin"), &["offsets"], &[frame])
+    }
+
+    /// Read `offsets.bin`. `None` when the cache predates offset capture (or the
+    /// dump was analyzed before this feature existed) — callers must degrade
+    /// gracefully rather than treat it as an empty array.
+    pub fn read_hprof_offsets(&self) -> io::Result<Option<Vec<u64>>> {
+        read_delta_u64_array(&self.path.join("offsets.bin"), "offsets")
+    }
+
+    /// True when `offsets.bin` is present. Used to distinguish "no offsets
+    /// captured" from "offsets captured but empty" without decompressing.
+    pub fn has_hprof_offsets(&self) -> bool {
+        self.path.join("offsets.bin").exists()
     }
 
     /// Rebuild an OQL query session straight from this cache.
@@ -712,6 +757,48 @@ fn read_delta_u32_array(path: &Path, name: &str) -> io::Result<Option<Vec<u32>>>
     let raw = decompress_zstd_frame(f, len)?;
     let deltas = le_bytes_to_i32(&raw);
     Ok(Some(undelta_zigzag_i32(&deltas)))
+}
+
+/// Read an `i64`-delta stream (see [`encode_delta_u64_zstd`]) back to `u64`s.
+fn read_delta_u64_array(path: &Path, name: &str) -> io::Result<Option<Vec<u64>>> {
+    let Some((f, len)) = seek_to_entry(path, name)? else {
+        return Ok(None);
+    };
+    let raw = decompress_zstd_frame(f, len)?;
+    let mut out = Vec::with_capacity(raw.len() / 8);
+    let mut acc = 0i64;
+    for c in raw.chunks_exact(8) {
+        let d = i64::from_le_bytes(c.try_into().expect("chunks_exact(8)"));
+        // Wrapping: the encoder wrote `v - prev` as i64, so any offset < 2^63
+        // round-trips regardless of monotonicity.
+        acc = acc.wrapping_add(d);
+        out.push(acc as u64);
+    }
+    Ok(Some(out))
+}
+
+/// Delta-encode a `u64` stream as little-endian `i64` deltas and zstd it,
+/// streaming through the compressor so the raw 8-bytes-per-element array is
+/// never materialized a second time. The counterpart is
+/// [`read_delta_u64_array`]. Object record offsets are near-monotonic in
+/// dense-id order, so the deltas are small and compress hard.
+fn encode_delta_u64_zstd(data: &[u64]) -> io::Result<Vec<u8>> {
+    let mut enc = zstd::Encoder::new(Vec::new(), 3)?;
+    let mut buf: Vec<u8> = Vec::with_capacity(STAGE_BYTES);
+    let mut prev = 0i64;
+    for &v in data {
+        let d = (v as i64).wrapping_sub(prev);
+        prev = v as i64;
+        buf.extend_from_slice(&d.to_le_bytes());
+        if buf.len() >= STAGE_BYTES {
+            enc.write_all(&buf)?;
+            buf.clear();
+        }
+    }
+    if !buf.is_empty() {
+        enc.write_all(&buf)?;
+    }
+    enc.finish()
 }
 
 /// Read an entry as opaque bytes, with no byte-order interpretation — the

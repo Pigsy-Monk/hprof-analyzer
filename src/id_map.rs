@@ -328,6 +328,26 @@ impl IdMap {
         }
     }
 
+    /// `IdMap::index_of` against serialized [`IdMapPages`], without rebuilding
+    /// an `IdMap` — and therefore without cloning the multi-GB page vectors.
+    /// Used by cache-backed readers that only have `Pass1Snapshot.id_map_pages`.
+    #[cfg(feature = "native")]
+    pub fn index_of_in_pages(pages: &IdMapPages, addr: u64) -> Option<usize> {
+        if pages.block_base.is_empty() || addr < pages.block_base[0] {
+            return None;
+        }
+        // Greatest block base <= addr.
+        let b = pages.block_base.partition_point(|&base| base <= addr) - 1;
+        let delta = addr - pages.block_base[b];
+        if delta >= BLOCK_SPAN {
+            return None; // addr sits in the gap after block b, before b+1's base
+        }
+        let d = delta as u32;
+        let lo = pages.block_start[b] as usize;
+        let hi = pages.block_start[b + 1] as usize;
+        search_offsets(&pages.offsets[lo..hi], d).map(|pos| lo + pos)
+    }
+
     /// Compress the sorted addrs into a self-describing blob (delta-vbyte then
     /// deflate for Deflate9/Deflate1, or raw LE u64 for None), returning (blob, element_count).
     pub fn compress(&self, codec: Codec) -> io::Result<(Vec<u8>, usize)> {

@@ -16,7 +16,10 @@ mod md_test;
 pub mod named_queries;
 pub mod opts;
 mod pass1;
+pub use pass1::ClassInfo;
 pub use pass1::Pass1;
+#[cfg(feature = "native")]
+pub mod objread;
 mod pass2;
 mod progress;
 pub mod query;
@@ -629,7 +632,11 @@ pub fn analyze_with_cache(
         path.to_str()
             .ok_or_else(|| std::io::Error::other("non-UTF8 path"))?,
     );
-    let p1 = pass1::Pass1::run(&source, false)?;
+    // `capture_hprof_offsets = true` on the default path: the per-object HPROF
+    // record offsets are what let `heap inspect` read one object's fields with a
+    // single seek instead of rescanning the dump. They are written to
+    // `offsets.bin` and dropped inside the pipeline, right after pass 1.
+    let p1 = pass1::Pass1::run(&source, true)?;
     let snap = pass1::Pass1Snapshot::from_pass1(&p1);
 
     let mut prog_fn = |stage: &str, _frac: f32| progress(stage);
@@ -756,7 +763,7 @@ pub fn render_report_section(r: &report::Report, section: &str) -> String {
 #[cfg(feature = "native")]
 fn analyze_to_report_inner_with_cache(
     source: &HprofSource,
-    p1: pass1::Pass1,
+    mut p1: pass1::Pass1,
     opts: &AnalyzeOptions,
     progress: &mut dyn FnMut(&str, f32),
     cache: &cache::CacheDir,
@@ -767,6 +774,20 @@ fn analyze_to_report_inner_with_cache(
     let truncated_input = p1.truncated_input;
     let redacted = p1.redacted;
     progress("pass1", 1.0);
+
+    // Persist the per-object HPROF record offsets now, then free the raw array.
+    // It is 8 bytes/object (~4.9 GB on a 44 GB dump) and holding it through
+    // pass 2 / dominators / retained would raise the whole run's peak RSS for no
+    // reason — `write_hprof_offsets` delta-encodes and compresses it on the way
+    // out, so only the compressed blob is live afterwards. Empty when the caller
+    // ran pass 1 without offset capture (e.g. the redact/diff paths), in which
+    // case there is nothing to write and `heap inspect` degrades gracefully.
+    if !p1.hprof_offsets.is_empty() {
+        if let Err(e) = cache.write_hprof_offsets(&p1.hprof_offsets) {
+            eprintln!("hprof-cache: failed to write offsets.bin: {e}");
+        }
+        p1.hprof_offsets = Vec::new();
+    }
 
     if p1.class_ids.len() > u32::MAX as usize {
         return Err(io::Error::new(
