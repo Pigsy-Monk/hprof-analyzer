@@ -1,0 +1,22 @@
+src/cvec.rs
+  s_fe56474f8dd48a::t_f16299a799f93d 594-653
+  s_fe56474f8dd48a::t_44c33468c12cfc 654-704
+src/main.rs
+  s_fe56474f8dd48a::t_b72c548549cb73 4936-4974,4976-4994
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.45-trip",
+  "base_commit_sha": "4a4e0ad22e7343e1ca04511f3c304d6b87dee8e2",
+  "prompts": {},
+  "sessions": {
+    "s_fe56474f8dd48a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e20589d6-adef-402a-b9c0-e1f531da4a0e",
+        "model": "deepseek-v4-1-flash-260910"
+      },
+      "human_author": "zwsong <zwsong@trip.com>"
+    }
+  }
+}
