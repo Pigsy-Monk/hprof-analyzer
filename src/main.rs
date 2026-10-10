@@ -4844,6 +4844,19 @@ fn run(
     } else {
         None
     };
+    // MAT id -> MAT id of that object's class. Filled while the `outbound` index
+    // is emitted (that pass already resolves every object's class object) and
+    // consumed by the `inbound` pass, which has to write each class object's
+    // instance list first — MAT's `ClassImpl.getObjectIds()` reads a class's
+    // instances straight out of the inbound body through `cacheEntry`
+    // (`IndexManager.c2objects()` *is* the inbound index; see `emit_dot_index`).
+    // One i32 per MAT object; empty when `mat` is None.
+    let mut class_mat_of: Vec<i32> = Vec::new();
+    // MAT id of each class object -> (0-based offset of that class object's
+    // entry in the `inbound` body, instance count written there). Filled by the
+    // inbound pass and consumed by `emit_dot_index` for `ClassImpl.cacheEntry`.
+    let mut class_inb: std::collections::HashMap<i32, (i32, i32)> =
+        std::collections::HashMap::new();
     if let Some(ref m) = mat {
         let mm = mat_map.as_ref().expect("mat_map built with mat");
         if let (Some((fwd_off_c, _class_idx_c)), Some(rescan_ctx)) =
@@ -4881,6 +4894,12 @@ fn run(
             // for objects with high out-degree (large arrays, class objects).
             let n_entries = mm.mat_count();
             let sorted = mm.sorted();
+            // MAT id 0 is MAT's synthetic system-class-loader object: MAT's own
+            // `o2c` gives it the class-loader class object, and the inbound entry
+            // for that class object lists 0 among its instances. Mirror that so
+            // the instance partition below agrees with MAT byte for byte.
+            class_mat_of = vec![0i32; n_entries];
+            class_mat_of[0] = mat_classloader_mat.unwrap_or(0);
             let mut idx = 0usize;
             // MAT id 0 (the synthetic system-class-loader object) has an outbound
             // list of exactly one element: its class object. Emitting an empty
@@ -4910,6 +4929,7 @@ fn run(
                 } else {
                     mm.translate(coid as i32).max(0)
                 };
+                class_mat_of[mat_id as usize] = class_mat;
                 // Option B: record this object as a referrer of its own class
                 // object when the internal graph lacks that edge (primitive
                 // arrays and class objects). Merged into `inbound` below.
@@ -5118,6 +5138,25 @@ fn run(
             // class object (object 0's own class edge). Our graph has no node for
             // object 0, so inject it here.
             let root_class = mat_classloader_mat.filter(|&v| v > 0);
+            // MAT ids of the class objects — the entries that need the
+            // instances-first layout and that carry a `cacheEntry` (one entry
+            // per class, so this set is tiny).
+            let class_obj_mats: std::collections::HashSet<i32> = g
+                .class_obj_class_idx
+                .keys()
+                .filter_map(|&coid| {
+                    let mid = mm.translate(coid as i32);
+                    if mid > 0 { Some(mid) } else { None }
+                })
+                .collect();
+            // mat id -> (0-based inbound-body offset of its entry, instance
+            // count). Consumed by `emit_dot_index` for `ClassImpl.cacheEntry`.
+            // Running 0-based body position; entry 0 (the synthetic root) is
+            // never a class object, so it only advances the cursor.
+            let mut body_pos: i64 = 0;
+            if !root_inb.is_empty() {
+                body_pos += root_inb.len() as i64;
+            }
             let iter = std::iter::once(root_inb).chain(mm.sorted().iter().map(|&old_id| {
                 // `inb_data` is indexed by DENSE id: `encode_phase4` writes one
                 // count-prefixed entry per dense node, and `dominator.rs` seeks
@@ -5154,6 +5193,7 @@ fn run(
                     }
                 }
                 let mat_id = mm.translate(old_id as i32);
+                let is_class_obj = class_obj_mats.contains(&mat_id);
                 // Option B: merge in the referrers whose class edge our graph
                 // lacks (primitive arrays → their array class object; class
                 // objects → the java.lang.Class class object). The internal
@@ -5177,6 +5217,39 @@ fn run(
                         e.insert(0, 0);
                     }
                 }
+                // MAT layout for a CLASS object's inbound entry:
+                // [instances ascending] ++ [remaining referrers ascending].
+                // `ClassImpl.getObjectIds()` slices the *first* `count` values
+                // out of the inbound body, so the instances have to lead.
+                // `e` is already sorted ascending, so a stable partition keeps
+                // both halves ascending. `class_mat_of[x] == mat_id` is exactly
+                // "x is an instance of the class object mat_id"; it can never
+                // hold for a non-class object, so this is a no-op there.
+                if is_class_obj && !class_mat_of.is_empty() {
+                    let mut inst: Vec<i32> = Vec::with_capacity(e.len());
+                    let mut rest: Vec<i32> = Vec::with_capacity(e.len());
+                    for &x in &e {
+                        if class_mat_of.get(x as usize).copied() == Some(mat_id) {
+                            inst.push(x);
+                        } else {
+                            rest.push(x);
+                        }
+                    }
+                    let cnt = inst.len();
+                    if cnt > 0 {
+                        // `body_pos` is the 0-based index of this entry in the
+                        // inbound body, i.e. exactly the `offset` MAT's
+                        // `InboundReader.getObjectsOf` wants (`body.getNext(off,
+                        // cnt)` == `body[off .. off+cnt)`).
+                        class_inb.insert(mat_id, (body_pos as i32, cnt as i32));
+                    }
+                    inst.extend_from_slice(&rest);
+                    e = inst;
+                }
+                // Empty entries are written as holes and occupy no body space.
+                if !e.is_empty() {
+                    body_pos += e.len() as i64;
+                }
                 e
             }));
             m.emit_inbound_iter(iter)?;
@@ -5187,6 +5260,8 @@ fn run(
     drop(mat_zero_ref);
     drop(mat_self_ref);
     drop(class_edge_refs);
+    // ~4 bytes/MAT-object, live only across the outbound + inbound emission.
+    drop(class_mat_of);
     // Restore g.idom from compressed blob (it was compressed before emit_outbound
     // to save ~1.3 GB of RSS during the outbound + inbound emission window).
     if let Some(c) = mat_idom_c {
@@ -5631,6 +5706,7 @@ fn run(
                 mat_instance_sizes.as_ref().unwrap_or(&empty_sizes),
                 mat_root_instance_size,
                 mat_classloader_mat.unwrap_or(0),
+                &class_inb,
             )?;
         }
     }

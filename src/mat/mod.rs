@@ -877,6 +877,10 @@ impl MatEmitter {
         instance_sizes: &HashMap<u64, i32>,
         root_instance_size: i32,
         root_class_mat: i32,
+        // MAT id of each class object -> (0-based start of that class object's
+        // entry in the `inbound` body, number of instances written there). See
+        // `ClassImpl.cacheEntry` below.
+        class_inb: &HashMap<i32, (i32, i32)>,
     ) -> io::Result<()> {
         use serial::*;
 
@@ -1373,6 +1377,8 @@ impl MatEmitter {
 
                 let key_str = format!("class_0x{:x}", addr);
                 let name_clone = mat_name;
+                // The ObjRef closure must be 'static, so copy the pair out.
+                let ce_pair = class_inb.get(&mat_id).copied();
                 s.write_object_keyed(
                     &class_impl_chain,
                     // `layers` must be ordered subclass-first, parallel to `chain`:
@@ -1425,7 +1431,38 @@ impl MatEmitter {
                                 ),
                                 (
                                     "cacheEntry".into(),
-                                    FieldVal::ObjRef(Box::new(|s: &mut Ser| s.null())),
+                                    FieldVal::ObjRef(Box::new(move |s: &mut Ser| {
+                                        // MAT's ClassImpl.getObjectIds() is
+                                        // `snapshot.getIndexManager().c2objects()
+                                        // .getObjectsOf(this.cacheEntry)`, and
+                                        // `IndexManager.c2objects()` returns the
+                                        // **inbound** index (javap of MAT 1.17:
+                                        // `c2objects()` -> `getfield inbound`).
+                                        // `InboundReader.getObjectsOf(int[])` is
+                                        // `body.getNext(off, cnt)` — the slice
+                                        // `body[off .. off+cnt)` of the inbound
+                                        // body. So cacheEntry must be an
+                                        // int[]{offset, count} whose slice is the
+                                        // class's instance list. `offset` is the
+                                        // 0-based body index where this class
+                                        // object's inbound entry starts (that
+                                        // entry is written instances-first, see
+                                        // the inbound emitter in main.rs) and
+                                        // `count` is its instance count.
+                                        //
+                                        // A null here is NOT harmless: it makes
+                                        // getObjectsOf return int[0] for every
+                                        // class, which collapses Top Consumers,
+                                        // the Finalizer view, the system class
+                                        // loader page and the Thread Overview
+                                        // table (every one of them asks a class
+                                        // for its instances). Classes with no
+                                        // instances keep MAT's own null.
+                                        match ce_pair {
+                                            Some((off, cnt)) => s.write_int_array(&[off, cnt]),
+                                            None => s.null(),
+                                        }
+                                    })),
                                 ),
                                 // `fields`, `staticFields` and `subClasses` must be
                                 // non-null: MAT's ClassImpl.setSnapshot() iterates
