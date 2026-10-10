@@ -12,6 +12,53 @@ use crate::cvec::CompressedU32;
 use crate::pass2::ThreadStack;
 use int_index::{IntIndexStreamer, LongIndexStreamer};
 
+/// RAII timing probe for the MAT emission path, gated on `HPROF_TIMING`.
+///
+/// Prints exactly one stderr line when it drops:
+/// `[mat] <name> <elapsed>s @<wall-epoch-seconds>`
+///
+/// The trailing wall-clock epoch is deliberate: it lets a reader reconstruct the
+/// *compute* time between two emits as
+/// `wall(next) - wall(this) - elapsed(next)` — so the "assemble the structure"
+/// cost is measurable without instrumenting the caller in `src/main.rs`.
+///
+/// When `HPROF_TIMING` is unset the only cost is one `std::env::var_os` per
+/// emit (a handful per run); nothing is printed, and every emitted byte — and
+/// stdout — is unaffected, so parity is untouched. stderr only.
+struct MatTimer<'a> {
+    name: &'a str,
+    start: Option<std::time::Instant>,
+}
+
+impl<'a> MatTimer<'a> {
+    #[inline]
+    fn new(name: &'a str) -> Self {
+        let start = if std::env::var_os("HPROF_TIMING").is_some() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        Self { name, start }
+    }
+}
+
+impl Drop for MatTimer<'_> {
+    fn drop(&mut self) {
+        if let Some(t) = self.start {
+            let wall = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            eprintln!(
+                "[mat] {} {:.3}s @{:.3}",
+                self.name,
+                t.elapsed().as_secs_f64(),
+                wall
+            );
+        }
+    }
+}
+
 /// Per-class metadata captured from Pass1 before it is consumed by Pass2::build.
 /// This carries everything needed to emit the `ClassImpl` objects in the master
 /// `.index` Java serialization stream.
@@ -122,6 +169,7 @@ pub struct MatRoots {
 impl MatClassMeta {
     /// Extract the fields we need from Pass1 before it is moved into Pass2::build.
     pub fn from_pass1(p1: &crate::pass1::Pass1, dump_path: &str) -> Self {
+        let _mt = MatTimer::new("MatClassMeta::from_pass1");
         let class_info = p1
             .class_map
             .iter()
@@ -384,6 +432,7 @@ impl MatIdMap {
     /// - `addr_at`: closure returning the object address for a given dense-id;
     ///   must be callable while the id_map is still live (before compress)
     pub fn build(n: usize, idom: &[u32], addr_at: impl Fn(usize) -> u64) -> Self {
+        let _mt = MatTimer::new("MatIdMap::build");
         let mut sorted: Vec<u32> = (0..n as u32)
             .filter(|&i| idom[i as usize] != u32::MAX)
             .collect();
@@ -576,6 +625,7 @@ impl MatEmitter {
     /// to the dense id of the class-object for that row (see
     /// [`build_row_to_classobj_id`]).
     pub fn emit_o2c(&self, class_idx_c: &CompressedU32, inv: &[i32]) -> io::Result<()> {
+        let _mt = MatTimer::new("o2c");
         let w = BufWriter::new(File::create(self.path("o2c"))?);
         let mut s = IntIndexStreamer::new(w);
         let mut err: Option<io::Error> = None;
@@ -599,6 +649,7 @@ impl MatEmitter {
     /// Values are the raw addresses in dense-id order. Must be called BEFORE the
     /// id-map is compressed (the caller supplies an `addr_at(i)` accessor).
     pub fn emit_idx<F: FnMut(usize) -> u64>(&self, n: usize, mut addr_at: F) -> io::Result<()> {
+        let _mt = MatTimer::new("idx");
         let w = BufWriter::new(File::create(self.path("idx"))?);
         let mut s = LongIndexStreamer::new(w);
         for i in 0..n {
@@ -614,6 +665,7 @@ impl MatEmitter {
     /// size in bytes; each is passed through [`size_compress`] (identity for
     /// sizes <= i32::MAX, which is the common case).
     pub fn emit_a2s(&self, shallow_c: &CompressedU32) -> io::Result<()> {
+        let _mt = MatTimer::new("a2s");
         let w = BufWriter::new(File::create(self.path("a2s"))?);
         let mut s = IntIndexStreamer::new(w);
         let mut err: Option<io::Error> = None;
@@ -636,6 +688,7 @@ impl MatEmitter {
     /// Emit the MAT `domIn` index: object id -> immediate-dominator object id (an
     /// IntIndex over the dominator-tree `idom` array).
     pub fn emit_dom_in(&self, idom: &[i32]) -> io::Result<()> {
+        let _mt = MatTimer::new("domIn");
         let w = BufWriter::new(File::create(self.path("domIn"))?);
         let mut s = IntIndexStreamer::new(w);
         for &d in idom {
@@ -649,6 +702,7 @@ impl MatEmitter {
     /// Emit a named IntIndex from a pre-built `&[i32]` slice (used for remapped
     /// o2c and a2s where values are assembled in MAT id order by the caller).
     pub fn emit_int_index(&self, name: &str, vals: &[i32]) -> io::Result<()> {
+        let _mt = MatTimer::new(name);
         let w = BufWriter::new(File::create(self.path(name))?);
         let mut s = IntIndexStreamer::new(w);
         for &v in vals {
@@ -662,6 +716,7 @@ impl MatEmitter {
     /// Emit a named LongIndex from a pre-built `&[i64]` slice (used for remapped
     /// idx and o2ret where values are assembled in MAT id order by the caller).
     pub fn emit_long_index(&self, name: &str, vals: &[i64]) -> io::Result<()> {
+        let _mt = MatTimer::new(name);
         let w = BufWriter::new(File::create(self.path(name))?);
         let mut s = LongIndexStreamer::new(w);
         for &v in vals {
@@ -678,6 +733,7 @@ impl MatEmitter {
     where
         I: IntoIterator<Item = i64>,
     {
+        let _mt = MatTimer::new(name);
         let w = BufWriter::new(File::create(self.path(name))?);
         let mut s = LongIndexStreamer::new(w);
         for v in iter {
@@ -691,6 +747,7 @@ impl MatEmitter {
     /// Emit the MAT `o2ret` index: object id -> retained heap size in bytes (a
     /// LongIndex).
     pub fn emit_o2ret(&self, retained: &[i64]) -> io::Result<()> {
+        let _mt = MatTimer::new("o2ret");
         let w = BufWriter::new(File::create(self.path("o2ret"))?);
         let mut s = LongIndexStreamer::new(w);
         for &r in retained {
@@ -707,6 +764,7 @@ impl MatEmitter {
     /// `int_index_1n` for the layout). The caller owns the assembly so the
     /// large `Vec<Vec<i32>>` can be built streaming and dropped promptly.
     pub fn emit_outbound(&self, entries: &[Vec<i32>]) -> io::Result<()> {
+        let _mt = MatTimer::new("outbound");
         let w = BufWriter::new(File::create(self.path("outbound"))?);
         let w = int_index_1n::write_sorted(w, entries)?;
         w.into_inner().map_err(|e| e.into_error())?;
@@ -720,6 +778,7 @@ impl MatEmitter {
         I: Iterator<Item = S>,
         S: AsRef<[i32]>,
     {
+        let _mt = MatTimer::new("outbound");
         let w = BufWriter::new(File::create(self.path("outbound"))?);
         let w = int_index_1n::write_sorted_iter_streaming(w, entries)?;
         w.into_inner().map_err(|e| e.into_error())?;
@@ -733,6 +792,7 @@ impl MatEmitter {
     where
         F: FnMut(&mut dyn FnMut(i32) -> io::Result<()>) -> io::Result<()>,
     {
+        let _mt = MatTimer::new("outbound");
         let w = BufWriter::new(File::create(self.path("outbound"))?);
         let w = int_index_1n::write_sorted_cb(w, n_entries, f)?;
         w.into_inner().map_err(|e| e.into_error())?;
@@ -745,6 +805,7 @@ impl MatEmitter {
     /// (unlike outbound) — the entry is purely the referrer ids in MAT's
     /// pre-order sort order.
     pub fn emit_inbound(&self, entries: &[Vec<i32>]) -> io::Result<()> {
+        let _mt = MatTimer::new("inbound");
         let w = BufWriter::new(File::create(self.path("inbound"))?);
         let w = int_index_1n::write_sorted(w, entries)?;
         w.into_inner().map_err(|e| e.into_error())?;
@@ -758,6 +819,7 @@ impl MatEmitter {
         I: Iterator<Item = S>,
         S: AsRef<[i32]>,
     {
+        let _mt = MatTimer::new("inbound");
         let w = BufWriter::new(File::create(self.path("inbound"))?);
         let w = int_index_1n::write_sorted_iter_streaming(w, entries)?;
         w.into_inner().map_err(|e| e.into_error())?;
@@ -769,6 +831,7 @@ impl MatEmitter {
     /// the virtual root, i.e. the GC roots / top-level dominators) and
     /// `entries[k + 1]` is object `k`'s dominator children.
     pub fn emit_dom_out(&self, entries: &[Vec<i32>]) -> io::Result<()> {
+        let _mt = MatTimer::new("domOut");
         let w = BufWriter::new(File::create(self.path("domOut"))?);
         let w = int_index_1n::write_unsorted(w, entries)?;
         w.into_inner().map_err(|e| e.into_error())?;
@@ -781,6 +844,7 @@ impl MatEmitter {
         I: Iterator<Item = S>,
         S: AsRef<[i32]>,
     {
+        let _mt = MatTimer::new("domOut");
         let w = BufWriter::new(File::create(self.path("domOut"))?);
         let w = int_index_1n::write_unsorted_iter_streaming(w, entries)?;
         w.into_inner().map_err(|e| e.into_error())?;
@@ -795,6 +859,7 @@ impl MatEmitter {
     where
         I: Iterator<Item = (i32, i64)>,
     {
+        let _mt = MatTimer::new("i2sv2");
         let path = self.dir.join(format!("{}.i2sv2.index", self.prefix));
         let mut f = BufWriter::new(File::create(&path)?);
         for (cid, ret) in class_retained {
@@ -825,6 +890,7 @@ impl MatEmitter {
         mm: &MatIdMap,
         local_frame_samples: &HashMap<u32, Vec<(u32, u32)>>,
     ) -> io::Result<()> {
+        let _mt = MatTimer::new("threads");
         let path = self.dir.join(format!("{}.threads", self.prefix));
         let mut f = BufWriter::new(File::create(&path)?);
         for ts in thread_stacks {
@@ -912,6 +978,7 @@ impl MatEmitter {
     ) -> io::Result<()> {
         use serial::*;
 
+        let _mt = MatTimer::new("index");
         let num_rows = class_names.len();
 
         // --- build per-class aggregate data (instance count + shallow-heap sum) ---
