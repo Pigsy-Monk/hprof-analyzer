@@ -1,0 +1,19 @@
+src/mat/mod.rs
+  s_fe56474f8dd48a::t_1e687d89d769b3 15-61,172,435,628,652,668,691,705,719,736,750,767,781,795,808,822,834,847,862,893,981
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.45-trip",
+  "base_commit_sha": "4ca41cf15a720b6578412d328dff9322f9c69e42",
+  "prompts": {},
+  "sessions": {
+    "s_fe56474f8dd48a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e20589d6-adef-402a-b9c0-e1f531da4a0e",
+        "model": "deepseek-v4-1-flash-260910"
+      },
+      "human_author": "zwsong <zwsong@trip.com>"
+    }
+  }
+}
