@@ -326,6 +326,17 @@ enum Cmd {
         /// `@retainedHeapSize` — are unaffected.
         #[arg(long)]
         no_rescan: bool,
+        /// Print resident-set size (RSS) at each labeled pipeline stage to
+        /// stderr while the analysis runs — the same `[trace-rss] <stage>
+        /// RSS=N MB (peak N MB)` lines the CLI prints with `--trace-rss`.
+        /// Equivalent to setting `HPROF_TRACE_RSS` in the environment.
+        #[arg(long)]
+        trace_rss: bool,
+        /// Show a live progress line on stderr while the analysis runs.
+        /// `auto` (default) enables it only when stderr is a terminal and
+        /// `--trace-rss` is not set (that already prints per-stage lines).
+        #[arg(long, value_enum, default_value_t = ProgressWhen::Auto)]
+        progress: ProgressWhen,
     },
     /// Run one or more OQL queries against a heap dump and print the results.
     /// Fast query-only path (no full report): retained-size, dominator, and
@@ -1102,12 +1113,25 @@ fn main() {
             input,
             port,
             no_rescan,
+            trace_rss,
+            progress,
         }) => {
             if !input_is_hprof(&input) {
                 fail(format!(
                     "'{input}' is not an HPROF dump; the `server` subcommand needs a .hprof[.gz/.zip/.tar.gz] file"
                 ));
             }
+            // The analysis runs on a background thread inside `serve`, but both
+            // of these are process-global switches, so setting them here covers
+            // it. `auto` mirrors the CLI: on only when stderr is a terminal, and
+            // off when --trace-rss already prints per-stage lines.
+            let show_progress = match progress {
+                ProgressWhen::Always => true,
+                ProgressWhen::Never => false,
+                ProgressWhen::Auto => !trace_rss && std::io::stderr().is_terminal(),
+            };
+            progress::set_enabled(show_progress);
+            trace::set_enabled(trace_rss);
             let opts = AnalyzeOptions {
                 reachable_only: true,
                 // Hand the OQL cache over with the report so the first query
@@ -2000,6 +2024,7 @@ fn analyze_to_report_inner(
             }
         };
     }
+    progress::phase("scanning dump (pass 1)");
     let p1 = pass1::Pass1::run(source, false)?;
     let truncated_input = p1.truncated_input;
     let redacted = p1.redacted;
@@ -2039,6 +2064,7 @@ fn analyze_to_report_inner(
 
     let mut no_in_sets = std::collections::HashMap::new();
     let mut no_exists_bools = std::collections::HashMap::new();
+    progress::phase("building object graph (pass 2)");
     let (
         mut g,
         mut inbound,
@@ -2062,9 +2088,11 @@ fn analyze_to_report_inner(
 
     inbound.compress_id_map(compress)?;
 
+    progress::phase("ordering objects (reverse post-order)");
     let rpo = rpo_dfs::rpo_dfs(g.n, &g.gc_root_indices, &g.fwd_offsets, &g.fwd_targets);
     t_pipe!("rpo done");
 
+    progress::phase("retained size (unreachable forest)");
     {
         g.unreachable_retained = unreachable_retained::compute_unreachable_retained(
             g.n,
@@ -2129,6 +2157,7 @@ fn analyze_to_report_inner(
     // build_from_fwd needs dfn alive; it is cleared afterward (matching run()).
     // Large dumps: drop fwd_targets first and rescan HPROF to avoid the
     // inb_flat+fwd_targets peak (saves ~7-10 GB on 30G+ dumps).
+    progress::phase("building inbound references");
     let (inb_block_off, inb_data) = if inbound.total_inb > 1_000_000_000 {
         drop(std::mem::take(&mut g.fwd_targets));
         drop(std::mem::take(&mut g.fwd_offsets));
@@ -2150,6 +2179,7 @@ fn analyze_to_report_inner(
         rpo.parent_pre = c.restore()?;
     }
 
+    progress::phase("computing dominators");
     g.idom =
         dominator::compute_dominators(g.n, rpo, &g.gc_root_indices, &inb_block_off, &inb_data)?;
     drop(inb_block_off);
@@ -2205,6 +2235,7 @@ fn analyze_to_report_inner(
         Some(a)
     };
 
+    progress::phase("building report");
     let mut report = report::build_model(
         &mut g,
         dc_off,

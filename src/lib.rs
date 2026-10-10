@@ -114,7 +114,16 @@ pub fn analyze_to_report_with_retained_and_cache(
     Vec<u64>,
     Option<crate::query::run::ReplCache>,
 )> {
-    analyze_to_report_inner(source, opts, &mut |_, _| {})
+    // Surface the phases on the process-global progress line. `progress::phase`
+    // is a no-op unless something enabled it (`server --progress`, or the CLI's
+    // `--progress`), so this costs one atomic load per phase and nothing else.
+    //
+    // Without this the server had no progress output at all: the phase labels
+    // live in the bin crate's own copy of the pipeline, which the server never
+    // runs — `progress::set_enabled(true)` turned on a switch nobody read.
+    analyze_to_report_inner(source, opts, &mut |phase, _frac| {
+        crate::progress::phase(phase)
+    })
 }
 
 /// Like `analyze_to_report_with_retained` but fires `progress(phase, fraction)`
