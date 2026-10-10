@@ -4683,6 +4683,16 @@ fn run(
             // MAT recomputes the per-instance heap size from the declared
             // fields; the 8-byte object alignment it uses comes from the actual
             // address spacing.
+            //
+            // `ref_size` must be corrected from the HPROF `id_size` to the
+            // detected reference width BEFORE `compute_instance_sizes` runs:
+            // that function reads `meta.ref_size` for both the per-reference
+            // byte count and the intermediate alignment modulus. With a
+            // compressed-oops dump (id_size=8, ref_size=4) the stale value
+            // inflated every non-array `ClassImpl.instanceSize` (String 32 vs
+            // 24), which then contradicted the `a2s`/`o2ret` tables (both built
+            // from the native 4-byte shallow) — producing "shallow > retained".
+            meta.ref_size = g.ref_size;
             let object_align =
                 mat::compute_object_align(mm.sorted().iter().map(|&old| addrs[old as usize]));
             let sizes = mat::compute_instance_sizes(meta, object_align);
@@ -4747,11 +4757,9 @@ fn run(
     }
     crate::trace::probe("main: after emit o2hprof");
     crate::trace::probe("main: before mat_inv (free_addrs done at idx emission)");
-    // `ref_size` is only known once the graph exists; SnapshotInfo's
-    // `$useCompressedOops` property needs it.
-    if let Some(ref mut m) = mat_class_meta {
-        m.ref_size = g.ref_size;
-    }
+    // (`mat_class_meta.ref_size` was corrected to `g.ref_size` back at the
+    // `compute_instance_sizes` call site — it must be right *before* the sizes
+    // are computed, and `emit_dot_index` reads it from the same field.)
     // Build the row→class-object id inverse table now that mm is available, so
     // we can prefer reachable class-objects when multiple map to the same row.
     let mut mat_inv: Option<Vec<i32>> =

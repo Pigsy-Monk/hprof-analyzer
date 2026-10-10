@@ -208,6 +208,19 @@ pub trait ClassResolver {
     fn ref_width(&self) -> usize {
         8
     }
+    /// Every class id (class-object address) this resolver knows, in unspecified
+    /// order. Used ONCE per executor to precompute the exact set of classes a
+    /// FROM spec matches, so the per-object class gate becomes a membership test
+    /// instead of a name lookup + string compare (see
+    /// [`SingleScanExecutor::class_match_set`]).
+    ///
+    /// The default returns empty, which the builder reads as "cannot enumerate"
+    /// and turns into "no precomputed set" — resolvers without a class table
+    /// (test fakes, hierarchy-less stubs) keep the original per-object path, so
+    /// this is a pure fast path with no semantic effect.
+    fn all_class_ids(&self) -> Vec<u64> {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]
@@ -294,6 +307,17 @@ pub struct SingleScanExecutor<'a, R: ClassResolver> {
     /// predicate walker hits an `Exists` node. Reset to 0 at the start of each
     /// per-object `where_passes`/`array_where_passes` call.
     exists_cursor: std::cell::Cell<usize>,
+    /// Precomputed, sorted, deduped set of class ids that the FROM spec matches,
+    /// built ONCE at executor construction from the resolver's class table. When
+    /// `Some`, [`class_matches`](Self::class_matches) answers the per-object class
+    /// gate with a membership test (`len == 1` → one `u64` compare; else a binary
+    /// search) instead of a `HashMap<u64, String>` probe plus a string compare —
+    /// the scan's hottest per-object cost. `None` when the set cannot be built
+    /// exactly: a subquery source (matches everything), a `FROM OBJECTS` source
+    /// (no class pattern), or a resolver that cannot enumerate its classes
+    /// (`all_class_ids()` empty). In those cases the original name-based path
+    /// runs unchanged, so semantics are identical by construction.
+    class_match_set: Option<Vec<u64>>,
 }
 
 /// Per-select-item running state for a scan-time aggregate accumulator.
@@ -653,6 +677,49 @@ fn compile_like_for_query(query: &Query) -> std::collections::HashMap<String, re
     compile_like_regexes(query).unwrap_or_default()
 }
 
+/// Precompute the exact set of class ids a FROM spec matches, backing the
+/// per-object class-gate fast path (see [`SingleScanExecutor::class_match_set`]).
+/// Returns `None` when the set cannot be built exactly, in which case the
+/// executor keeps the original name-based `class_matches`.
+///
+/// Exactness is by construction: the filter below calls the SAME predicate
+/// `class_matches` would call for an object of that class — `is_instance_of` for
+/// `FROM INSTANCEOF C`, else `class_name_matches_spec` on the resolved dotted
+/// name — over EVERY class the resolver knows, including classes with no
+/// resolvable name string (which `is_instance_of` can still match through a
+/// named superclass). A class id absent from the set is therefore one the
+/// name-based path would also reject.
+fn build_class_match_set<R: ClassResolver>(
+    query: &Query,
+    resolver: &R,
+    from_regex: Option<&regex::Regex>,
+) -> Option<Vec<u64>> {
+    // A FROM-subquery source has no class pattern of its own (it matches every
+    // object), and `FROM OBJECTS <address>` has none either (its gate is the
+    // resolved dense index). `class_spec()` is `None` for both.
+    let spec = query.from.class_spec()?;
+    let ids = resolver.all_class_ids();
+    if ids.is_empty() {
+        return None; // resolver cannot enumerate its classes → keep the old path
+    }
+    let mut set: Vec<u64> = ids
+        .into_iter()
+        .filter(|&cid| {
+            if spec.instanceof {
+                resolver.is_instance_of(cid, spec, from_regex)
+            } else {
+                match resolver.class_name(cid) {
+                    Some(name) => class_name_matches_spec(name, spec, from_regex),
+                    None => false,
+                }
+            }
+        })
+        .collect();
+    set.sort_unstable();
+    set.dedup();
+    Some(set)
+}
+
 impl<'a, R: ClassResolver> SingleScanExecutor<'a, R> {
     pub fn new(query: &'a Query, plan: &'a QueryPlan, resolver: &'a R) -> Self {
         // Build per-item accumulators when the query is an aggregate scan. A
@@ -685,6 +752,9 @@ impl<'a, R: ClassResolver> SingleScanExecutor<'a, R> {
         } else {
             None
         };
+        // Compile the FROM regex once and, from it, the exact class-match set.
+        let from_regex = compile_from_query(query);
+        let class_match_set = build_class_match_set(query, resolver, from_regex.as_ref());
         Self {
             query,
             plan,
@@ -694,7 +764,7 @@ impl<'a, R: ClassResolver> SingleScanExecutor<'a, R> {
             truncated: false,
             carry: None,
             in_sets: Vec::new(),
-            from_regex: compile_from_query(query),
+            from_regex,
             like_regexes: compile_like_for_query(query),
             agg_acc,
             target_index,
@@ -702,6 +772,7 @@ impl<'a, R: ClassResolver> SingleScanExecutor<'a, R> {
             group_map,
             exists_bools: Vec::new(),
             exists_cursor: std::cell::Cell::new(0),
+            class_match_set,
         }
     }
 
@@ -714,6 +785,8 @@ impl<'a, R: ClassResolver> SingleScanExecutor<'a, R> {
         } else {
             None
         };
+        let from_regex = compile_from_query(query);
+        let class_match_set = build_class_match_set(query, resolver, from_regex.as_ref());
         Self {
             query,
             plan,
@@ -723,7 +796,7 @@ impl<'a, R: ClassResolver> SingleScanExecutor<'a, R> {
             truncated: false,
             carry: Some(carry),
             in_sets: Vec::new(),
-            from_regex: compile_from_query(query),
+            from_regex,
             like_regexes: compile_like_for_query(query),
             // Carry mode is always for cross-phase retained queries, never for
             // aggregates; no accumulator needed.
@@ -733,6 +806,7 @@ impl<'a, R: ClassResolver> SingleScanExecutor<'a, R> {
             group_map: None,
             exists_bools: Vec::new(),
             exists_cursor: std::cell::Cell::new(0),
+            class_match_set,
         }
     }
 
@@ -841,6 +915,17 @@ impl<'a, R: ClassResolver> SingleScanExecutor<'a, R> {
         self.carry.expect("take_carry on a non-carry executor")
     }
     fn class_matches(&self, class_id: u64) -> bool {
+        // Fast path: a precomputed exact match set turns the gate into a
+        // membership test — one `u64` compare for the common single-class FROM,
+        // a binary search otherwise. Built by `build_class_match_set` from the
+        // same predicate the slow path evaluates, so it cannot disagree.
+        if let Some(set) = &self.class_match_set {
+            return match set.len() {
+                0 => false,
+                1 => class_id == set[0],
+                _ => set.binary_search(&class_id).is_ok(),
+            };
+        }
         // A FROM-subquery source has no class pattern of its own: identity is
         // constrained by the outer semi-join against the inner result, so the
         // scan must consider every object here.
@@ -1721,6 +1806,16 @@ impl<'a, R: ClassResolver> SingleScanExecutor<'a, R> {
 
 impl<'a, R: ClassResolver> ObjectVisitor for SingleScanExecutor<'a, R> {
     fn visit_instance(&mut self, src_idx: usize, class_id: u64, blob: &[u8]) {
+        // `WHERE <alias>.@objectId = <literal>`: `@objectId` IS the dense object
+        // index, so at most one index can satisfy the conjunct. Skip every other
+        // object outright; the conjunct stays in `where_terms` and is evaluated
+        // below, so results are identical to a full scan (see
+        // `optimize::pushdown_object_id`).
+        if let Some(t) = self.plan.object_id_target {
+            if src_idx as u64 != t {
+                return;
+            }
+        }
         // `FROM OBJECTS <address>`: only the single resolved dense index matches.
         // Gate only for an Object source so every other query is unaffected.
         if let FromSource::Object(_) = &self.query.from {
@@ -1829,6 +1924,13 @@ impl<'a, R: ClassResolver> ObjectVisitor for SingleScanExecutor<'a, R> {
     }
 
     fn visit_array(&mut self, src_idx: usize, class_name: &str, length: u32) {
+        // `WHERE <alias>.@objectId = <literal>`: same single-index gate as the
+        // instance path (an array's `@objectId` is its dense index too).
+        if let Some(t) = self.plan.object_id_target {
+            if src_idx as u64 != t {
+                return;
+            }
+        }
         // `FROM OBJECTS <address>`: only the single resolved dense index matches
         // (the target object may be an array). Gate only for an Object source.
         if let FromSource::Object(_) = &self.query.from {
@@ -4483,6 +4585,109 @@ mod tests {
             st.pending()[0].carry.indices(),
             vec![0, 1],
             "row-expanding op seeds must not be pruned"
+        );
+    }
+
+    // ---------- precomputed class-match set tests ----------
+
+    /// A resolver with an ENUMERABLE class table. The plain `TestSchema` returns
+    /// no class ids, which by design disables the fast path; this one lets us
+    /// exercise it.
+    struct TableSchema {
+        classes: Vec<(u64, &'static str)>,
+    }
+    impl ClassResolver for TableSchema {
+        fn class_name(&self, class_id: u64) -> Option<&str> {
+            self.classes
+                .iter()
+                .find(|(id, _)| *id == class_id)
+                .map(|(_, n)| *n)
+        }
+        fn all_class_ids(&self) -> Vec<u64> {
+            self.classes.iter().map(|(id, _)| *id).collect()
+        }
+    }
+
+    fn table(pairs: &[(u64, &'static str)]) -> TableSchema {
+        TableSchema {
+            classes: pairs.to_vec(),
+        }
+    }
+
+    /// THE parity argument for the fast path: for every class id in the table,
+    /// the precomputed set must agree with the name-based gate the slow path
+    /// evaluates. Covers exact, package-glob, quoted-regex, and no-match FROMs.
+    #[test]
+    fn class_match_set_agrees_with_name_based_gate() {
+        let classes: Vec<(u64, &'static str)> = vec![
+            (10, "java.lang.Object"),
+            (11, "java.lang.String"),
+            (12, "java.lang.StringBuilder"),
+            (13, "java.util.List"),
+            (14, "com.acme.Widget"),
+        ];
+        let res = table(&classes);
+        for sql in [
+            "SELECT @objectId FROM java.lang.String s",
+            "SELECT @objectId FROM java.lang.Object s",
+            "SELECT @objectId FROM java.lang.* s",
+            "SELECT @objectId FROM com.acme.Widget s",
+            "SELECT @objectId FROM \"java\\.lang\\..*\" s",
+            "SELECT @objectId FROM no.such.Class s",
+        ] {
+            let q = parse(sql).unwrap();
+            let plan = pq(&q);
+            let ex = SingleScanExecutor::new(&q, &plan, &res);
+            let set = ex
+                .class_match_set
+                .as_ref()
+                .expect("enumerable resolver must yield a set");
+            let spec = q.from.class_spec().unwrap();
+            for (id, name) in &classes {
+                let slow = class_name_matches_spec(name, spec, ex.from_regex.as_ref());
+                let fast = match set.len() {
+                    0 => false,
+                    1 => *id == set[0],
+                    _ => set.binary_search(id).is_ok(),
+                };
+                assert_eq!(fast, slow, "sql={sql} class={name}");
+            }
+        }
+    }
+
+    /// The fast path must only arm when it can be built EXACTLY. A resolver that
+    /// cannot enumerate its classes, a `FROM OBJECTS` source, and a subquery
+    /// source all leave `class_match_set` as `None`, so the original per-object
+    /// gate runs unchanged.
+    #[test]
+    fn class_match_set_declines_when_it_cannot_be_exact() {
+        let enumerable = table(&[(10, "java.lang.Object")]);
+        let plain = schema(&[(10, "java.lang.Object")]);
+        fn armed<R: ClassResolver>(sql: &str, res: &R) -> bool {
+            let q = parse(sql).unwrap();
+            let plan = pq(&q);
+            SingleScanExecutor::new(&q, &plan, res)
+                .class_match_set
+                .is_some()
+        }
+        assert!(
+            armed("SELECT @objectId FROM java.lang.Object s", &enumerable),
+            "an enumerable resolver must yield a set"
+        );
+        assert!(
+            !armed("SELECT @objectId FROM java.lang.Object s", &plain),
+            "a resolver with no all_class_ids() cannot enumerate → no set"
+        );
+        assert!(
+            !armed("SELECT @objectId FROM OBJECTS 0x10", &enumerable),
+            "FROM OBJECTS has no class pattern → no set"
+        );
+        assert!(
+            !armed(
+                "SELECT @objectId FROM (SELECT * FROM java.lang.Object) s",
+                &enumerable
+            ),
+            "a subquery source matches everything → no set"
         );
     }
 }

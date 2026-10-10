@@ -199,6 +199,13 @@ pub struct QueryPlan {
     /// Planned EXCEPT branches (empty for a non-EXCEPT query). Each branch plan
     /// itself has empty intersect/except branches.
     pub except_branch_plans: Vec<QueryPlan>,
+    /// Set by `optimize::pushdown_object_id` when a top-level AND conjunct pins
+    /// `@objectId` to an integer literal: the physical scan may visit ONLY that
+    /// dense object index instead of the whole heap. The conjunct itself stays in
+    /// `where_terms` and is still evaluated, so results are bit-identical to a
+    /// full scan — every OTHER index would fail that same conjunct anyway.
+    /// `None` (the planner default) means no pushdown: a full scan.
+    pub object_id_target: Option<u64>,
 }
 
 /// A planned `WHERE <lhs> IN (<subquery>)` predicate. `lhs` is the outer
@@ -1054,6 +1061,7 @@ fn plan_single(q: &Query, depth_cap: usize) -> Result<QueryPlan, QueryError> {
             having_terms: Vec::new(),
             intersect_branch_plans: Vec::new(),
             except_branch_plans: Vec::new(),
+            object_id_target: None,
         });
     }
 
@@ -1097,6 +1105,7 @@ fn plan_single(q: &Query, depth_cap: usize) -> Result<QueryPlan, QueryError> {
             having_terms: Vec::new(),
             intersect_branch_plans: Vec::new(),
             except_branch_plans: Vec::new(),
+            object_id_target: None,
         });
     }
 
@@ -1127,6 +1136,7 @@ fn plan_single(q: &Query, depth_cap: usize) -> Result<QueryPlan, QueryError> {
             having_terms: Vec::new(),
             intersect_branch_plans: Vec::new(),
             except_branch_plans: Vec::new(),
+            object_id_target: None,
         });
     }
     // A mixed select containing path(a, b) alongside other items is not supported:
@@ -1175,6 +1185,7 @@ fn plan_single(q: &Query, depth_cap: usize) -> Result<QueryPlan, QueryError> {
             having_terms: Vec::new(),
             intersect_branch_plans: Vec::new(),
             except_branch_plans: Vec::new(),
+            object_id_target: None,
         });
     }
 
@@ -1341,6 +1352,7 @@ fn plan_single(q: &Query, depth_cap: usize) -> Result<QueryPlan, QueryError> {
         having_terms,
         intersect_branch_plans: Vec::new(),
         except_branch_plans: Vec::new(),
+        object_id_target: None,
     })
 }
 

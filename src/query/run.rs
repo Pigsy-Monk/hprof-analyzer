@@ -141,6 +141,18 @@ impl<'a> ClassResolver for LiveResolver<'a> {
     fn ref_width(&self) -> usize {
         self.id_size
     }
+
+    /// Every class-object address in the dump's class table. Backs the executor's
+    /// precomputed class-match set (see `execute::build_class_match_set`).
+    ///
+    /// Deliberately keyed off `class_map` — NOT `names`: `names` omits classes
+    /// whose name string did not resolve, yet `is_instance_of` can still match
+    /// such a class through a named superclass. Enumerating the full class table
+    /// keeps the precomputed set a superset of everything the per-object path
+    /// could accept, so the two can never disagree.
+    fn all_class_ids(&self) -> Vec<u64> {
+        self.class_map.keys().copied().collect()
+    }
 }
 
 impl<'a> crate::query::plan::FieldSchema for LiveResolver<'a> {
@@ -267,6 +279,31 @@ impl<'q, R: ClassResolver> ScanDriver<'q, R> {
             }
         }
         self
+    }
+
+    /// The only dense object indices any executor can possibly match, when EVERY
+    /// executor's plan carries an `@objectId = <literal>` pushdown — else `None`,
+    /// meaning "a full `0..n` scan is required".
+    ///
+    /// `@objectId` is the dense object index, so an `@objectId = t` conjunct
+    /// admits at most index `t`; a caller driving the scan by hand can therefore
+    /// visit just these indices instead of the whole heap. `n` is the object
+    /// count: a target at or beyond it names no object and is dropped (that
+    /// executor then matches nothing — exactly what a full scan yields). Targets
+    /// are deduped because two executors may pin the same index.
+    ///
+    /// Returning `None` whenever ANY executor lacks a target is deliberate: that
+    /// executor must still see every object, so the loop cannot be narrowed.
+    pub fn pushdown_indices(&self, n: usize) -> Option<Vec<usize>> {
+        let mut out: Vec<usize> = Vec::new();
+        for ex in &self.execs {
+            let t = ex.plan().object_id_target?;
+            let t = usize::try_from(t).ok()?;
+            if t < n && !out.contains(&t) {
+                out.push(t);
+            }
+        }
+        Some(out)
     }
 
     /// Build the string-capture sidecar if any exec has `needs.string_values`.
@@ -862,10 +899,27 @@ pub fn run_resident_only(
     // (kind 3) and arrays (kind 1/2) are skipped: array-FROM queries are routed
     // to the scan path by the caller, and the scan never delivers class objects
     // to visit_instance either.
-    for i in 0..cache.n {
-        if cache.p1.kind[i] == 0 {
-            let class_addr = cache.p1.class_addr_table[cache.class_ids[i] as usize];
-            driver.visit_instance(i, class_addr, &[]);
+    //
+    // When every query pinned `@objectId` to a literal, visit ONLY those indices
+    // (see `ScanDriver::pushdown_indices`) — the whole-heap loop collapses to a
+    // handful of steps. The conjunct is still evaluated per visited object, so
+    // the row set is identical to the full scan.
+    match driver.pushdown_indices(cache.n) {
+        Some(idxs) => {
+            for i in idxs {
+                if cache.p1.kind[i] == 0 {
+                    let class_addr = cache.p1.class_addr_table[cache.class_ids[i] as usize];
+                    driver.visit_instance(i, class_addr, &[]);
+                }
+            }
+        }
+        None => {
+            for i in 0..cache.n {
+                if cache.p1.kind[i] == 0 {
+                    let class_addr = cache.p1.class_addr_table[cache.class_ids[i] as usize];
+                    driver.visit_instance(i, class_addr, &[]);
+                }
+            }
         }
     }
 
@@ -935,10 +989,23 @@ pub fn run_resident_with_retained(
         entries.push((slot, ex));
     }
     let mut driver = ScanDriver::new(entries).with_src_capture(reachable_only);
-    for i in 0..cache.n {
-        if cache.p1.kind[i] == 0 {
-            let class_addr = cache.p1.class_addr_table[cache.class_ids[i] as usize];
-            driver.visit_instance(i, class_addr, &[]);
+    // Same `@objectId` single-index pushdown as `run_resident_only`.
+    match driver.pushdown_indices(cache.n) {
+        Some(idxs) => {
+            for i in idxs {
+                if cache.p1.kind[i] == 0 {
+                    let class_addr = cache.p1.class_addr_table[cache.class_ids[i] as usize];
+                    driver.visit_instance(i, class_addr, &[]);
+                }
+            }
+        }
+        None => {
+            for i in 0..cache.n {
+                if cache.p1.kind[i] == 0 {
+                    let class_addr = cache.p1.class_addr_table[cache.class_ids[i] as usize];
+                    driver.visit_instance(i, class_addr, &[]);
+                }
+            }
         }
     }
     let state = driver.finish_state();

@@ -153,6 +153,56 @@ pub fn order_by_selectivity(_plan: &mut QueryPlan, _stats: &SchemaStats) {
     // added, sort candidates ascending by stats.count_of(class).
 }
 
+/// Recognise a bare `@objectId = <int literal>` equality conjunct (either
+/// operand order) and return the literal. Returns `None` for anything else —
+/// a different attribute, a non-`Eq` operator, a non-integer literal, or an
+/// expression wrapper (`@objectId + 1 = 5`) — so only the exact identity form
+/// is ever pushed down.
+fn object_id_eq_literal(pred: &crate::query::ast::Predicate) -> Option<i64> {
+    use crate::query::ast::{CompareOp, Expr, Predicate, Value};
+    let Predicate::Compare { lhs, op, rhs } = pred else {
+        return None;
+    };
+    if *op != CompareOp::Eq {
+        return None;
+    }
+    let bare_int = |e: &Expr| match e {
+        Expr::Lit(Value::Int(n)) => Some(*n),
+        _ => None,
+    };
+    let is_object_id = |e: &Expr| matches!(e, Expr::Attr(crate::query::ast::Attr::ObjectId));
+    if is_object_id(lhs) {
+        return bare_int(rhs);
+    }
+    if is_object_id(rhs) {
+        return bare_int(lhs);
+    }
+    None
+}
+
+/// Push a top-level `@objectId = <int literal>` conjunct down to the physical
+/// scan as a single-index visit: `@objectId` is the dense object index
+/// (execute.rs `project_attr` returns `src_idx`), so at most ONE object can
+/// satisfy the conjunct and the scan may visit just that index instead of the
+/// whole heap. Purely a work-elision: the conjunct stays in `where_terms` and is
+/// still evaluated, so any OTHER index would be rejected by it anyway — the
+/// result set is bit-identical to a full scan.
+///
+/// Only the FIRST such conjunct is recorded. With two contradictory conjuncts
+/// (`@objectId = 5 AND @objectId = 7`) the recorded index fails the other
+/// conjunct, so the scan still yields zero rows — which is what a full scan
+/// yields too. A negative literal, or one outside the heap's index range, can
+/// name no object; that is left to the executor, which resolves the literal
+/// against the real object count (see `ScanDriver::pushdown_indices`).
+/// Idempotent: clears and recomputes `object_id_target` each call.
+pub fn pushdown_object_id(plan: &mut QueryPlan) {
+    plan.object_id_target = plan
+        .where_terms
+        .iter()
+        .find_map(|c| object_id_eq_literal(&c.pred))
+        .and_then(|n| u64::try_from(n).ok());
+}
+
 /// The full optimizer pass: reorder predicates, push LIMIT to the scan when
 /// safe, defer expensive projections past the filter, prune dead needs, narrow
 /// the carry layout, then recurse into FROM-subplans, IN-subplans, and UNION
@@ -163,6 +213,7 @@ pub fn optimize(mut plan: QueryPlan, query: &Query, stats: &SchemaStats) -> Quer
     reorder_predicates(&mut plan);
     order_by_selectivity(&mut plan, stats);
     pushdown_limit(&mut plan);
+    pushdown_object_id(&mut plan);
     defer_projections(&mut plan, query);
     eliminate_dead_needs(&mut plan);
     narrow_carry(&mut plan);
@@ -838,5 +889,82 @@ mod tests {
             matches!(plan.carry, CarryLayout::IndexOnly),
             "IndexPlusScalars with empty widths must downgrade to IndexOnly"
         );
+    }
+
+    // ---------- pushdown_object_id tests ----------
+
+    /// A bare `@objectId = <int>` conjunct (either operand order) is pushed down
+    /// to the single dense index it names; `optimize` must also be idempotent.
+    #[test]
+    fn pushdown_object_id_recognises_bare_equality() {
+        for sql in [
+            "SELECT @objectId FROM java.lang.String s WHERE s.@objectId = 42",
+            "SELECT @objectId FROM java.lang.String s WHERE @objectId = 42",
+            "SELECT @objectId FROM java.lang.String s WHERE 42 = s.@objectId",
+        ] {
+            let mut plan = pq(&parse(sql).unwrap());
+            pushdown_object_id(&mut plan);
+            assert_eq!(plan.object_id_target, Some(42), "sql: {sql}");
+            let once = plan.object_id_target;
+            pushdown_object_id(&mut plan);
+            assert_eq!(plan.object_id_target, once, "not idempotent: {sql}");
+        }
+    }
+
+    /// Only the exact identity form is pushed down. Anything that could admit a
+    /// DIFFERENT index — a non-`Eq` operator, an arithmetic operand, an OR/AND
+    /// nested inside an operand, a non-integer or negative literal — must leave
+    /// the plan on the full-scan path.
+    #[test]
+    fn pushdown_object_id_rejects_non_identity_forms() {
+        for sql in [
+            // not equality
+            "SELECT @objectId FROM java.lang.String s WHERE s.@objectId > 42",
+            "SELECT @objectId FROM java.lang.String s WHERE s.@objectId != 42",
+            // the literal is not a bare integer
+            "SELECT @objectId FROM java.lang.String s WHERE s.@objectId = 42.0",
+            "SELECT @objectId FROM java.lang.String s WHERE s.@objectId = -1",
+            // the operand is an expression, not a bare @objectId
+            "SELECT @objectId FROM java.lang.String s WHERE s.@objectId + 1 = 43",
+            // the equality is nested under OR / NOT, so other indices can match
+            "SELECT @objectId FROM java.lang.String s WHERE s.@objectId = 42 OR s.@objectId = 7",
+            "SELECT @objectId FROM java.lang.String s WHERE NOT (s.@objectId = 42)",
+            // a different attribute entirely
+            "SELECT @objectId FROM java.lang.String s WHERE @usedHeapSize = 42",
+        ] {
+            let mut plan = pq(&parse(sql).unwrap());
+            pushdown_object_id(&mut plan);
+            assert_eq!(plan.object_id_target, None, "must not push down: {sql}");
+        }
+    }
+
+    /// Two contradictory equalities still push down to the first literal: that
+    /// index fails the second conjunct, so the scan yields zero rows — exactly
+    /// what a full scan yields.
+    #[test]
+    fn pushdown_object_id_contradictory_pair_keeps_first() {
+        let mut plan = pq(&parse(
+            "SELECT @objectId FROM java.lang.String s \
+                 WHERE s.@objectId = 5 AND s.@objectId = 7",
+        )
+        .unwrap());
+        pushdown_object_id(&mut plan);
+        assert_eq!(plan.object_id_target, Some(5));
+        // The conjunct is still in where_terms (it must be evaluated, not dropped).
+        assert!(
+            plan.where_terms
+                .iter()
+                .any(|c| object_id_eq_literal(&c.pred) == Some(5)),
+            "the pushed-down conjunct must remain in where_terms"
+        );
+    }
+
+    /// `optimize` runs the pushdown, so a planned+optimized query carries the
+    /// target end to end (this is the wiring the executor relies on).
+    #[test]
+    fn optimize_applies_object_id_pushdown() {
+        let q = parse("SELECT @objectId FROM java.lang.String s WHERE s.@objectId = 3").unwrap();
+        let plan = optimize(pq(&q), &q, &SchemaStats::default());
+        assert_eq!(plan.object_id_target, Some(3));
     }
 }
