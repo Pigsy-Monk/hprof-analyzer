@@ -4,6 +4,180 @@ All notable changes to hprof-analyzer are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **`server` starts from the disk cache.** A `server` previously held its
+  analysis in memory only, so every restart re-ran the whole pipeline — on a
+  44 GB dump that is ~50 minutes and ~20 GiB, which is most of the reason not
+  to run one. It now rebuilds the query session from the cache files already
+  on disk (`pass1.bin.zst` + `arrays.bin` + `class_names.json.zst`) before
+  spawning the pipeline, and logs `warm start from disk cache`. On the 44 GB
+  fare dump that brings a restart down to **42.7 seconds**. Anything missing
+  or undecodable falls through to the pipeline, so this is purely an
+  optimisation.
+
+- **`server` diagnostics: `--trace-rss` and `--progress`.** The analyze path
+  had per-stage RSS tracing and progress output; `server` accepted neither
+  (setting `HPROF_TRACE_RSS` in the environment worked, but nothing
+  documented it). Both flags now exist on `server`, with the CLI's `auto`
+  rule, and the server's stage boundaries emit progress phases.
+
+- **`server --no-rescan`.** Both of the server's query escape hatches re-read
+  the dump *while the resident analysis stays in memory*, so the peaks are
+  roughly additive: a single query needing dominators took a `ready` server
+  from 14.6 GiB to 31.3 GiB on a 32 GiB box and got it OOM-killed silently.
+  `--no-rescan` refuses such a query up front with
+  `{"kind":"rescan_refused"}`, naming the capability it wanted. Queries the
+  resident cache can answer — counts, histograms, plain class projections —
+  are unaffected.
+
+- **Queries answer `@inbounds` / `@outbounds` / `path()` from the cache.** A
+  server warmed from `graph.bin` no longer re-reads the dump for edge
+  queries. The session built from disk now carries the forward CSR and the
+  inbound block CSR, so the ~50-minute, ~20 GiB rescan that existed only
+  because a cache-assembled session carried no edges at all is gone. A
+  truncated cache degrades to "no edges" rather than panicking, and a `heap
+  load` without `--with-graph` simply has none.
+
+- **`mat caches --report <path>`.** `mat caches` deliberately skipped the
+  HTML report (`skip_report: true`, output to `/dev/null`) to avoid paying
+  for `build_model` + `render` + `alloc_sites`. `--report` opts back in,
+  with the output format inferred from the extension. Without the flag
+  nothing changes.
+
+- **Checkpoint tooling for the inbound-CSR and dominator stages.** Debugging
+  the rescan-path edge loss meant re-running a ~40-minute pipeline per
+  hypothesis; `HPROF_CKPT_SAVE=<dir>` plus the `dev dom-ckpt` /
+  `dev ckpt-diff` / `dev ckpt-cmp` / `dev ckpt-rebuild-inbound` subcommands
+  make that seconds-level.
+
+### Changed
+
+- **`heap load --with-graph` peak cut by ~48%.** On the 44 GB fare dump the
+  peak dropped from ≥50.79 GiB to **26.43 GiB** (a plain `heap load` sits
+  near 20 GiB). The graph-cache write path no longer flattens the 2.3-billion
+  -edge forward CSR into a `Vec<u32>`, builds full-size delta buffers, or
+  clones the offset table: `graph.bin` is now streamed straight to the file
+  through a single 64 KiB staging buffer, and the forward half is written
+  *before* `build_from_fwd` consumes the CSR, which is what lets it borrow
+  the chunked store instead of copying it. Output is byte-identical to the
+  old file. `graph.bin` is assembled under `.tmp` and renamed, so a run that
+  dies mid-write cannot leave a truncated file that `check_magic` would
+  accept.
+
+- **`graph.bin`'s inbound half is real.** It was written as empty arrays
+  while the file claimed otherwise. The inbound CSR is now written in the
+  same `(inb_block_off, inb_data)` block form `compute_dominators` consumes.
+
+- **Cache snapshots carry `kind` / `class_ids`.** Groundwork for the warm
+  start: `Pass1Snapshot` now holds every field `OqlCacheHandover` needs, so
+  the session can be rebuilt from the cache alone. Because `bincode` is not
+  self-describing, a cache written by an older build now fails to decode and
+  is re-analyzed with a warning (rather than a hard error), since `is_valid`
+  only checks magic bytes and file presence and cannot see a schema change.
+
+- **`server` hands the OQL cache over with the report.** The server's first
+  OQL query used to re-run Pass1+Pass2 to build its `ReplCache` — 1903 s on a
+  37.9 GB dump. Two causes: a `prewarm()` that ran a full Pass1+Pass2
+  *concurrently* with the analysis (roughly doubling peak memory, and what
+  OOM'd a 32 GiB box in server mode while the same binary finished the same
+  dump in CLI mode — removing it takes the analysis peak from 31.29 GiB to
+  17.03 GiB), and the analysis discarding the tables the query path reads.
+  `AnalyzeOptions::keep_oql_cache` (set only by the server) now keeps them.
+
+- **`mat caches` emits the report content MAT expects, not just an openable
+  index.** `ClassImpl` carries a real `address`, MAT-id `superClassId` /
+  `classLoaderId`, and real `fields` / `staticFields`; `SnapshotInfo`
+  declares its full field set; `$useCompressedOops` is derived rather than
+  hard-coded false; `roots` / `rootsPerThread` / `loaderLabels` and per-class
+  static fields are populated. MAT recomputes none of these on reopen, so
+  whatever is omitted stays omitted.
+
+### Fixed
+
+- **`FROM INSTANCEOF <class>` no longer drops array types.** `FROM INSTANCEOF
+  java.lang.Object` answered differently on the two query paths: the CLI
+  (scan) reported `byte[]` and `java.lang.Object[]`, the server reported
+  neither — everything else agreed, which is what made it easy to miss. Both
+  paths now deliver arrays; on the server, the resident path drives array
+  visits too, gated on the same `wants_arrays` predicate the scan uses. A
+  query that can observe an array's element count (`@length`,
+  `length()`/`size()`) is kept on the scan path, since the resident cache
+  does not carry element counts.
+
+- **`--reachable-only` now actually prunes.** Two separate defects. The CLI
+  passed `reachable_only: true` as an argument while handing down
+  `AnalyzeOptions::default()` (whose `reachable_only` is `false`), so the
+  per-row source-index sidecar was never armed and `heap query` pruned
+  nothing — it reported 762 `java.lang.Thread` objects on the 44 GB fare dump
+  where MAT reports 753. Separately, the flag was a no-op for every query
+  that escalates to the full pipeline (`@retainedHeapSize`, dominators,
+  `@inbounds`, `toString`, RefPath), because carry-mode executors never build
+  rows and so never arm the sidecar; those now prune their seeds before the
+  late stage runs. **Known limitation:** scan-phase aggregates such as
+  `COUNT(*)` still cannot be pruned.
+
+- **MAT index: `ClassImpl.cacheEntry` was written as null.** MAT's
+  `ClassImpl.getObjectIds()` slices the *inbound* index by that entry, so
+  every view that asks a class for its instances came back empty or
+  truncated: Top Consumers / Retained Set page numbering, the Finalizer page,
+  the system class loader page, and the Thread Overview table. `inbound` now
+  writes a class object's entry in MAT's own layout (instances ascending,
+  then remaining referrers ascending), and `inbound.index` is byte-identical
+  to MAT's. Thread Overview goes 19 → 21 rows, `372.html` 1489 → 5600 B.
+
+- **MAT index: `domOut` was unsorted.** MAT sorts *every* dominator-tree
+  entry by total size descending, not just the superroot's; ours were in
+  ascending mat-id order, and the synthetic id 0 was forced to the end.
+  `domOut.index` is now byte-identical to MAT's golden file. (This is what
+  had collapsed MAT's Top Consumers to "No objects bigger than 1%".)
+
+- **MAT index: the `UnreachableObjectsHistogram` property was missing; the
+  `i2sv2` we wrote was wrong.** MAT stores the objects it discards as
+  unreachable in a `SnapshotInfo` property; we wrote only the four plain
+  properties, so the "Unreachable Objects" view had nothing to show. It now
+  carries the same records, in the same order, with the same counts and sizes
+  as MAT's own index. Conversely `i2sv2` (`RetainedSizeCache`) is no longer
+  emitted: MAT's Class Histogram `Retained Heap` column reads the cached
+  value whenever the entry is present, and ours (a plain sum of instance
+  retained sizes) disagreed with MAT for 408 of 2036 classes, showing the
+  column too large and mis-ordered. MAT recomputes the cache itself when the
+  file is absent, so MAT now owns those values and the page is row-for-row
+  identical to MAT's.
+
+- **MAT index: `ClassImpl` field order and the embedded version.** The
+  `ClassImpl` call site passed its key layers superclass-first where the
+  serializer expects subclass-first, so MAT read `classLoaderAddress` /
+  `classLoaderId` where it expected `AbstractObjectImpl`'s address and
+  objectId and then hit `StreamCorruptedException: invalid type code: 00`
+  (it re-parsed the dump). `fields` / `staticFields` / `subClasses` written
+  as `TC_NULL` also made MAT NPE while restoring the snapshot.
+
+- **`server`: the retained fast path was unreachable.** `used_fast_path`
+  required `needs.retained` (via `needs_only_retained`) *and*
+  `cache_eligible` (which requires `!needs.retained`), so the branch was dead
+  code and every `@retainedHeapSize` query re-ran Pass1+Pass2 from the dump,
+  on top of the resident analysis. On the fixture,
+  `SUM(@retainedHeapSize)` went 3033 ms → 122 ms and `SELECT
+  @retainedHeapSize` 2949 ms → 108 ms.
+
+- **pass2: the inbound-CSR rescan path dropped edges.** When the dump is
+  large enough to take the re-read path rather than transposing the forward
+  CSR, `InboundBuilder` was handed empty `class_addr_to_hist` /
+  `field_plans_dense` (so every instance-field edge was silently skipped) and
+  an object array's element-class id was read and discarded. On a 41.3 GiB
+  dump this lost 39% of the inbound edges and put 16.9% of nodes in the wrong
+  place.
+
+- **dominator: fail loudly when the LT invariant is violated.**
+  `semi[w] <= preorder(parent[w])` is a theorem, so a violation proves the
+  predecessor lists and the DFS tree disagree about where edges are attached
+  — and therefore that any dominator tree built from them is wrong. That is
+  exactly the silent failure the recovery ladder cannot catch (it fires only
+  on an out-of-bounds decode), and it was producing a plausible, wrong tree
+  with exit 0 and no warning. Now checked in the production path (one
+  O(count) integer scan, no allocation) and reported as an error.
+
 ## [0.3.1] — 2026-10-02
 
 ### Added
