@@ -1,0 +1,22 @@
+docs/mat-cache.md
+  s_d88b882af55fa9::t_c2f3065ef2d437 67-70
+  s_d88b882af55fa9::t_a06695baa065d5 81,83-84,86
+  s_d88b882af55fa9::t_2f708da8c19c2e 126-127
+  s_d88b882af55fa9::t_23bdcfc4aaeead 3,6,8-25
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.45-trip",
+  "base_commit_sha": "167f286a2777addf721237aa75564e1db9282956",
+  "prompts": {},
+  "sessions": {
+    "s_d88b882af55fa9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "99417d7d-eefa-47ba-a772-d0c0f9c0d8ed",
+        "model": "deepseek-v4-1-flash-260910"
+      },
+      "human_author": "zwsong <zwsong@trip.com>"
+    }
+  }
+}
