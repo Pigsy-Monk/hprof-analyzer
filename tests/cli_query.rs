@@ -5947,13 +5947,20 @@ fn is_null_and_is_not_null_filter() {
 fn limit_offset_paginates_correctly() {
     let Some(hprof) = philosophers() else { return };
     // Get first 3 rows and next 3 rows; they must be disjoint.
+    //
+    // The sort key is deliberately non-unique (`classof`), so the projected row
+    // must carry something row-unique — otherwise the assertion is unsatisfiable
+    // rather than wrong: with `boolean[]` as the alphabetically-first class the
+    // first six objects share one class name, and pages legitimately repeat it.
+    // `@objectAddress` is the object's identity, so disjointness of ROWS is
+    // still exactly what is asserted.
     let page1 = Command::new(BIN)
         .arg("query")
         .arg(&hprof)
         .args([
             "--query",
-            "SELECT classof(x) AS class FROM INSTANCEOF java.lang.Object x \
-             ORDER BY class ASC LIMIT 3",
+            "SELECT classof(x) AS class, @objectAddress AS addr \
+             FROM INSTANCEOF java.lang.Object x ORDER BY class ASC LIMIT 3",
         ])
         .output()
         .unwrap();
@@ -5968,8 +5975,8 @@ fn limit_offset_paginates_correctly() {
         .arg(&hprof)
         .args([
             "--query",
-            "SELECT classof(x) AS class FROM INSTANCEOF java.lang.Object x \
-             ORDER BY class ASC LIMIT 3 OFFSET 3",
+            "SELECT classof(x) AS class, @objectAddress AS addr \
+             FROM INSTANCEOF java.lang.Object x ORDER BY class ASC LIMIT 3 OFFSET 3",
         ])
         .output()
         .unwrap();
