@@ -1,3 +1,4 @@
+pub mod objfields;
 pub mod oql_docs;
 
 use std::{path::PathBuf, sync::Arc};
@@ -620,12 +621,23 @@ impl HprofMcpServer {
     }
 
     /// Inspect a single object by dense index.
-    #[tool(description = "Get class name and memory sizes for one object. \
+    #[tool(
+        description = "Get class name, memory sizes and FIELD VALUES for one object. \
                        object_index comes from: (a) @objectId column in a query result (0-based, use directly), \
                        (b) 'index' field in browse_dominators output (0-based, use directly), \
                        (c) obj_index_1based from get_report dominator_tree/root_path (1-BASED — subtract 1 first!). \
-                       Returns shallow_bytes (object itself) and retained_bytes (everything kept alive only by this object). \
-                       After inspect, call browse_dominators({object_index: <same>}) to see what it retains.")]
+                       Returns shallow_bytes (object itself), retained_bytes (everything kept alive only by this object), \
+                       and 'fields': the object's actual field values, decoded straight from the dump by byte offset \
+                       (a seek, not a rescan — milliseconds even on a 40 GB dump). \
+                       Primitives come as JSON numbers/booleans; a reference field is \
+                       {\"@ref\":\"0x...\",\"@index\":<dense index>,\"@class\":\"...\"} — feed @index back to inspect_object \
+                       to walk it — and gains \"@text\" when the target is a java.lang.String. \
+                       Arrays return @kind/@element_count/@element_type and an 'elements' list capped at 64 entries. \
+                       Strings carry \"@text\" (capped at 512 chars, with @text_length when cut). \
+                       When the values cannot be read, 'fields' is null and 'fields_note' says why \
+                       (e.g. an older cache with no object-offset table, or a gzip/zip dump) — never silently empty. \
+                       After inspect, call browse_dominators({object_index: <same>}) to see what it retains."
+    )]
     async fn inspect_object(
         &self,
         Parameters(p): Parameters<InspectObjectParams>,
@@ -727,6 +739,16 @@ impl HprofMcpServer {
 
         if let Some(refs) = inbound_refs {
             result["inbound_refs"] = serde_json::json!(refs);
+        }
+
+        // Field values, read straight out of the dump by byte offset (a seek,
+        // not a rescan). `fields` is null — with `fields_note` saying why —
+        // whenever the values cannot be read, so a caller never mistakes "could
+        // not read" for "this object has no fields".
+        let (fields, fields_note) = objfields::render_fields(sess, &class_idx, idx);
+        result["fields"] = fields.unwrap_or(serde_json::Value::Null);
+        if let Some(note) = fields_note {
+            result["fields_note"] = serde_json::json!(note);
         }
 
         let json = serde_json::to_string_pretty(&result)
@@ -1639,6 +1661,164 @@ mod tests {
             marker["_omitted"],
             serde_json::json!(30),
             "should report 30 omitted children"
+        );
+    }
+
+    // ── inspect_object field values ──────────────────────────────────────────
+    //
+    // `inspect_object` reads field values through `objfields::render_fields`,
+    // which is the MCP face of the CLI's seek-based reader. These tests pin the
+    // same user-facing contract the CLI's `tests/cli_inspect_fields.rs` pins:
+    // correct values, and a *loud* refusal (never a silent empty object) when
+    // the offsets needed to seek are absent.
+
+    /// Copy the fixture into a scratch dir and analyse it there, so a test may
+    /// delete `offsets.bin` without racing the shared, gitignored cache the rest
+    /// of the suite uses.
+    fn staged_session(tag: &str) -> Option<(std::path::PathBuf, crate::cache::CachedSession)> {
+        let src = philosophers_path()?;
+        let dir =
+            std::env::temp_dir().join(format!("hprof_mcp_fields_{}_{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).ok()?;
+        let dump = dir.join("dump.hprof");
+        std::fs::copy(&src, &dump).ok()?;
+        let sess =
+            crate::analyze_with_cache(&dump, &AnalyzeOptions::default(), CacheMode::Full, |_| {})
+                .ok()?;
+        Some((dump, sess))
+    }
+
+    fn class_idx_of(sess: &crate::cache::CachedSession) -> Vec<u32> {
+        sess.cache
+            .read_class_idx()
+            .expect("read class_idx")
+            .expect("class_idx present")
+    }
+
+    /// `heap load` writes the object-offset table that makes the seek possible.
+    #[test]
+    fn analysis_writes_the_object_offset_table() {
+        let Some((_dir, sess)) = staged_session("hasoffs") else {
+            return;
+        };
+        assert!(
+            sess.cache.has_hprof_offsets(),
+            "analysis must write offsets.bin, or field values are unreadable"
+        );
+    }
+
+    /// Object 100 of the fixture is a `java.util.HashMap$Node`: `hash` is a
+    /// primitive, `key`/`value` are references to Strings, `next` is a null
+    /// reference — one of each shape the reader has to render.
+    #[test]
+    fn inspect_fields_decode_values() {
+        let Some((_dir, sess)) = staged_session("fields") else {
+            return;
+        };
+        let class_idx = class_idx_of(&sess);
+        let (fields, note) = super::objfields::render_fields(&sess, &class_idx, 100);
+        assert!(note.is_none(), "expected no note, got {note:?}");
+        let f = fields.expect("fields must be present");
+        assert_eq!(f["@address"], "0x80100c40");
+        assert_eq!(f["hash"], 119777, "primitive int field");
+        assert_eq!(f["next"], serde_json::Value::Null, "null reference");
+        // A reference is its address plus a dense index, never a nested expansion.
+        assert_eq!(f["key"]["@ref"], "0xffe45968");
+        assert_eq!(f["key"]["@index"], 226452);
+        assert_eq!(f["key"]["@class"], "java.lang.String");
+        assert_eq!(f["value"]["@ref"], "0xffe69fb8");
+    }
+
+    /// A `String`-valued field carries the decoded text, so the caller does not
+    /// have to chase `key` → `byte[]` by hand.
+    #[test]
+    fn inspect_fields_inline_string_text() {
+        let Some((_dir, sess)) = staged_session("strfld") else {
+            return;
+        };
+        let class_idx = class_idx_of(&sess);
+        let (fields, _) = super::objfields::render_fields(&sess, &class_idx, 100);
+        assert_eq!(fields.unwrap()["key"]["@text"], "ymt");
+    }
+
+    /// Inspecting a `String` itself shows the text, not only its `value` byte[].
+    #[test]
+    fn inspect_fields_string_object_shows_text() {
+        let Some((_dir, sess)) = staged_session("strobj") else {
+            return;
+        };
+        let class_idx = class_idx_of(&sess);
+        let (fields, note) = super::objfields::render_fields(&sess, &class_idx, 226452);
+        assert!(note.is_none(), "expected no note, got {note:?}");
+        let f = fields.expect("fields");
+        assert_eq!(f["@text"], "ymt");
+        // The raw fields are still there alongside the decoded text.
+        assert_eq!(f["hash"], 119776);
+        assert_eq!(f["coder"], 0);
+    }
+
+    /// Arrays are decoded, capped at `objread::MAX_ARRAY_ELEMENTS`.
+    #[test]
+    fn inspect_fields_decode_array_elements() {
+        let Some((_dir, sess)) = staged_session("arr") else {
+            return;
+        };
+        let class_idx = class_idx_of(&sess);
+        // Object 72895 is a `byte[]`.
+        let (fields, note) = super::objfields::render_fields(&sess, &class_idx, 72895);
+        assert!(note.is_none(), "expected no note, got {note:?}");
+        let f = fields.expect("fields");
+        assert_eq!(f["@kind"], "primitive array");
+        assert_eq!(f["@element_type"], "byte");
+        assert!(
+            f["@element_count"].is_number(),
+            "must report the true count"
+        );
+        let elems = f["elements"].as_array().expect("elements must be a list");
+        assert!(
+            elems.len() <= crate::objread::MAX_ARRAY_ELEMENTS,
+            "a byte[N] must not become an N-element response; got {}",
+            elems.len()
+        );
+    }
+
+    /// Negative control: with no offset table the reader must say so — not
+    /// return an empty object, which would read as "this object has no fields".
+    #[test]
+    fn inspect_fields_without_offsets_degrade_loudly() {
+        let Some((_dir, sess)) = staged_session("noff") else {
+            return;
+        };
+        std::fs::remove_file(sess.cache.path.join("offsets.bin")).expect("remove offsets.bin");
+        let class_idx = class_idx_of(&sess);
+        let (fields, note) = super::objfields::render_fields(&sess, &class_idx, 100);
+        assert!(
+            fields.is_none(),
+            "no offsets must yield no fields, got {fields:?}"
+        );
+        let note = note.expect("a note explaining the gap");
+        assert!(
+            note.contains("no object-offset table"),
+            "expected an explanatory note, got {note:?}"
+        );
+    }
+
+    /// A class object has no HPROF record; it must say that rather than read
+    /// garbage or return an empty object.
+    #[test]
+    fn inspect_fields_class_object_reports_no_record() {
+        let Some((_dir, sess)) = staged_session("cls") else {
+            return;
+        };
+        let class_idx = class_idx_of(&sess);
+        // Object 233903 is a `java.lang.Class` (kind 3).
+        let (fields, note) = super::objfields::render_fields(&sess, &class_idx, 233903);
+        assert!(fields.is_none());
+        let note = note.expect("a note explaining the gap");
+        assert!(
+            note.contains("class object"),
+            "class object must report why it has no fields, got {note:?}"
         );
     }
 }
