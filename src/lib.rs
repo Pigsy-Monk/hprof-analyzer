@@ -590,22 +590,37 @@ pub fn analyze_with_cache(
     let cache = CacheDir::for_dump(path)?;
 
     // Fast path: load from cache.
+    //
+    // A cache that passes `is_valid` can still fail to decode: bincode is not
+    // self-describing, so a cache written by an older build — e.g. one predating
+    // `Pass1Snapshot`'s `kind`/`class_ids` — errors here rather than reading
+    // shifted bytes. Treat that as a stale cache and fall through to the
+    // pipeline instead of failing the whole command; `is_valid` only checks
+    // magic bytes and file presence, which cannot see a schema change.
     if cache.is_valid(mode) {
-        let report = cache
-            .read_report()?
-            .ok_or_else(|| std::io::Error::other("cache corrupt: missing report"))?;
-        let pass1 = cache
-            .read_pass1()?
-            .ok_or_else(|| std::io::Error::other("cache corrupt: missing pass1"))?;
-        let class_names = cache.read_class_names()?.unwrap_or_default();
-        return Ok(CachedSession {
-            dump_path: path.to_path_buf(),
-            report,
-            pass1,
-            cache,
-            mode,
-            class_names,
-        });
+        let loaded = (|| -> std::io::Result<CachedSession> {
+            let report = cache
+                .read_report()?
+                .ok_or_else(|| std::io::Error::other("cache corrupt: missing report"))?;
+            let pass1 = cache
+                .read_pass1()?
+                .ok_or_else(|| std::io::Error::other("cache corrupt: missing pass1"))?;
+            let class_names = cache.read_class_names()?.unwrap_or_default();
+            Ok(CachedSession {
+                dump_path: path.to_path_buf(),
+                report,
+                pass1,
+                cache: CacheDir {
+                    path: cache.path.clone(),
+                },
+                mode,
+                class_names,
+            })
+        })();
+        match loaded {
+            Ok(sess) => return Ok(sess),
+            Err(e) => eprintln!("hprof-cache: cache unreadable ({e}); re-analyzing"),
+        }
     }
 
     // Slow path: run full pipeline, then write cache.

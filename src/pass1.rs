@@ -1274,6 +1274,18 @@ pub struct Pass1Snapshot {
     pub header_timestamp_ms: u64,
     /// Total dump file size in bytes (for cache validation).
     pub file_size: u64,
+    /// Per-object kind byte (Pass1's `kind`).
+    ///
+    /// Carried so a server can rebuild a query session straight from the disk
+    /// cache — `OqlCacheHandover` needs it, and it is otherwise only available
+    /// from the in-memory `Pass1` that the analysis pipeline drops. Appended
+    /// last: bincode is not self-describing, so caches written before this
+    /// field existed fail to decode (and are treated as invalid, see
+    /// `analyze_with_cache`) rather than silently reading shifted bytes.
+    pub kind: Vec<u8>,
+    /// Per-object index into `class_addr_table` (Pass1's `class_ids`).
+    /// Same rationale as `kind`.
+    pub class_ids: Vec<u32>,
 }
 
 #[cfg(feature = "native")]
@@ -1294,6 +1306,8 @@ impl Pass1Snapshot {
             id_size: p.id_size,
             header_timestamp_ms: p.header_timestamp_ms,
             file_size: p.file_size,
+            kind: p.kind.clone(),
+            class_ids: p.class_ids.clone(),
         }
     }
 }
