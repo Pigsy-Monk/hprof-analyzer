@@ -1,0 +1,32 @@
+tests/mat_pipeline.rs
+  s_d88b882af55fa9::t_2d9eb2fb8785fb 189-196,200-201,203,205-206
+src/mat/serial.rs
+  s_d88b882af55fa9::t_96998dba11f454 894
+  s_d88b882af55fa9::t_473352f1fa1528 834-885,887-893,895-916
+  s_d88b882af55fa9::t_6b4c9cb413fd93 56,58
+  s_d88b882af55fa9::t_e1f828d2eacb78 886
+src/mat/mod.rs
+  s_d88b882af55fa9::t_e1f828d2eacb78 88-108,905-911,1070-1132,1225-1243
+src/main.rs
+  s_d88b882af55fa9::t_6b947dabd229f4 4483-4484,4489-4494
+  s_d88b882af55fa9::t_f25fd39de550d1 5671-5690,5692-5696,5699,5701-5703,5705-5708,5710
+  s_d88b882af55fa9::t_670c9f41021e2b 5732
+  s_d88b882af55fa9::t_93dee2c5caff98 4459-4462
+  s_d88b882af55fa9::t_2f630e321aa7c6 5731
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.45-trip",
+  "base_commit_sha": "a70954a1f8ef4506a50354218aea739ff59254f9",
+  "prompts": {},
+  "sessions": {
+    "s_d88b882af55fa9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "99417d7d-eefa-47ba-a772-d0c0f9c0d8ed",
+        "model": "deepseek-v4-1-flash-260910"
+      },
+      "human_author": "zwsong <zwsong@trip.com>"
+    }
+  }
+}
