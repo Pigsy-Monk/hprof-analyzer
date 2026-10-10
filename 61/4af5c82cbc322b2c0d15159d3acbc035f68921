@@ -1,0 +1,38 @@
+src/mat/mod.rs
+  s_693092c3ed91bb::t_f7d1c31acaac5f 647-661
+  s_693092c3ed91bb::t_c18f3cd7db8368 889-899,902-909,919-926,930-932
+  s_693092c3ed91bb::t_f985084587ad59 782-785,858-861
+  s_693092c3ed91bb::t_6ae10a166e5136 787,863
+  s_693092c3ed91bb::t_8049dfe9a05139 837-843,845
+  s_693092c3ed91bb::t_8acd7d1080385b 936-955
+scripts/mat_index_accept.sh
+  s_693092c3ed91bb::t_c2917d659e1a24 43,46,49-51,60-61
+  s_693092c3ed91bb::t_0946ca15d268b5 165-170,174,181-184
+  s_693092c3ed91bb::t_c10f4460c9d0c6 173,175-179
+  s_693092c3ed91bb::t_1e433cec831b8a 63-68
+  s_693092c3ed91bb::t_53c0b2d36265e5 14-17
+  s_693092c3ed91bb::t_00c3f65bbadbf5 32-35
+  s_693092c3ed91bb::t_6a42d2677b6c88 77-80
+  s_693092c3ed91bb::t_e0e24c7da85464 92-101
+  s_693092c3ed91bb::t_f8f89458b0e11a 1-13,18-31,36-42,44-45,47-48,52-59,62,69-73,75-76,81-91,102-123,125,129,131-164,171-172,180,185-188
+  s_693092c3ed91bb::t_1e018632e13d86 74
+  s_693092c3ed91bb::t_d7c193a00be9ca 124,126-128,130
+scripts/IndexProbe.java
+  s_693092c3ed91bb::t_aa45f58a63fd31 1-107
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.45-trip",
+  "base_commit_sha": "614af5c82cbc322b2c0d15159d3acbc035f68921",
+  "prompts": {},
+  "sessions": {
+    "s_693092c3ed91bb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8aedcf42-f422-450b-911c-f2b4c41e1747",
+        "model": "deepseek-v4-1-flash-260910"
+      },
+      "human_author": "zwsong <zwsong@trip.com>"
+    }
+  }
+}
