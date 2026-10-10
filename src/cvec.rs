@@ -591,6 +591,117 @@ mod tests {
         assert_eq!(b9.restore().unwrap(), raw, "Deflate9 bytes must round-trip");
     }
 
+    /// Diagnostic (ignored by default). Measures the real `addrs` carrier — the
+    /// `CompressedU64` built at the `CompressedU64::compress(&addrs, Deflate1)`
+    /// call site in `src/main.rs` — on a real dump, at both levels.
+    ///
+    /// `addrs` is `id_map.addr_at(i)` over every object, i.e. addresses in
+    /// address-sorted order, so it is monotonic; its shape therefore depends on
+    /// the dump's address spacing, which is why this uses a real dump rather
+    /// than synthetic data. The level-1/level-9 **size ratio** is what
+    /// extrapolates to the 44 GB dump (it is a ratio, so dump size cancels).
+    ///
+    /// Run: `cargo test --profile fast --bin hprof-analyzer -- --ignored --nocapture carrier_ratio_real`
+    #[test]
+    #[ignore = "diagnostic: real-dump level-1 vs level-9 carrier size ratio"]
+    fn carrier_ratio_real_dump() {
+        use std::time::Instant;
+        for dump in [
+            "tests/fixtures/dump_2_scala-doku.hprof",
+            "tests/fixtures/dump_7_gauss-mix.hprof",
+        ] {
+            if !std::path::Path::new(dump).exists() {
+                eprintln!("skip carrier_ratio_real_dump: {dump} absent");
+                continue;
+            }
+            let p = crate::pass1::Pass1::run(&crate::source::HprofSource::from(dump), false)
+                .expect("pass1");
+            let n = p.id_map.len();
+            // Exactly the call site's expression.
+            let addrs: Vec<u64> = (0..n).map(|i| p.id_map.addr_at(i)).collect();
+            drop(p);
+            let raw = addrs.len() as u64 * 8;
+
+            let mut blobs = Vec::new();
+            for (label, codec) in [("Deflate1", Codec::Deflate1), ("Deflate9", Codec::Deflate9)] {
+                let t = Instant::now();
+                let c = CompressedU64::compress(&addrs, codec).unwrap();
+                let secs = t.elapsed().as_secs_f64();
+                assert_eq!(c.restore().unwrap(), addrs, "{label} must round-trip");
+                println!(
+                    "[carrier-real] {dump} {label}: objects={n} raw={raw} B blob={} B ratio={:.4} time={:.2}s",
+                    c.held_bytes(),
+                    c.held_bytes() as f64 / raw as f64,
+                    secs
+                );
+                blobs.push(c.held_bytes() as f64);
+            }
+            let (l1, l9) = (blobs[0], blobs[1]);
+            // 44 GB dump: 606M objects -> 4.848 GB raw.
+            let big_raw = 606_000_000f64 * 8.0;
+            println!(
+                "[carrier-real] {dump}: level1/level9 = {:.4}x -> on 606M objects ({:.2} GB raw): \
+                 level9={:.2} GB, level1={:.2} GB, delta={:+.2} GB",
+                l1 / l9,
+                big_raw / 1e9,
+                l9 * (big_raw / raw as f64) / 1e9,
+                l1 * (big_raw / raw as f64) / 1e9,
+                (l1 - l9) * (big_raw / raw as f64) / 1e9,
+            );
+        }
+    }
+
+    /// Diagnostic (ignored by default). The two big MAT carriers — `addrs`
+    /// (`src/main.rs`, `id_map.addr_at(i)`, address-sorted so monotonic) and the
+    /// hprof-offset blob — are both monotonic `u64` arrays. Deflating them at
+    /// level 1 instead of level 9 trades CPU for carrier size, and the carrier
+    /// is live across a peak window, so the size delta *is* an RSS delta.
+    /// This quantifies that trade on shape-matched data.
+    ///
+    /// Run: `cargo test --profile fast --bin hprof-analyzer -- --ignored --nocapture carrier_level`
+    #[test]
+    #[ignore = "diagnostic: measures the level-1 vs level-9 carrier size/time trade"]
+    fn carrier_level1_vs_level9_shape_matched() {
+        use std::time::Instant;
+        // 400 MB of u64; the deflate ratio has converged well before this.
+        const N: usize = 50_000_000;
+        let mut state = 0x243F_6A88_85A3_08D3u64;
+        let mut a = 0u64;
+        let v: Vec<u64> = (0..N)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                // Mean gap ≈ 44.3e9 / 514e6 ≈ 86 bytes on the real dump.
+                a += 40 + (state % 92);
+                a
+            })
+            .collect();
+
+        let mut sizes = Vec::new();
+        for (label, codec) in [("Deflate1", Codec::Deflate1), ("Deflate9", Codec::Deflate9)] {
+            let t = Instant::now();
+            let c = CompressedU64::compress(&v, codec).unwrap();
+            let secs = t.elapsed().as_secs_f64();
+            assert_eq!(c.restore().unwrap(), v, "{label} must round-trip");
+            println!(
+                "[carrier] CompressedU64 {label}: raw={} B blob={} B ratio={:.4} time={:.2}s",
+                N * 8,
+                c.held_bytes(),
+                c.held_bytes() as f64 / (N * 8) as f64,
+                secs
+            );
+            sizes.push((label, c.held_bytes() as f64));
+        }
+        let (_, l1) = sizes[0];
+        let (_, l9) = sizes[1];
+        println!(
+            "[carrier] level1/level9 blob = {:.4}x  → on a 4.1 GB carrier that is {:+.2} GB",
+            l1 / l9,
+            (l1 - l9) * (4.1e9 / (N as f64 * 8.0)) / 1e9
+        );
+    }
+
     #[test]
     fn streaming_u32_compress_matches_oneshot() {
         // The chunked streaming compressor must produce a byte-identical blob to

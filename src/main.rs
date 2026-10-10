@@ -4933,12 +4933,65 @@ fn run(
             // Pre-allocate fwd_tgt and scatter-fill via HPROF rescan.
             let mut fwd_tgt: Vec<u32> = vec![0u32; total_edges];
             crate::trace::probe("main: before outbound rescan (fwd_off+fwd_tgt allocated)");
-            crate::pass2::rescan_outbound(
-                rescan_ctx,
-                &mut fwd_off,
-                &mut fwd_tgt,
-                mat_zero_ref.as_mut().expect("mat_zero_ref built with mat"),
-            )?;
+            let zero_ref = mat_zero_ref.as_mut().expect("mat_zero_ref built with mat");
+            // ── Fast path (opt-in): take the forward CSR from the on-disk cache
+            // instead of re-deriving it with a full HPROF rescan.
+            //
+            // `graph.bin` holds exactly pass2's `fwd_off`/`fwd_tgt`, and
+            // `rescan_outbound` exists only to *reconstruct* that same CSR (it
+            // was dropped to save RSS). When the cache is present and its offset
+            // table agrees with ours, the 44 GB re-read is pure duplicate work.
+            //
+            // `zero_ref` is NOT in the cache — it is a MAT-emission detail, not
+            // graph state — but it is exactly "class object whose HPROF record
+            // has super_id == 0 || loader_id == 0" (see `rescan_outbound`'s
+            // CLASS_DUMP arm), and `MatClassMeta::class_info` already carries
+            // both ids per class-object address.
+            //
+            // Default OFF: without `HPROF_MAT_FWD_FROM_CACHE` this is a single
+            // env lookup and the rescan path below runs byte-for-byte as before.
+            let cached_fwd = if std::env::var_os("HPROF_MAT_FWD_FROM_CACHE").is_some() {
+                match cache::CacheDir::for_dump(std::path::Path::new(input)) {
+                    Ok(c) if c.is_valid(cache::CacheMode::Graph) => {
+                        crate::trace::probe("main: fwd-from-cache: reading graph.bin");
+                        c.read_forward_edges().ok().flatten()
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let mut took_cache = false;
+            if let Some((c_off, c_tgt)) = cached_fwd {
+                // The offset table must be the same CSR we already hold, or the
+                // cache belongs to a different graph and must not be trusted.
+                if c_off == fwd_off && c_tgt.len() == total_edges {
+                    if let (Some(meta), Some((blob, len))) =
+                        (mat_class_meta.as_ref(), rescan_ctx.id_map_c.as_ref())
+                    {
+                        let id_map = crate::id_map::IdMap::from_compressed(
+                            blob,
+                            *len,
+                            rescan_ctx.id_map_codec,
+                        )?;
+                        for (&addr, &(super_id, loader_id, _)) in meta.class_info.iter() {
+                            if super_id == 0 || loader_id == 0 {
+                                if let Some(i) = id_map.index_of(addr) {
+                                    zero_ref.set(i);
+                                }
+                            }
+                        }
+                        fwd_tgt = c_tgt;
+                        took_cache = true;
+                        crate::trace::probe("main: fwd-from-cache: HIT (rescan skipped)");
+                    }
+                } else {
+                    crate::trace::probe("main: fwd-from-cache: offset table mismatch, rescanning");
+                }
+            }
+            if !took_cache {
+                crate::pass2::rescan_outbound(rescan_ctx, &mut fwd_off, &mut fwd_tgt, zero_ref)?;
+            }
             crate::trace::probe("main: after outbound rescan");
             // id_map was live during rescan (2 GB) and is now freed; trim to return
             // freed pages before restoring class_obj_ids, saving ~2 GB from emit peak.
