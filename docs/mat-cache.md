@@ -1,14 +1,28 @@
 # Speeding up Eclipse MAT with hprof-analyzer
 
-Eclipse MAT parses a 34 GB heap dump in ~4 seconds and writes 12 cache files
+Eclipse MAT parses a **34 GB** heap dump in ~4 seconds and writes 12 cache files
 alongside the `.hprof`. On the next open it reads from cache and loads in ~0.9 s.
 The catch: MAT's own parser peaks at **~55 GB RSS** while writing those caches
-on the same 34 GB dump.
+on the same **34 GB** dump.
 
-hprof-analyzer generates the same 12 cache files in a single pipeline pass,
-peaking at **~19 GB RSS** — less than half of MAT's peak. Once the cache files
-are present, MAT opens instantly at the same low memory cost regardless of who
-generated them.
+hprof-analyzer generates the same cache files in a single pipeline pass,
+peaking at **~19 GB RSS** on that **34 GB** dump — less than half of MAT's peak.
+Once the cache files are present, MAT opens instantly at the same low memory
+cost regardless of who generated them.
+
+The two measurements below are on **different dumps**, so the numbers are not
+directly comparable row-to-row; each row names its dump.
+
+| | 34 GB dump | 44.3 GB dump |
+|---|---|---|
+| `mat caches` wall time | — | **2 h 06 m 35 s** |
+| cache files written | 12 | **11 files, 45.9 GB** |
+| hprof-analyzer peak RSS | **19.2 GB** | **22.9 GiB** |
+| MAT's own parse peak RSS | **~55 GB** | not measured |
+
+The 44.3 GB run writes 11 files rather than 12 because `i2sv2` is no longer
+emitted (see [Known differences](#known-differences-from-mats-own-output));
+MAT rebuilds that cache itself on first use.
 
 ## Workflow
 
@@ -47,9 +61,13 @@ hprof parses vs one).
 | `<dump>.outbound.index` | IntArray1N sorted | Per-object outbound reference list |
 | `<dump>.inbound.index` | IntArray1N sorted | Per-object inbound reference list |
 | `<dump>.domOut.index` | IntArray1N unsorted | Per-object dominator-tree children |
-| `<dump>.i2sv2.index` | Raw int+long pairs | Per-class retained size |
 | `<dump>.threads` | Text | Thread stacks and local variables |
 | `<dump>.index` | Java serialization | Master snapshot metadata (class cache, GC roots, loader labels) |
+
+`<dump>.i2sv2.index` (MAT's per-class retained-size cache) is deliberately
+**not** written: MAT's Class Histogram reads the cached value whenever the
+entry is present, and ours disagreed with MAT's, so MAT now recomputes it
+itself. That is why a run writes 11 files, not 12.
 
 MAT expects files named `<hprof-basename>.<suffix>` in the same directory as
 the `.hprof`. The optional `<dir>` argument to `mat caches` lets you write cache
@@ -60,11 +78,12 @@ files to a different location; if omitted, they are written alongside the `.hpro
 These are intentional divergences that MAT accepts at load time without error:
 
 - **`.index`**: The embedded hprof path string differs (our absolute path vs MAT's path). MAT re-resolves the path at open time; harmless.
-- **`outbound.index` / `inbound.index`**: Our synthetic GC-root model differs slightly — the virtual superroot edges are arranged differently. Some root-path queries may return slightly different paths.
+- **`outbound.index`**: Our synthetic GC-root model differs slightly — the virtual superroot edges are arranged differently. Some root-path queries may return slightly different paths.
 - **`a2s.index` / `o2ret.index`**: MAT adds a synthetic shallow size for GC-root stubs; we do not. Affects a handful of objects.
-- **`i2sv2.index` / `threads`**: Content-equivalent but not byte-identical (different serialization ordering).
+- **`i2sv2.index`**: no longer written (see above) — MAT recomputes the per-class retained-size cache itself.
+- **`threads`**: Content-equivalent but not byte-identical (different serialization ordering).
 
-`idx`, `o2c`, `domIn`, `o2hprof`: byte-identical to MAT's output.
+`idx`, `o2c`, `domIn`, `o2hprof`, `inbound`, `domOut`: byte-identical to MAT's output.
 
 ## CLI reference
 
@@ -104,7 +123,8 @@ once inside the JVM. hprof-analyzer instead:
   - **`malloc_trim`** after scatter to return freed id_map pages to the OS before
     restoring `class_obj_ids`
 
-The measured peak on a 34 GB production dump is **19.2 GB** vs MAT's ~55 GB.
+The measured peak on the **34 GB** production dump is **19.2 GB** vs MAT's
+~55 GB; the same pipeline peaks at **22.9 GiB** on the **44.3 GB** dump.
 
 ## `o2hprof` implementation detail
 
