@@ -134,4 +134,20 @@ impl ChunkU32 {
             None
         }
     }
+
+    /// Iterate the live chunks in index order, yielding each as a slice.
+    ///
+    /// Lets a consumer stream the whole array (e.g. into a compressor) without
+    /// flattening it into one `Vec<u32>` first — the flatten is what made
+    /// `heap load --with-graph` peak at ~50 GiB on a 44 GB dump. Already-freed
+    /// chunks (see `free_below`) are skipped, so a partially-consumed array
+    /// yields only what is still resident; callers that need a fixed count
+    /// should `.take(n)` with `n` known independently (e.g. the CSR's
+    /// `fwd_offsets.last()`).
+    // Only the lib's `cache` module streams through this; the binary declares
+    // its own copy of this module tree, where it is unused.
+    #[allow(dead_code)]
+    pub fn iter_live_chunks(&self) -> impl Iterator<Item = &[u32]> {
+        self.chunks.iter().filter(|c| !c.is_empty()).map(|c| &c[..])
+    }
 }

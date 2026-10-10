@@ -26,7 +26,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{pass1::Pass1Snapshot, report::Report};
+use crate::{chunkvec::ChunkU32, pass1::Pass1Snapshot, report::Report};
 
 // ── File format constants ─────────────────────────────────────────────────────
 
@@ -61,7 +61,12 @@ pub struct ArraysForCache<'a> {
 /// Graph-mode extras (opt-in with --with-graph).
 pub struct GraphForCache<'a> {
     pub fwd_off: &'a [u32],
-    pub fwd_tgt: &'a [u32],
+    /// Forward edge targets. Held as the chunked store rather than a flat
+    /// `Vec<u32>`: on the 44 GB dump this array has 2.3 billion entries, so
+    /// flattening it costs ~9.3 GB — and flattening it here (while the chunked
+    /// original is still live) was the bulk of the ~50 GiB `--with-graph` peak.
+    /// The writer streams it straight into the compressor instead.
+    pub fwd_tgt: &'a ChunkU32,
     pub inb_off: &'a [u32],
     pub inb_tgt: &'a [u32],
     /// Only when --ref-paths was used.
@@ -200,18 +205,25 @@ impl CacheDir {
     // ── Graph layer ───────────────────────────────────────────────────────────
 
     pub fn write_graph(&self, g: &GraphForCache) -> io::Result<()> {
-        let mut names: Vec<&str> = vec!["fwd_off", "fwd_tgt", "inb_off", "inb_tgt"];
-        let mut frames: Vec<Vec<u8>> = vec![
-            zstd_compress_u32(g.fwd_off)?,
-            zstd_compress_delta_u32(g.fwd_tgt)?,
-            zstd_compress_u32(g.inb_off)?,
-            zstd_compress_delta_u32(g.inb_tgt)?,
-        ];
+        let n_arrays = if g.fwd_field_idx.is_some() { 5 } else { 4 };
+        let mut w = IndexedWriter::create(&self.path.join("graph.bin"), n_arrays)?;
+        w.add_u32("fwd_off", g.fwd_off.iter().copied())?;
+        // `fwd_off` is the CSR offset table, so its last entry is the edge count.
+        let total_edges = g.fwd_off.last().copied().unwrap_or(0) as usize;
+        w.add_delta_u32(
+            "fwd_tgt",
+            g.fwd_tgt
+                .iter_live_chunks()
+                .flatten()
+                .copied()
+                .take(total_edges),
+        )?;
+        w.add_u32("inb_off", g.inb_off.iter().copied())?;
+        w.add_delta_u32("inb_tgt", g.inb_tgt.iter().copied())?;
         if let Some(fi) = g.fwd_field_idx {
-            names.push("fwd_field_idx");
-            frames.push(zstd_compress_delta_u16(fi)?);
+            w.add_delta_u16("fwd_field_idx", fi.iter().copied())?;
         }
-        write_indexed_file(&self.path.join("graph.bin"), &names, &frames)
+        w.finish()
     }
 
     // ── Seek-based reads ──────────────────────────────────────────────────────
@@ -311,6 +323,177 @@ fn write_indexed_file(path: &Path, names: &[&str], frames: &[Vec<u8>]) -> io::Re
         f.write_all(frame)?;
     }
     f.flush()
+}
+
+// ── Streaming indexed writer ─────────────────────────────────────────────────
+
+/// Staging buffer for the streaming writers: bytes are handed to zstd in 64 KiB
+/// blocks, so neither the uncompressed array nor the compressed frame is ever
+/// fully resident.
+const STAGE_BYTES: usize = 1 << 16;
+
+/// Write an HPCA indexed file without materialising whole arrays.
+///
+/// `write_indexed_file` needs every compressed frame in memory up front, which
+/// forces each array through a full-size temporary — and delta-encoding one
+/// naively adds two more (the `Vec<i32>` deltas, then their LE bytes). For the
+/// 44 GB dump's forward targets (2.3 billion edges) that is ~28 GB of
+/// transients for one array, which is what pushed `heap load --with-graph` to
+/// ~50 GiB.
+///
+/// This writer compresses each array straight into the file through a single
+/// 64 KiB staging buffer and patches the index at `finish()`, so the resident
+/// cost is constant regardless of array length. It also lets the caller add
+/// arrays at different points in the pipeline — needed because the forward CSR
+/// must be written before `build_from_fwd` consumes it, while the inbound CSR
+/// only exists afterwards.
+///
+/// The file is assembled under `<path>.tmp` and renamed on `finish()`, so a run
+/// that dies mid-write cannot leave a truncated file that `check_magic` would
+/// accept as a valid cache.
+pub struct IndexedWriter {
+    tmp: PathBuf,
+    final_path: PathBuf,
+    f: File,
+    entries: Vec<([u8; 16], u64, u64)>,
+    n_arrays: usize,
+    offset: u64,
+}
+
+impl IndexedWriter {
+    /// Start a file that will hold exactly `n_arrays` arrays. The count is
+    /// needed up front because the index sits ahead of the data.
+    pub fn create(path: &Path, n_arrays: usize) -> io::Result<Self> {
+        let mut tmp_os = path.as_os_str().to_owned();
+        tmp_os.push(".tmp");
+        let tmp = PathBuf::from(tmp_os);
+        let mut f = File::create(&tmp)?;
+        f.write_all(MAGIC)?;
+        f.write_all(&VERSION.to_le_bytes())?;
+        f.write_all(&[n_arrays as u8])?;
+        // Placeholder index, patched by `finish`.
+        f.write_all(&vec![0u8; n_arrays * ENTRY_SIZE])?;
+        Ok(Self {
+            tmp,
+            final_path: path.to_path_buf(),
+            f,
+            entries: Vec::with_capacity(n_arrays),
+            n_arrays,
+            offset: (4 + 2 + 1 + n_arrays * ENTRY_SIZE) as u64,
+        })
+    }
+
+    /// Compress whatever `emit` writes, straight into the file.
+    fn add_frame(
+        &mut self,
+        name: &str,
+        emit: impl FnOnce(&mut zstd::stream::write::Encoder<'_, &mut File>) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let start = self.offset;
+        let mut enc = zstd::stream::write::Encoder::new(&mut self.f, 3)?;
+        emit(&mut enc)?;
+        let _ = enc.finish()?;
+        let end = self.f.stream_position()?;
+        let mut name_bytes = [0u8; 16];
+        let nb = name.as_bytes();
+        let take = nb.len().min(16);
+        name_bytes[..take].copy_from_slice(&nb[..take]);
+        self.entries.push((name_bytes, start, end - start));
+        self.offset = end;
+        Ok(())
+    }
+
+    /// Little-endian u32s, no delta.
+    pub fn add_u32<I: IntoIterator<Item = u32>>(&mut self, name: &str, it: I) -> io::Result<()> {
+        self.add_frame(name, |enc| {
+            let mut buf: Vec<u8> = Vec::with_capacity(STAGE_BYTES);
+            for v in it {
+                buf.extend_from_slice(&v.to_le_bytes());
+                if buf.len() >= STAGE_BYTES {
+                    enc.write_all(&buf)?;
+                    buf.clear();
+                }
+            }
+            if !buf.is_empty() {
+                enc.write_all(&buf)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Deltas of the u32 stream, written as `(v - prev) as i32` little-endian.
+    /// `read_delta_u32_array` accumulates them the same way, so this is the
+    /// format the old whole-array delta compressor produced.
+    pub fn add_delta_u32<I: IntoIterator<Item = u32>>(
+        &mut self,
+        name: &str,
+        it: I,
+    ) -> io::Result<()> {
+        self.add_frame(name, |enc| {
+            let mut buf: Vec<u8> = Vec::with_capacity(STAGE_BYTES);
+            let mut prev = 0i64;
+            for v in it {
+                let d = (v as i64 - prev) as i32;
+                prev = v as i64;
+                buf.extend_from_slice(&d.to_le_bytes());
+                if buf.len() >= STAGE_BYTES {
+                    enc.write_all(&buf)?;
+                    buf.clear();
+                }
+            }
+            if !buf.is_empty() {
+                enc.write_all(&buf)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// i16 deltas of u16s, little-endian.
+    pub fn add_delta_u16<I: IntoIterator<Item = u16>>(
+        &mut self,
+        name: &str,
+        it: I,
+    ) -> io::Result<()> {
+        self.add_frame(name, |enc| {
+            let mut buf: Vec<u8> = Vec::with_capacity(STAGE_BYTES);
+            let mut prev = 0i32;
+            for v in it {
+                let d = (v as i32 - prev) as i16;
+                prev = v as i32;
+                buf.extend_from_slice(&d.to_le_bytes());
+                if buf.len() >= STAGE_BYTES {
+                    enc.write_all(&buf)?;
+                    buf.clear();
+                }
+            }
+            if !buf.is_empty() {
+                enc.write_all(&buf)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Patch the index and move the finished file into place.
+    pub fn finish(mut self) -> io::Result<()> {
+        if self.entries.len() != self.n_arrays {
+            return Err(io::Error::other(format!(
+                "indexed writer: expected {} arrays, got {}",
+                self.n_arrays,
+                self.entries.len()
+            )));
+        }
+        self.f.seek(SeekFrom::Start(7))?;
+        for (name, off, len) in &self.entries {
+            self.f.write_all(name)?;
+            self.f.write_all(&off.to_le_bytes())?;
+            self.f.write_all(&len.to_le_bytes())?;
+        }
+        self.f.flush()?;
+        let tmp = std::mem::take(&mut self.tmp);
+        let dest = std::mem::take(&mut self.final_path);
+        drop(self.f);
+        fs::rename(tmp, dest)
+    }
 }
 
 /// Check that a file starts with the HPCA magic bytes.
@@ -424,33 +607,6 @@ fn zstd_compress_u64(data: &[u64]) -> io::Result<Vec<u8>> {
     zstd::encode_all(raw.as_slice(), 3)
 }
 
-/// Delta-encode a u32 array (zigzag i32 deltas), then zstd-3.
-/// Nearly-sorted arrays (like edge targets after dominator ordering) compress 20–50×.
-fn zstd_compress_delta_u32(data: &[u32]) -> io::Result<Vec<u8>> {
-    let mut deltas: Vec<i32> = Vec::with_capacity(data.len());
-    let mut prev = 0i64;
-    for &v in data {
-        let delta = v as i64 - prev;
-        deltas.push(delta as i32);
-        prev = v as i64;
-    }
-    let raw = i32_to_le_bytes(&deltas);
-    zstd::encode_all(raw.as_slice(), 3)
-}
-
-/// Delta-encode a u16 array, then zstd-3.
-fn zstd_compress_delta_u16(data: &[u16]) -> io::Result<Vec<u8>> {
-    let mut deltas: Vec<i16> = Vec::with_capacity(data.len());
-    let mut prev = 0i32;
-    for &v in data {
-        let delta = v as i32 - prev;
-        deltas.push(delta as i16);
-        prev = v as i32;
-    }
-    let raw = i16_to_le_bytes(&deltas);
-    zstd::encode_all(raw.as_slice(), 3)
-}
-
 fn undelta_zigzag_i32(deltas: &[i32]) -> Vec<u32> {
     let mut out = Vec::with_capacity(deltas.len());
     let mut acc = 0i64;
@@ -479,22 +635,6 @@ fn u32_to_le_bytes(data: &[u32]) -> Vec<u8> {
 
 fn u64_to_le_bytes(data: &[u64]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() * 8);
-    for &v in data {
-        out.extend_from_slice(&v.to_le_bytes());
-    }
-    out
-}
-
-fn i32_to_le_bytes(data: &[i32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len() * 4);
-    for &v in data {
-        out.extend_from_slice(&v.to_le_bytes());
-    }
-    out
-}
-
-fn i16_to_le_bytes(data: &[i16]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len() * 2);
     for &v in data {
         out.extend_from_slice(&v.to_le_bytes());
     }

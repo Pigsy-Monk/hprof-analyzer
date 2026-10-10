@@ -790,15 +790,25 @@ fn analyze_to_report_inner_with_cache(
         None
     };
 
-    // Save fwd CSR for graph cache before inbound consumes it.
-    let fwd_for_cache: Option<(Vec<u32>, Vec<u32>)> = if mode == cache::CacheMode::Graph {
-        let total_edges = g.fwd_offsets.last().copied().unwrap_or(0) as usize;
-        let fwd_off = g.fwd_offsets.clone();
-        let fwd_tgt: Vec<u32> = (0..total_edges).map(|i| g.fwd_targets.get(i)).collect();
-        Some((fwd_off, fwd_tgt))
-    } else {
-        None
-    };
+    // Write the forward half of the graph cache *before* inbound consumes the
+    // CSR. Streaming straight out of the chunked store is the whole point: the
+    // previous version flattened 2.3 billion edges into a `Vec<u32>` and then
+    // delta-encoded that into two more full-size temporaries (`Vec<i32>` deltas,
+    // then their LE bytes) — ~28 GB of transients for one array, which is what
+    // put `heap load --with-graph` at ~50 GiB on the 44 GB dump while a plain
+    // `heap load` sits near 20 GiB.
+    if mode == cache::CacheMode::Graph {
+        let graph = GraphForCache {
+            fwd_off: &g.fwd_offsets,
+            fwd_tgt: &g.fwd_targets,
+            inb_off: &[],
+            inb_tgt: &[],
+            fwd_field_idx: g.fwd_field_name_idx.as_deref(),
+        };
+        if let Err(e) = cache.write_graph(&graph) {
+            eprintln!("hprof-cache: failed to write graph.bin: {e}");
+        }
+    }
     let field_stats_fwd: Option<(Vec<u32>, crate::chunkvec::ChunkU32)> = if opts.field_stats {
         let total_edges = g.fwd_offsets.last().copied().unwrap_or(0) as usize;
         let fwd_off_copy = g.fwd_offsets.clone();
@@ -869,21 +879,7 @@ fn analyze_to_report_inner_with_cache(
         eprintln!("hprof-cache: failed to write arrays.bin: {e}");
     }
 
-    // Write graph cache (forward edges; inbound CSR omitted for now).
-    if mode == cache::CacheMode::Graph {
-        if let Some((fwd_off, fwd_tgt)) = fwd_for_cache {
-            let graph = GraphForCache {
-                fwd_off: &fwd_off,
-                fwd_tgt: &fwd_tgt,
-                inb_off: &[],
-                inb_tgt: &[],
-                fwd_field_idx: g.fwd_field_name_idx.as_deref(),
-            };
-            if let Err(e) = cache.write_graph(&graph) {
-                eprintln!("hprof-cache: failed to write graph.bin: {e}");
-            }
-        }
-    }
+    // (graph.bin was written above, before inbound consumed the forward CSR.)
 
     let precomputed_field_stats: Option<crate::report::FieldStats> =
         if let Some((fwd_off, fwd_tgt)) = field_stats_fwd {
