@@ -644,7 +644,21 @@ impl MatEmitter {
         ];
         // SnapshotInfo field values (superclass first, i.e. SnapshotInfo layer written second):
         // primitives in alpha order (none here), then object fields in alpha order: creationDate, properties.
-        let hprof_version = meta.format.clone();
+        // MAT's `hprof.version` property holds the *name* of its
+        // `org.eclipse.mat.hprof.describer.Version` enum, not the dump's header
+        // string: on reopen it does `Version.valueOf(prop)`, so the raw header
+        // ("JAVA PROFILE 1.0.1") throws
+        //   IllegalArgumentException: No enum constant
+        //   org.eclipse.mat.hprof.describer.Version.JAVA PROFILE 1.0.1
+        // The enum's labels are exactly the header strings (JDK12BETA3 =
+        // "JAVA PROFILE 1.0", JDK12BETA4 = "JAVA PROFILE 1.0.1", JDK6 =
+        // "JAVA PROFILE 1.0.2"), which is what MAT's own index stores.
+        let hprof_version = match meta.format.as_str() {
+            "JAVA PROFILE 1.0" => "JDK12BETA3",
+            "JAVA PROFILE 1.0.1" => "JDK12BETA4",
+            _ => "JDK6",
+        }
+        .to_string();
         let file_size = meta.file_size;
         let ts_ms = meta.timestamp_ms as i64;
         let snapshot_layers = vec![
@@ -765,9 +779,12 @@ impl MatEmitter {
                     f_long("totalSize"),
                     f_int("usedHeapSize"),
                     f_obj("cacheEntry", "Ljava/lang/Object;"),
-                    f_arr("fields", "[Lorg.eclipse.mat.snapshot.model.IClass;"),
+                    f_arr(
+                        "fields",
+                        "[Lorg.eclipse.mat.snapshot.model.FieldDescriptor;",
+                    ),
                     f_obj("name", "Ljava/lang/String;"),
-                    f_arr("staticFields", "[Lorg.eclipse.mat.snapshot.model.IClass;"),
+                    f_arr("staticFields", "[Lorg.eclipse.mat.snapshot.model.Field;"),
                     f_arr("subClasses", "Ljava/util/List;"),
                 ],
             },
@@ -817,29 +834,15 @@ impl MatEmitter {
                 let name_clone = name.clone();
                 s.write_object_keyed(
                     &class_impl_chain,
+                    // `layers` must be ordered subclass-first, parallel to `chain`:
+                    // `write_object_keyed` reverses it so the values land superclass-first
+                    // on the wire, which is the order the JVM (and therefore MAT) reads.
+                    // Passing the superclass layer first — as this used to — made every
+                    // ClassImpl value stream subclass-first, so MAT's reader consumed the
+                    // first ClassImpl primitive as AbstractObjectImpl.address and then hit
+                    // a non-type-code byte: "invalid type code: 00".
                     vec![
-                        // AbstractObjectImpl layer (superclass, written first in stream)
-                        LayerData {
-                            fields: vec![
-                                f_long("address"),
-                                f_int("objectId"),
-                                f_obj("classInstance", "Lorg.eclipse.mat.parser.model.ClassImpl;"),
-                            ],
-                            values: vec![
-                                ("address".into(), FieldVal::Long(addr as i64)),
-                                ("objectId".into(), FieldVal::Int(mat_id)),
-                                (
-                                    "classInstance".into(),
-                                    FieldVal::ObjRef({
-                                        let k = key_str.clone();
-                                        Box::new(move |s: &mut Ser| {
-                                            s.ref_object(&k);
-                                        })
-                                    }),
-                                ),
-                            ],
-                        },
-                        // ClassImpl layer (subclass, written second in stream)
+                        // ClassImpl layer (subclass)
                         LayerData {
                             fields: vec![
                                 f_long("classLoaderAddress"),
@@ -852,9 +855,12 @@ impl MatEmitter {
                                 f_long("totalSize"),
                                 f_int("usedHeapSize"),
                                 f_obj("cacheEntry", "Ljava/lang/Object;"),
-                                f_arr("fields", "[Lorg.eclipse.mat.snapshot.model.IClass;"),
+                                f_arr(
+                                    "fields",
+                                    "[Lorg.eclipse.mat.snapshot.model.FieldDescriptor;",
+                                ),
                                 f_obj("name", "Ljava/lang/String;"),
-                                f_arr("staticFields", "[Lorg.eclipse.mat.snapshot.model.IClass;"),
+                                f_arr("staticFields", "[Lorg.eclipse.mat.snapshot.model.Field;"),
                                 f_arr("subClasses", "Ljava/util/List;"),
                             ],
                             values: vec![
@@ -880,9 +886,27 @@ impl MatEmitter {
                                     "cacheEntry".into(),
                                     FieldVal::ObjRef(Box::new(|s: &mut Ser| s.null())),
                                 ),
+                                // `fields` / `staticFields` / `subClasses` must be
+                                // non-null even though we do not carry the data:
+                                // MAT's `ClassImpl.setSnapshot()` walks
+                                // `staticFields` while restoring the snapshot and
+                                // throws "NullPointerException: Cannot read the
+                                // array length because \"this.staticFields\" is
+                                // null", and the field / subclass views dereference
+                                // the other two. Empty means "no declared fields /
+                                // no static fields / no known subclasses".
+                                // (Carrying the real `FieldDescriptor`s is a
+                                // separate fidelity gap — see the report.)
                                 (
                                     "fields".into(),
-                                    FieldVal::ObjRef(Box::new(|s: &mut Ser| s.null())),
+                                    FieldVal::ObjRef(Box::new(|s: &mut Ser| {
+                                        s.write_object_array(
+                                            "[Lorg.eclipse.mat.snapshot.model.FieldDescriptor;",
+                                            uid::FIELD_DESCRIPTOR_ARRAY,
+                                            0,
+                                            |_| {},
+                                        );
+                                    })),
                                 ),
                                 (
                                     "name".into(),
@@ -892,11 +916,43 @@ impl MatEmitter {
                                 ),
                                 (
                                     "staticFields".into(),
-                                    FieldVal::ObjRef(Box::new(|s: &mut Ser| s.null())),
+                                    FieldVal::ObjRef(Box::new(|s: &mut Ser| {
+                                        s.write_object_array(
+                                            "[Lorg.eclipse.mat.snapshot.model.Field;",
+                                            uid::FIELD_ARRAY,
+                                            0,
+                                            |_| {},
+                                        );
+                                    })),
                                 ),
                                 (
                                     "subClasses".into(),
-                                    FieldVal::ObjRef(Box::new(|s: &mut Ser| s.null())),
+                                    FieldVal::ObjRef(Box::new(|s: &mut Ser| {
+                                        s.write_array_list(0, vec![]);
+                                    })),
+                                ),
+                            ],
+                        },
+                        // AbstractObjectImpl layer (superclass). Its values are emitted
+                        // before ClassImpl's on the wire because `write_object_keyed`
+                        // reverses the layer order.
+                        LayerData {
+                            fields: vec![
+                                f_long("address"),
+                                f_int("objectId"),
+                                f_obj("classInstance", "Lorg.eclipse.mat.parser.model.ClassImpl;"),
+                            ],
+                            values: vec![
+                                ("address".into(), FieldVal::Long(addr as i64)),
+                                ("objectId".into(), FieldVal::Int(mat_id)),
+                                (
+                                    "classInstance".into(),
+                                    FieldVal::ObjRef({
+                                        let k = key_str.clone();
+                                        Box::new(move |s: &mut Ser| {
+                                            s.ref_object(&k);
+                                        })
+                                    }),
                                 ),
                             ],
                         },
