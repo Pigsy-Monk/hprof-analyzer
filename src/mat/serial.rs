@@ -58,6 +58,17 @@ pub mod uid {
     pub const BOOLEAN: i64 = -3665804199014368530;
     pub const LONG: i64 = 4290774380558885855;
     pub const NUMBER: i64 = -8742448824652078965;
+    pub const INTEGER: i64 = 1360826667806852920;
+    pub const CHARACTER: i64 = 3786198910865385080;
+    pub const FLOAT: i64 = -2671257302660747028;
+    pub const DOUBLE: i64 = -9172774392245257468;
+    pub const BYTE: i64 = -7183698231559129828;
+    pub const SHORT: i64 = 7515723908773894738;
+    /// "[Lorg.eclipse.mat.parser.model.XGCRootInfo;"
+    pub const X_GC_ROOT_INFO_ARRAY: i64 = -7438224439945897845;
+    pub const OBJECT_REFERENCE: i64 = 1;
+    pub const FIELD: i64 = 2;
+    pub const FIELD_DESCRIPTOR: i64 = 2;
 }
 
 /// Java field type tags (single-char typecode as first byte of a field descriptor).
@@ -67,6 +78,10 @@ pub enum FieldType {
     Long,
     Float,
     Boolean,
+    Char,
+    Double,
+    Byte,
+    Short,
     /// Object field: typecode 'L' + a TC_STRING naming the JVM type signature, e.g. "Ljava/lang/String;"
     Object(String),
     /// Array field: typecode '[' + a TC_STRING naming the array signature, e.g. "[I"
@@ -80,6 +95,10 @@ impl FieldType {
             FieldType::Long => b'J',
             FieldType::Float => b'F',
             FieldType::Boolean => b'Z',
+            FieldType::Char => b'C',
+            FieldType::Double => b'D',
+            FieldType::Byte => b'B',
+            FieldType::Short => b'S',
             FieldType::Object(_) => b'L',
             FieldType::Array(_) => b'[',
         }
@@ -307,6 +326,11 @@ impl Ser {
         }
     }
 
+    /// Handle already assigned to `key`, if that object has been written.
+    pub fn object_handle(&self, key: &str) -> Option<u32> {
+        self.handles.get(key).copied()
+    }
+
     /// Emit a TC_REFERENCE to a previously-keyed object. Panics if the key is unknown.
     pub fn ref_object(&mut self, key: &str) {
         let h = *self
@@ -418,6 +442,50 @@ impl Ser {
         self.i32(m.step);
         // custom writeObject: for each used slot, writeInt(key) [own block] then writeObject(value)
         for (key, val_idx) in m.slots() {
+            self.block_data(&key.to_be_bytes());
+            write_value(self, val_idx);
+        }
+        self.u8(TC_ENDBLOCKDATA);
+    }
+
+    /// Like [`Self::write_hashmap_int_object`] but emits the entries in a
+    /// caller-chosen order instead of MAT's slot order.
+    ///
+    /// MAT's `HashMapIntObject.readObject` re-inserts every entry with
+    /// `putQuick(key, value)`, so the stream order does not determine the
+    /// resulting map — which lets the caller pick an order that keeps forward
+    /// references out of the stream (the class cache is written children-first
+    /// so each `ClassImpl.subClasses` entry is a plain back-reference).
+    pub fn write_hashmap_int_object_custom<F: FnMut(&mut Ser, usize)>(
+        &mut self,
+        map_class_name: &str,
+        m: &MatIntMap,
+        order: &[usize],
+        mut write_value: F,
+    ) {
+        self.u8(TC_OBJECT);
+        let cd = ClassDesc {
+            name: map_class_name.into(),
+            uid: uid::HASH_MAP_INT_OBJECT,
+            flags: SC_WRITE_METHOD | SC_SERIALIZABLE,
+            fields: vec![
+                f_int("capacity"),
+                f_int("limit"),
+                f_int("size"),
+                f_int("step"),
+            ],
+        };
+        self.write_class_desc_chain(&[cd]);
+        let _handle = self.assign_handle();
+        self.i32(m.capacity);
+        self.i32(m.limit);
+        self.i32(m.size);
+        self.i32(m.step);
+        let key_of: StdMap<usize, i32> = m.slots().into_iter().map(|(k, v)| (v, k)).collect();
+        for &val_idx in order {
+            let key = *key_of
+                .get(&val_idx)
+                .expect("ordered class entry must be present in the map");
             self.block_data(&key.to_be_bytes());
             write_value(self, val_idx);
         }
@@ -554,6 +622,188 @@ impl Ser {
         let _handle = self.assign_handle();
         // values superclass-first: Number has none, Long writes value:J
         self.i64(v);
+    }
+
+    /// Write a boxed value for an HPROF primitive static-field typecode.
+    ///
+    /// MAT stores static-field values as the boxed Java type for the field's
+    /// type (`AbstractParser.readValue`): `Integer` for INT, `Character` for
+    /// CHAR, … — object fields go through [`Self::write_object_reference`]
+    /// instead. `raw` is the field's value bits read big-endian from the dump
+    /// (zero-extended into a u64); the width is implied by `typecode`.
+    pub fn write_boxed_primitive(&mut self, typecode: u8, raw: u64) {
+        let (name, uid_v, field, sig): (&str, i64, &str, FieldType) = match typecode {
+            4 => (
+                "java.lang.Boolean",
+                uid::BOOLEAN,
+                "value",
+                FieldType::Boolean,
+            ),
+            5 => (
+                "java.lang.Character",
+                uid::CHARACTER,
+                "value",
+                FieldType::Char,
+            ),
+            6 => ("java.lang.Float", uid::FLOAT, "value", FieldType::Float),
+            7 => ("java.lang.Double", uid::DOUBLE, "value", FieldType::Double),
+            8 => ("java.lang.Byte", uid::BYTE, "value", FieldType::Byte),
+            9 => ("java.lang.Short", uid::SHORT, "value", FieldType::Short),
+            10 => ("java.lang.Integer", uid::INTEGER, "value", FieldType::Int),
+            11 => ("java.lang.Long", uid::LONG, "value", FieldType::Long),
+            _ => return,
+        };
+        let has_number_super = !matches!(typecode, 4 | 5);
+        self.u8(TC_OBJECT);
+        let mut chain = vec![ClassDesc {
+            name: name.into(),
+            uid: uid_v,
+            flags: SC_SERIALIZABLE,
+            fields: vec![FieldDesc {
+                name: field.into(),
+                ty: sig,
+            }],
+        }];
+        if has_number_super {
+            chain.push(ClassDesc {
+                name: "java.lang.Number".into(),
+                uid: uid::NUMBER,
+                flags: SC_SERIALIZABLE,
+                fields: vec![],
+            });
+        }
+        self.write_class_desc_chain(&chain);
+        let _handle = self.assign_handle();
+        match typecode {
+            4 => self.bool(raw != 0),
+            5 => self.u16(raw as u16),
+            6 => self.f32(f32::from_bits(raw as u32)),
+            7 => self.i64(raw as i64), // double bits pass through unchanged
+            8 => self.u8(raw as u8),
+            9 => self.u16(raw as u16),
+            10 => self.i32(raw as i32),
+            _ => self.i64(raw as i64),
+        }
+    }
+
+    /// Write a MAT `ObjectReference` (uid 1, single `long address` field).
+    pub fn write_object_reference(&mut self, address: u64) {
+        self.u8(TC_OBJECT);
+        let cd = ClassDesc {
+            name: "org.eclipse.mat.snapshot.model.ObjectReference".into(),
+            uid: uid::OBJECT_REFERENCE,
+            flags: SC_SERIALIZABLE,
+            fields: vec![f_long("address")],
+        };
+        self.write_class_desc_chain(&[cd]);
+        let _handle = self.assign_handle();
+        self.i64(address as i64);
+    }
+
+    /// Write one MAT `XGCRootInfo` (`GCRootInfo` subclass, uid 1 / uid 2).
+    ///
+    /// The wire layout mirrors what the JDK emits for MAT's classes: the
+    /// descriptor chain is `XGCRootInfo` (no fields) → `GCRootInfo`
+    /// (`objectId:int, objectAddress:long, contextId:int, contextAddress:long,
+    /// type:int`, written in the JDK's primitive-alphabetical order), and the
+    /// values follow superclass-first in that same order.
+    pub fn write_xgcroot_info(
+        &mut self,
+        object_id: i32,
+        object_address: u64,
+        context_id: i32,
+        context_address: u64,
+        ty: i32,
+    ) {
+        let gcr = || ClassDesc {
+            name: "org.eclipse.mat.snapshot.model.GCRootInfo".into(),
+            uid: uid::GC_ROOT_INFO,
+            flags: SC_SERIALIZABLE,
+            fields: vec![
+                f_long("contextAddress"),
+                f_int("contextId"),
+                f_long("objectAddress"),
+                f_int("objectId"),
+                f_int("type"),
+            ],
+        };
+        let chain = vec![
+            ClassDesc {
+                name: "org.eclipse.mat.parser.model.XGCRootInfo".into(),
+                uid: uid::X_GC_ROOT_INFO,
+                flags: SC_SERIALIZABLE,
+                fields: vec![],
+            },
+            gcr(),
+        ];
+        let layers = vec![
+            LayerData {
+                fields: vec![],
+                values: vec![],
+            },
+            LayerData {
+                fields: gcr().fields,
+                values: vec![
+                    (
+                        "contextAddress".into(),
+                        FieldVal::Long(context_address as i64),
+                    ),
+                    ("contextId".into(), FieldVal::Int(context_id)),
+                    (
+                        "objectAddress".into(),
+                        FieldVal::Long(object_address as i64),
+                    ),
+                    ("objectId".into(), FieldVal::Int(object_id)),
+                    ("type".into(), FieldVal::Int(ty)),
+                ],
+            },
+        ];
+        self.write_object(&chain, layers);
+    }
+
+    /// Write one MAT `Field` (a `FieldDescriptor` with an extra `Object value`).
+    /// `write_value` emits the value object (a boxed primitive, an
+    /// `ObjectReference`, or `TC_NULL`).
+    pub fn write_field<F>(&mut self, name: &str, ty: i32, write_value: F)
+    where
+        F: FnOnce(&mut Ser) + 'static,
+    {
+        let fd = || ClassDesc {
+            name: "org.eclipse.mat.snapshot.model.FieldDescriptor".into(),
+            uid: uid::FIELD_DESCRIPTOR,
+            flags: SC_SERIALIZABLE,
+            fields: vec![f_int("type"), f_obj("name", "Ljava/lang/String;")],
+        };
+        let chain = vec![
+            ClassDesc {
+                name: "org.eclipse.mat.snapshot.model.Field".into(),
+                uid: uid::FIELD,
+                flags: SC_SERIALIZABLE,
+                fields: vec![f_obj("value", "Ljava/lang/Object;")],
+            },
+            fd(),
+        ];
+        let n = name.to_string();
+        let layers = vec![
+            LayerData {
+                fields: vec![f_obj("value", "Ljava/lang/Object;")],
+                values: vec![(
+                    "value".into(),
+                    FieldVal::ObjRef(Box::new(write_value) as Box<dyn FnOnce(&mut Ser)>),
+                )],
+            },
+            LayerData {
+                fields: fd().fields,
+                values: vec![
+                    ("type".into(), FieldVal::Int(ty)),
+                    (
+                        "name".into(),
+                        FieldVal::ObjRef(Box::new(move |s: &mut Ser| s.string(&n))),
+                    ),
+                ],
+            },
+        ];
+        self.write_object(&chain, layers);
     }
 
     /// Write a java.util.ArrayList. Custom writeObject: defaultWriteObject writes `size:I`, then

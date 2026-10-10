@@ -4431,6 +4431,20 @@ fn run(
     // our dense-id space to MAT's (reachable-only, address-sorted, id-0=synthetic).
     // Restore mat_addrs_c here (just before use) so it's uncompressed for the
     // minimum possible window. Restore idom for MatIdMap::build, then drop it again.
+    //
+    // The master `.index` needs three more things that can only be computed while
+    // the dense address table is still resident (MAT ids are address-sorted, so
+    // every address→id lookup is a binary search over it): the GC-root maps, the
+    // class-loader labels, and MAT's recomputed per-instance heap size (whose
+    // alignment constant comes from the address spacing). All three are built
+    // here and handed to `emit_dot_index`.
+    let mut mat_roots: Option<mat::MatRoots> = None;
+    let mut mat_instance_sizes: Option<std::collections::HashMap<u64, i32>> = None;
+    let mut mat_root_instance_size: i32 = 0;
+    // row -> "the row's class is java.lang.ClassLoader or a subclass". Built
+    // while the address table is live; consumed later, where `class_idx` is
+    // live, to find every class-loader instance in the heap.
+    let mut mat_row_is_loader: Vec<bool> = Vec::new();
     let mat_map: Option<mat::MatIdMap> = if let Some(addrs_c) = mat_addrs_c {
         // Restore idom only for MatIdMap::build, then drop immediately after.
         if let Some(ref c) = mat_idom_c {
@@ -4472,6 +4486,151 @@ fn run(
                 }
             }
             crate::trace::probe("main: mat class/loader address maps built");
+
+            // ── GC roots / rootsPerThread / loaderLabels (MAT id space) ──────
+            // MAT's `HprofParserHandlerImpl.map2ids` drops every root whose
+            // address has no object in the heap, and routes a thread-local root
+            // (JAVA_FRAME / JNI_LOCAL / NATIVE_STACK / THREAD_BLOCK) into
+            // `rootsPerThread` when its thread serial was already known — which
+            // is why `numberOfGCRoots` can be smaller than the record count.
+            let sorted = mm.sorted();
+            let lookup = |a: u64| -> Option<i32> {
+                sorted
+                    .binary_search_by_key(&a, |&old| addrs[old as usize])
+                    .ok()
+                    .map(|i| (i + 1) as i32)
+            };
+            let mut root_map: std::collections::HashMap<i32, Vec<mat::RootRecord>> =
+                std::collections::HashMap::new();
+            for (i, &a) in meta.gc_root_addrs.iter().enumerate() {
+                let tag = meta.gc_root_types.get(i).copied().unwrap_or(0);
+                if let Some(mid) = lookup(a) {
+                    root_map.entry(mid).or_default().push(mat::RootRecord {
+                        object_id: mid,
+                        object_address: a,
+                        context_id: 0,
+                        context_address: 0,
+                        ty: mat::mat_root_type(tag),
+                    });
+                }
+            }
+            let mut per_thread: std::collections::HashMap<
+                i32,
+                std::collections::HashMap<i32, Vec<mat::RootRecord>>,
+            > = std::collections::HashMap::new();
+            for r in &meta.thread_local_roots {
+                let ty = mat::mat_root_type(r.tag);
+                if r.referrer_addr == 0 {
+                    // MAT: addGCRoot(id, 0, type) → the plain roots map.
+                    if let Some(mid) = lookup(r.local_addr) {
+                        root_map.entry(mid).or_default().push(mat::RootRecord {
+                            object_id: mid,
+                            object_address: r.local_addr,
+                            context_id: 0,
+                            context_address: 0,
+                            ty,
+                        });
+                    }
+                    continue;
+                }
+                if let (Some(tmid), Some(lmid)) = (lookup(r.referrer_addr), lookup(r.local_addr)) {
+                    per_thread
+                        .entry(tmid)
+                        .or_default()
+                        .entry(lmid)
+                        .or_default()
+                        .push(mat::RootRecord {
+                            object_id: lmid,
+                            object_address: r.local_addr,
+                            context_id: tmid,
+                            context_address: r.referrer_addr,
+                            ty,
+                        });
+                }
+            }
+            let mut roots_vec: Vec<(i32, Vec<mat::RootRecord>)> = root_map.into_iter().collect();
+            roots_vec.sort_by_key(|&(k, _)| k);
+            let mut per_thread_vec: Vec<(i32, Vec<mat::RootLocals>)> = per_thread
+                .into_iter()
+                .map(|(t, locals)| {
+                    let mut v: Vec<(i32, Vec<mat::RootRecord>)> = locals.into_iter().collect();
+                    v.sort_by_key(|&(k, _)| k);
+                    (t, v)
+                })
+                .collect();
+            per_thread_vec.sort_by_key(|&(k, _)| k);
+
+            // loaderLabels: MAT keys this by the class-loader id of every class
+            // *plus* the id of every instance of `java.lang.ClassLoader` and its
+            // subclasses (SnapshotImpl.calculateLoaderLabels), which is more
+            // class loaders than the distinct `class_loader_id` values: a loader
+            // that loads no class in this heap still counts. Label resolution
+            // needs the loaded class loader object, so the bootstrap loader is
+            // the only one MAT names ("<system class loader>"); the rest get the
+            // NO_LABEL placeholder when the class-specific-name resolver finds
+            // nothing.
+            let coc = mat_coc_snapshot.as_ref();
+            let mut loader_classes: std::collections::HashSet<u64> =
+                std::collections::HashSet::new();
+            let mut jlc_addr: Option<u64> = None;
+            let mut row_is_loader: Vec<bool> = vec![false; g.class_names.len()];
+            if let Some(coc) = coc {
+                // address → class name, for the ClassLoader hierarchy walk.
+                let mut name_by_addr: std::collections::HashMap<u64, &str> =
+                    std::collections::HashMap::new();
+                for (&cdense, &row) in coc.iter() {
+                    if let Some(n) = g.class_names.get(row as usize) {
+                        name_by_addr.insert(addrs[cdense as usize], n.as_str());
+                    }
+                }
+                jlc_addr = name_by_addr
+                    .iter()
+                    .find(|(_, n)| **n == "java.lang.ClassLoader" || **n == "java/lang/ClassLoader")
+                    .map(|(&a, _)| a);
+                if let Some(j) = jlc_addr {
+                    let mut children: std::collections::HashMap<u64, Vec<u64>> =
+                        std::collections::HashMap::new();
+                    for (&addr, &(sup, _, _)) in meta.class_info.iter() {
+                        children.entry(sup).or_default().push(addr);
+                    }
+                    let mut stack = vec![j];
+                    while let Some(a) = stack.pop() {
+                        if loader_classes.insert(a) {
+                            if let Some(cs) = children.get(&a) {
+                                stack.extend(cs.iter().copied());
+                            }
+                        }
+                    }
+                    for (&cdense, &row) in coc.iter() {
+                        if loader_classes.contains(&addrs[cdense as usize]) {
+                            if let Some(s) = row_is_loader.get_mut(row as usize) {
+                                *s = true;
+                            }
+                        }
+                    }
+                }
+            }
+            mat_row_is_loader = row_is_loader;
+
+            // MAT recomputes the per-instance heap size from the declared
+            // fields; the 8-byte object alignment it uses comes from the actual
+            // address spacing.
+            let object_align =
+                mat::compute_object_align(mm.sorted().iter().map(|&old| addrs[old as usize]));
+            let sizes = mat::compute_instance_sizes(meta, object_align);
+            // Object 0 (the synthetic system class loader) is an instance of
+            // java.lang.ClassLoader as far as MAT is concerned: `getHeapSize(0)`
+            // resolves through o2c[0] to that class's heapSizePerInstance, which
+            // is also its retained size (MAT's own o2ret[0]) and the 56-byte
+            // excess in `usedHeapSize` over the sum of the real objects.
+            mat_root_instance_size = jlc_addr.and_then(|a| sizes.get(&a).copied()).unwrap_or(0);
+            mat_instance_sizes = Some(sizes);
+            mat_roots = Some(mat::MatRoots {
+                roots: roots_vec,
+                per_thread: per_thread_vec,
+                loader_labels: Vec::new(), // filled in once `class_idx` is live
+            });
+            crate::trace::probe("main: mat roots/loaderLabels/instanceSizes built");
         }
         // emit idx: mat-id 0 = address 0x0 (synthetic root), then in mat-id order.
         // Stream addresses from addrs[sorted[i]] — no extra Vec<i64> needed.
@@ -5064,40 +5223,6 @@ fn run(
     // build_model to save ~1.7 GB in this window — but profiling showed the global
     // peak RSS is set much earlier (inbound CSR build), so this window is nowhere
     // near the peak; the compress cost ~208s for zero peak-RSS benefit. Removed.
-    // MAT: emit the `domOut` IntArray1N (unsorted) in MAT id order.
-    // Layout: entry[0] = vroot's dom-children (= MAT GC roots), entry[1] = dom-
-    // children of mat-id 0 (synthetic root, always empty), entries[2..mc+1] =
-    // dom-children of mat-ids 1..mc-1 (real objects). Streaming to avoid a
-    // large Vec<Vec<i32>> materialisation.
-    if let Some(ref m) = mat {
-        let mm = mat_map.as_ref().expect("mat_map built with mat");
-        let n = g.n;
-        // entry 0: vroot's dom-children
-        let lo0 = dc_off[n] as usize;
-        let hi0 = dc_off[n + 1] as usize;
-        let vroot_children: Vec<i32> = dc_tgt[lo0..hi0]
-            .iter()
-            .filter_map(|&v| {
-                let mid = mm.translate(v as i32);
-                if mid >= 0 { Some(mid) } else { None }
-            })
-            .collect();
-        let iter = std::iter::once(vroot_children)
-            .chain(std::iter::once(Vec::new())) // entry 1: mat-id 0 synthetic root
-            .chain(mm.sorted().iter().map(|&old_id| {
-                let lo = dc_off[old_id as usize] as usize;
-                let hi = dc_off[old_id as usize + 1] as usize;
-                dc_tgt[lo..hi]
-                    .iter()
-                    .filter_map(|&v| {
-                        let mid = mm.translate(v as i32);
-                        if mid >= 0 { Some(mid) } else { None }
-                    })
-                    .collect::<Vec<i32>>()
-            }));
-        m.emit_dom_out_iter(iter)?;
-        crate::trace::trim();
-    }
 
     // MAT: emit o2c (mat-id -> class-object mat-id) and a2s (mat-id -> shallow
     // size) in MAT id order. Restore the compressed blobs transiently for random
@@ -5125,17 +5250,66 @@ fn run(
             let class_obj_mat = mm.translate(class_obj_old);
             o2c_vals.push(if class_obj_mat >= 0 { class_obj_mat } else { 0 });
         }
-        drop(class_idx_vec);
         m.emit_int_index("o2c", &o2c_vals)?;
         drop(o2c_vals);
 
-        // a2s: mat-id 0 → size 0; others from shallow in old-id order
+        // a2s is MAT's `ArrayToSize` index: the shallow size of every ARRAY
+        // object and 0 for everything else (MAT's own index has a nonzero value
+        // for exactly the ids in the arrayObjects BitField). Non-arrays get
+        // their size from `o2c` + `ClassImpl.instanceSize`, so storing it here
+        // as well made MAT's "Heap Size" views read 24/40/… for plain objects.
+        // mat-id 0 is 0 too (it is not an array).
         let mut a2s_vals: Vec<i32> = Vec::with_capacity(mc);
         a2s_vals.push(0i32);
         for &old_id in mm.sorted() {
-            let sz = shallow_vec[old_id as usize] as i64;
-            a2s_vals.push(mat::size_compress(sz));
+            let row = class_idx_vec[old_id as usize] as usize;
+            let is_array = g.class_names.get(row).is_some_and(|n| n.starts_with('['));
+            let sz = if is_array {
+                mat::size_compress(shallow_vec[old_id as usize] as i64)
+            } else {
+                0
+            };
+            a2s_vals.push(sz);
         }
+        // ── loaderLabels ─────────────────────────────────────────────────
+        // MAT keys `loaderLabels` by the class-loader id of every class *plus*
+        // the id of every instance of `java.lang.ClassLoader` and its
+        // subclasses (SnapshotImpl.calculateLoaderLabels) — more class loaders
+        // than the distinct `class_loader_id` values, because a loader that
+        // loads no class in this heap still counts. The bootstrap loader is the
+        // only one MAT names ("<system class loader>"); the rest fall back to
+        // the NO_LABEL placeholder when the class-specific-name resolver finds
+        // nothing.
+        let mut loader_ids: std::collections::BTreeSet<i32> = std::collections::BTreeSet::new();
+        loader_ids.insert(0); // MAT's synthetic system class loader at 0x0
+        if mat_row_is_loader.len() == g.class_names.len() {
+            for i in 0..g.n {
+                let row = class_idx_vec[i] as usize;
+                if mat_row_is_loader.get(row).copied().unwrap_or(false) {
+                    let mid = mm.translate(i as i32);
+                    if mid > 0 {
+                        loader_ids.insert(mid);
+                    }
+                }
+            }
+        }
+        if let Some(r) = mat_roots.as_mut() {
+            r.loader_labels = loader_ids
+                .into_iter()
+                .map(|id| {
+                    (
+                        id,
+                        if id == 0 {
+                            "<system class loader>".to_string()
+                        } else {
+                            "__none__".to_string()
+                        },
+                    )
+                })
+                .collect();
+        }
+
+        drop(class_idx_vec);
         drop(shallow_vec);
         m.emit_int_index("a2s", &a2s_vals)?;
     }
@@ -5167,6 +5341,62 @@ fn run(
     g.has_same_class_ancestor = has_same;
     log(verbose, "retained", t.elapsed().as_secs_f64());
     t_dark!("compute_retained done");
+
+    // MAT: emit the `domOut` IntArray1N in MAT id order.
+    // Layout: entry[0] = superroot's dom-children, entry[1] = dom-children of
+    // mat-id 0 (the synthetic system class loader), entries[2..mc+1] =
+    // dom-children of mat-ids 1..mc-1 (real objects). Streaming to avoid a
+    // large Vec<Vec<i32>> materialisation.
+    //
+    // Two details MAT's own index depends on:
+    //   * object 0's dominator is the superroot (domIn[0] == 1), so 0 is one of
+    //     the superroot's children — without it MAT's dominator traversal never
+    //     reaches the synthetic root and Top Consumers collapses;
+    //   * the superroot's children are sorted by retained size DESCENDING
+    //     (`DominatorTree.sortByTotalSize`), because `TopConsumersQuery` walks
+    //     that list as a prefix and stops at the first entry under the
+    //     threshold. An id-ordered list makes it stop immediately and report
+    //     "no objects bigger than 1%".
+    // Emitted here, after `compute_retained`, because the sort needs the
+    // retained sizes.
+    if let Some(ref m) = mat {
+        let mm = mat_map.as_ref().expect("mat_map built with mat");
+        let n = g.n;
+        // entry 0: the superroot's dom-children, biggest retained first
+        let lo0 = dc_off[n] as usize;
+        let hi0 = dc_off[n + 1] as usize;
+        let mut vroot_children: Vec<(i32, u64)> = dc_tgt[lo0..hi0]
+            .iter()
+            .filter_map(|&v| {
+                let mid = mm.translate(v as i32);
+                if mid >= 0 {
+                    Some((mid, g.retained[v as usize]))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        vroot_children.sort_by_key(|b| std::cmp::Reverse(b.1));
+        let mut vroot_children: Vec<i32> = vroot_children.into_iter().map(|(mid, _)| mid).collect();
+        // The synthetic object 0 is dominated by the superroot too; its
+        // retained size is the smallest of the lot, so it sorts last.
+        vroot_children.push(0);
+        let iter = std::iter::once(vroot_children)
+            .chain(std::iter::once(Vec::new())) // entry 1: mat-id 0 synthetic root
+            .chain(mm.sorted().iter().map(|&old_id| {
+                let lo = dc_off[old_id as usize] as usize;
+                let hi = dc_off[old_id as usize + 1] as usize;
+                dc_tgt[lo..hi]
+                    .iter()
+                    .filter_map(|&v| {
+                        let mid = mm.translate(v as i32);
+                        if mid >= 0 { Some(mid) } else { None }
+                    })
+                    .collect::<Vec<i32>>()
+            }));
+        m.emit_dom_out_iter(iter)?;
+        crate::trace::trim();
+    }
 
     // Compute field_stats now (while the saved fwd clone is live and retained is populated),
     // then immediately free the clone to avoid carrying it through build_model's allocations.
@@ -5318,12 +5548,15 @@ fn run(
     }
 
     // MAT: emit the `o2ret` LongIndex in MAT id order.
-    // mat-id 0 (synthetic root) gets 0 retained size.
+    // mat-id 0 (the synthetic system class loader) is not a heap object, so
+    // MAT's retained-size calculation falls through to `SnapshotImpl
+    // .getHeapSize(0)`, which resolves through o2c[0] to java.lang.ClassLoader's
+    // heapSizePerInstance — i.e. exactly `mat_root_instance_size`.
     if let Some(ref m) = mat {
         let mm = mat_map.as_ref().expect("mat_map built with mat");
         let mc = mm.mat_count();
         let mut o2ret_vals: Vec<i64> = Vec::with_capacity(mc);
-        o2ret_vals.push(0i64); // synthetic root
+        o2ret_vals.push(mat_root_instance_size as i64); // synthetic root
         for &old_id in mm.sorted() {
             o2ret_vals.push(g.retained[old_id as usize] as i64);
         }
@@ -5367,6 +5600,8 @@ fn run(
 
         // .index: master Java serialization stream.
         if let Some(ref meta) = mat_class_meta {
+            let empty_roots = mat::MatRoots::default();
+            let empty_sizes = std::collections::HashMap::new();
             m.emit_dot_index(
                 meta,
                 &g.class_names,
@@ -5377,6 +5612,10 @@ fn run(
                 g.n,
                 &g.shallow,
                 &g.class_idx,
+                mat_roots.as_ref().unwrap_or(&empty_roots),
+                mat_instance_sizes.as_ref().unwrap_or(&empty_sizes),
+                mat_root_instance_size,
+                mat_classloader_mat.unwrap_or(0),
             )?;
         }
     }

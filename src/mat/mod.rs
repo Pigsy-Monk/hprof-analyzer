@@ -49,6 +49,53 @@ pub struct MatClassMeta {
     /// BOOLEAN=4 … LONG=11), so the HPROF typecode can be written straight
     /// through.
     pub class_fields: HashMap<u64, Vec<(String, u8)>>,
+    /// class-object address → its declared static (constant-pool) fields, as
+    /// `(name, HPROF typecode, raw big-endian value bits)`. MAT's
+    /// `ClassImpl.staticFields`; several MAT reports read these (System
+    /// Properties reads `java.lang.System.props`).
+    pub class_statics: HashMap<u64, Vec<(String, u8, u64)>>,
+    /// class-object address → the JVM-internal class name (e.g.
+    /// `java/lang/String`, `[Ljava/lang/String;`). Needed to reproduce MAT's
+    /// `calculateInstanceSize`, which walks the superclass chain by address.
+    pub class_name_by_addr: HashMap<u64, String>,
+    /// class-object address → its direct subclasses' addresses. MAT's
+    /// `ClassImpl.subClasses` is a real field that `getSubclasses()` /
+    /// `getAllSubclasses()` read (the "include subclasses" class lookups, the
+    /// Thread Overview and the reference-statistics reports all depend on it).
+    pub subclasses_by_addr: HashMap<u64, Vec<u64>>,
+    /// GC-root object addresses (direct, non-thread-local), in encounter order.
+    /// Parallel to `gc_root_types`.
+    pub gc_root_types: Vec<u8>,
+    /// Thread-local roots (JAVA_FRAME / JNI_LOCAL / NATIVE_STACK / THREAD_BLOCK)
+    /// with the referrer MAT would have used at read time.
+    pub thread_local_roots: Vec<crate::pass1::ThreadLocalRoot>,
+}
+
+/// One thread's thread-local roots: `(local object mat-id, its root records)`.
+pub type RootLocals = (i32, Vec<RootRecord>);
+
+/// One resolved GC-root record, in MAT id space.
+#[derive(Clone)]
+pub struct RootRecord {
+    pub object_id: i32,
+    pub object_address: u64,
+    pub context_id: i32,
+    pub context_address: u64,
+    /// MAT `GCRootInfo.Type` constant.
+    pub ty: i32,
+}
+
+/// Everything the master `.index` needs for its roots / rootsPerThread /
+/// loaderLabels maps, already translated into MAT id space by the caller
+/// (which is the only place the address table is still live).
+#[derive(Default)]
+pub struct MatRoots {
+    /// key = root object mat-id → its root records. Sorted by key.
+    pub roots: Vec<(i32, Vec<RootRecord>)>,
+    /// key = thread object mat-id → (local object mat-id → its root records).
+    pub per_thread: Vec<(i32, Vec<RootLocals>)>,
+    /// key = class-loader mat-id → MAT's display label.
+    pub loader_labels: Vec<(i32, String)>,
 }
 
 impl MatClassMeta {
@@ -78,9 +125,54 @@ impl MatClassMeta {
                 (addr, v)
             })
             .collect();
+        // Static (constant-pool) fields, same shape as `class_fields`.
+        let class_statics: HashMap<u64, Vec<(String, u8, u64)>> = p1
+            .class_map
+            .iter()
+            .map(|(&addr, ci)| {
+                let v: Vec<(String, u8, u64)> = ci
+                    .statics
+                    .iter()
+                    .map(|&(name_id, ty, val)| {
+                        (
+                            p1.strings.get(&name_id).cloned().unwrap_or_default(),
+                            ty,
+                            val,
+                        )
+                    })
+                    .collect();
+                (addr, v)
+            })
+            .collect();
+        let class_name_by_addr: HashMap<u64, String> = p1
+            .class_map
+            .iter()
+            .map(|(&addr, ci)| {
+                (
+                    addr,
+                    p1.strings.get(&ci.name_id).cloned().unwrap_or_default(),
+                )
+            })
+            .collect();
+        // Direct subclasses, keyed by the superclass's address (MAT's
+        // `HprofParserHandlerImpl` calls `superclass.addSubClass(clazz)`).
+        let mut subclasses_by_addr: HashMap<u64, Vec<u64>> = HashMap::new();
+        for (&addr, ci) in p1.class_map.iter() {
+            if ci.super_id != 0 {
+                subclasses_by_addr
+                    .entry(ci.super_id)
+                    .or_default()
+                    .push(addr);
+            }
+        }
+        for v in subclasses_by_addr.values_mut() {
+            v.sort_unstable();
+        }
         MatClassMeta {
             class_info,
             gc_root_addrs: p1.gc_root_addrs.clone(),
+            gc_root_types: p1.gc_root_types.clone(),
+            thread_local_roots: p1.thread_local_pairs.clone(),
             timestamp_ms: p1.header_timestamp_ms,
             file_size: p1.file_size,
             format: p1.format.clone(),
@@ -91,8 +183,161 @@ impl MatClassMeta {
             class_mat_to_addr: HashMap::new(),
             loader_addr_to_mat: HashMap::new(),
             class_fields,
+            class_statics,
+            class_name_by_addr,
+            subclasses_by_addr,
         }
     }
+}
+
+/// Map an HPROF heap-dump GC-root sub-tag to MAT's `GCRootInfo.Type` constant.
+///
+/// MAT's `Pass1Parser` reads the sub-tag and calls `handler.addGCRoot(id,
+/// referrer, <Type>)` with the type fixed per tag; the values are MAT's, not
+/// HPROF's, numbering (see `org.eclipse.mat.snapshot.model.GCRootInfo.Type`).
+pub fn mat_root_type(hprof_tag: u8) -> i32 {
+    use crate::types::heap;
+    match hprof_tag {
+        heap::ROOT_JNI_GLOBAL => 8,                             // NATIVE_STATIC
+        heap::ROOT_JNI_LOCAL => 4,                              // NATIVE_LOCAL
+        heap::ROOT_JAVA_FRAME => 64,                            // JAVA_LOCAL
+        heap::ROOT_NATIVE_STACK => 128,                         // NATIVE_STACK
+        heap::ROOT_STICKY_CLASS | heap::ROOT_SYSTEM_CLASS => 2, // SYSTEM_CLASS
+        heap::ROOT_THREAD_BLOCK => 16,                          // THREAD_BLOCK
+        heap::ROOT_MONITOR_USED => 32,                          // BUSY_MONITOR
+        heap::ROOT_THREAD_OBJ => 256,                           // THREAD_OBJ
+        // ROOT_UNKNOWN and the Android/JDK extras MAT 1.17 has no case for.
+        _ => 1, // UNKNOWN
+    }
+}
+
+/// MAT's `HprofParserHandlerImpl.calculateAlignment`: the GCD of the gaps
+/// between consecutive (address-sorted) object addresses, clamped to
+/// `[8, 256]`. The GCD can only shrink, so MAT bails out as soon as it reaches
+/// the 8-byte minimum.
+pub fn compute_object_align<I: Iterator<Item = u64>>(addrs: I) -> i32 {
+    let mut prev: u64 = 0;
+    let mut align: u64 = 0;
+    for next in addrs {
+        if next == 0 {
+            continue;
+        }
+        let diff = next.wrapping_sub(prev);
+        prev = next;
+        if next == diff {
+            // prev was 0: this is the first real address, nothing to compare.
+            continue;
+        }
+        if align == 0 {
+            align = diff;
+        } else {
+            let (mut mx, mut mn) = (align.max(diff), align.min(diff));
+            let mut d = mx % mn;
+            while d != 0 {
+                mx = mn;
+                mn = d;
+                d = mx % mn;
+            }
+            align = mn;
+            if align <= 8 {
+                break;
+            }
+        }
+    }
+    (align.min(256) as i32).max(8)
+}
+
+/// Reproduce MAT's `ClassImpl.heapSizePerInstance`, i.e.
+/// `HprofParserHandlerImpl.calculateInstanceSize`.
+///
+/// MAT ignores the HPROF `instance_size` field except for the `<method>` fake
+/// class: it recomputes the size from the declared fields, walking the
+/// superclass chain and 8-byte-aligning the result. Getting this wrong is
+/// visible in every MAT report that shows "Heap Size per Instance".
+pub fn compute_instance_sizes(meta: &MatClassMeta, object_align: i32) -> HashMap<u64, i32> {
+    let ref_size = meta.ref_size as i32;
+    let pointer_size = meta.id_size as i32;
+    let mut out: HashMap<u64, i32> = HashMap::with_capacity(meta.class_info.len());
+    let align_up = |v: i32, m: i32| -> i32 {
+        if m <= 0 {
+            return v;
+        }
+        let r = v % m;
+        if r == 0 { v } else { v + (m - r) }
+    };
+    // Declared-field byte total, MAT's `sizeOf` summed over the class's own
+    // `getFieldDescriptors()`.
+    let own_bytes = |addr: u64| -> i32 {
+        meta.class_fields
+            .get(&addr)
+            .map(|fs| {
+                fs.iter()
+                    .map(|&(_, ty)| {
+                        if ty == 2 {
+                            ref_size
+                        } else {
+                            crate::types::HprofType::from_code(ty)
+                                .map(|t| t.byte_size() as i32)
+                                .unwrap_or(0)
+                        }
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
+    };
+    fn recursive(
+        addr: u64,
+        meta: &MatClassMeta,
+        own_bytes: &dyn Fn(u64) -> i32,
+        pointer_size: i32,
+        ref_size: i32,
+        align_up: &dyn Fn(i32, i32) -> i32,
+        depth: u32,
+    ) -> i32 {
+        let super_addr = meta.class_info.get(&addr).map(|c| c.0).unwrap_or(0);
+        if super_addr == 0 || depth > 64 {
+            return pointer_size + ref_size;
+        }
+        align_up(
+            own_bytes(addr)
+                + recursive(
+                    super_addr,
+                    meta,
+                    own_bytes,
+                    pointer_size,
+                    ref_size,
+                    align_up,
+                    depth + 1,
+                ),
+            ref_size,
+        )
+    }
+    for &addr in meta.class_info.keys() {
+        let is_array = meta
+            .class_name_by_addr
+            .get(&addr)
+            .is_some_and(|n| n.starts_with('['));
+        let size = if is_array {
+            ref_size
+        } else {
+            let super_addr = meta.class_info.get(&addr).map(|c| c.0).unwrap_or(0);
+            let is_method = super_addr != 0
+                && meta
+                    .class_name_by_addr
+                    .get(&super_addr)
+                    .is_some_and(|n| n == "<method>");
+            if is_method {
+                meta.class_info.get(&addr).map(|c| c.2 as i32).unwrap_or(0)
+            } else {
+                align_up(
+                    recursive(addr, meta, &own_bytes, pointer_size, ref_size, &align_up, 0),
+                    object_align,
+                )
+            }
+        };
+        out.insert(addr, size);
+    }
+    out
 }
 
 /// Maps our internal dense-id space (all objects, encounter order) to MAT's
@@ -625,22 +870,32 @@ impl MatEmitter {
         _class_obj_class_idx: &HashMap<u32, u32>,
         inv: &[i32],
         mm: &MatIdMap,
-        num_objects: usize,
+        _num_objects: usize,
         shallow: &[u32],
         class_idx: &[u32],
+        roots: &MatRoots,
+        instance_sizes: &HashMap<u64, i32>,
+        root_instance_size: i32,
+        root_class_mat: i32,
     ) -> io::Result<()> {
         use serial::*;
 
         let num_rows = class_names.len();
 
         // --- build per-class aggregate data (instance count + shallow-heap sum) ---
+        // MAT's `ClassImpl.instanceCount`/`totalSize` are accumulated by
+        // `addInstance` over the objects that survive `GarbageCleaner` — i.e. the
+        // ones that get an id in the index, which is exactly `mm.sorted()`.
+        // Counting our whole dense space here (which also holds unreachable
+        // objects MAT drops) inflated every MAT histogram and every
+        // "Number of Objects" column.
         let mut instance_count: Vec<i32> = vec![0i32; num_rows];
         let mut used_heap: Vec<i64> = vec![0i64; num_rows];
-        for i in 0..num_objects {
-            let row = class_idx[i] as usize;
+        for &old in mm.sorted() {
+            let row = class_idx[old as usize] as usize;
             if row < num_rows {
                 instance_count[row] = instance_count[row].saturating_add(1);
-                used_heap[row] = used_heap[row].saturating_add(shallow[i] as i64);
+                used_heap[row] = used_heap[row].saturating_add(shallow[old as usize] as i64);
             }
         }
 
@@ -735,33 +990,25 @@ impl MatEmitter {
             }
             seen.len() as i32
         };
-        let n_loaders = {
-            let mut seen = std::collections::HashSet::new();
-            for &l in class_loader_id {
-                if l != 0 {
-                    seen.insert(l);
-                }
-            }
-            seen.len() as i32
-        };
-        // MAT counts distinct root *objects*; two root records can name the same
-        // object, and MAT's own index reports 838 here against 839 records.
-        let n_roots = {
-            let mut seen = std::collections::HashSet::new();
-            for &a in &meta.gc_root_addrs {
-                seen.insert(a);
-            }
-            seen.len() as i32
-        };
-        // usedHeapSize = sum of shallow sizes over reachable objects (MAT's own
-        // index records exactly this, and it is not recomputable from the rest
-        // of the cache).
+        let n_loaders = roots.loader_labels.len() as i32;
+        // MAT counts distinct root *objects* — and, crucially, only those it can
+        // resolve to an object in the heap (`HprofParserHandlerImpl.map2ids`
+        // drops root records whose address has no identifier). The caller
+        // already applied that filter, so the count is the emitted map size.
+        let n_roots = roots.roots.len() as i32;
+        // usedHeapSize = sum of shallow sizes over reachable objects, plus MAT's
+        // synthetic object 0 (the system class loader), which MAT treats as an
+        // instance of java.lang.ClassLoader and therefore counts at that class's
+        // heapSizePerInstance.
         let used_heap_size: i64 = mm
             .sorted()
             .iter()
             .map(|&old| shallow[old as usize] as i64)
-            .sum();
+            .sum::<i64>()
+            + root_instance_size as i64;
         let id_size = meta.id_size as i32;
+        // Captured by value so the `properties` closure below stays 'static.
+        let has_oops_property = meta.id_size == 8;
         let compressed_oops = meta.ref_size < meta.id_size;
         let dump_path = meta.dump_path.clone();
         let prefix = {
@@ -830,22 +1077,26 @@ impl MatEmitter {
                         "properties".into(),
                         FieldVal::ObjRef(Box::new(move |s: &mut Ser| {
                             // Properties map: the keys MAT's own index carries.
-                            // $heapFormat, $useCompressedOops, hprof.version, hprof.length
-                            let entries: Vec<(
+                            // MAT sets `$heapFormat` from the parser id's format
+                            // string (lower-case "hprof"), and only sets
+                            // `$useCompressedOops` for a 64-bit dump (the
+                            // `pointerSize == 8` guard in beforePass2).
+                            let mut entries: Vec<(
                                 i32,
                                 Box<dyn FnOnce(&mut Ser)>,
                                 Box<dyn FnOnce(&mut Ser)>,
-                            )> = vec![
-                                (
-                                    Ser::java_string_hashcode("$heapFormat"),
-                                    Box::new(|s: &mut Ser| {
-                                        s.string("$heapFormat");
-                                    }),
-                                    Box::new(|s: &mut Ser| {
-                                        s.string("HPROF");
-                                    }),
-                                ),
-                                (
+                            )> = vec![(
+                                Ser::java_string_hashcode("$heapFormat"),
+                                Box::new(|s: &mut Ser| {
+                                    s.string("$heapFormat");
+                                }),
+                                Box::new(|s: &mut Ser| {
+                                    s.string("hprof");
+                                }),
+                            )];
+                            // MAT only records this for a 64-bit dump.
+                            if has_oops_property {
+                                let e: (i32, Box<dyn FnOnce(&mut Ser)>, Box<dyn FnOnce(&mut Ser)>) = (
                                     Ser::java_string_hashcode("$useCompressedOops"),
                                     Box::new(|s: &mut Ser| {
                                         s.string("$useCompressedOops");
@@ -853,26 +1104,29 @@ impl MatEmitter {
                                     Box::new(move |s: &mut Ser| {
                                         s.write_boolean(compressed_oops);
                                     }),
-                                ),
-                                (
-                                    Ser::java_string_hashcode("hprof.version"),
-                                    Box::new(|s: &mut Ser| {
-                                        s.string("hprof.version");
-                                    }),
-                                    Box::new(move |s: &mut Ser| {
-                                        s.string(hprof_version);
-                                    }),
-                                ),
-                                (
-                                    Ser::java_string_hashcode("hprof.length"),
-                                    Box::new(|s: &mut Ser| {
-                                        s.string("hprof.length");
-                                    }),
-                                    Box::new(move |s: &mut Ser| {
-                                        s.write_long(file_size as i64);
-                                    }),
-                                ),
-                            ];
+                                );
+                                entries.push(e);
+                            }
+                            let e: (i32, Box<dyn FnOnce(&mut Ser)>, Box<dyn FnOnce(&mut Ser)>) = (
+                                Ser::java_string_hashcode("hprof.version"),
+                                Box::new(|s: &mut Ser| {
+                                    s.string("hprof.version");
+                                }),
+                                Box::new(move |s: &mut Ser| {
+                                    s.string(hprof_version);
+                                }),
+                            );
+                            entries.push(e);
+                            let e: (i32, Box<dyn FnOnce(&mut Ser)>, Box<dyn FnOnce(&mut Ser)>) = (
+                                Ser::java_string_hashcode("hprof.length"),
+                                Box::new(|s: &mut Ser| {
+                                    s.string("hprof.length");
+                                }),
+                                Box::new(move |s: &mut Ser| {
+                                    s.write_long(file_size as i64);
+                                }),
+                            );
+                            entries.push(e);
                             s.write_hashmap(16, 12, entries);
                         })),
                     ),
@@ -903,9 +1157,116 @@ impl MatEmitter {
             })
             .collect();
         class_entries.sort_by_key(|&(mid, _)| mid);
+        // The ClassImpl of java.lang.Class: every class's `classInstance`.
+        let jlc_key: Option<String> = meta
+            .class_name_by_addr
+            .iter()
+            .find(|(_, n)| *n == "java.lang.Class" || *n == "java/lang/Class")
+            .and_then(|(&a, _)| meta.class_addr_to_mat.get(&a).copied())
+            .filter(|&m| m > 0)
+            .map(|m| {
+                let a = meta.class_mat_to_addr.get(&m).copied().unwrap_or(0);
+                format!("class_0x{:x}", a)
+            });
+        // MAT materialises its synthetic object 0 as a `ClassLoaderImpl` whose
+        // class is `java.lang.ClassLoader`, so that class's instance count is
+        // one higher than the heap's real loaders and its totalSize carries
+        // object 0's heapSizePerInstance (MAT's own index shows the extra
+        // instance, and the snapshot's usedHeapSize — the sum of every class's
+        // totalSize — only adds up with it included).
+        if root_class_mat > 0 {
+            if let Some(&(_, row)) = class_entries.iter().find(|&&(m, _)| m == root_class_mat) {
+                instance_count[row] = instance_count[row].saturating_add(1);
+                used_heap[row] = used_heap[row].saturating_add(root_instance_size as i64);
+            }
+        }
         // Insert into HMIO in that order (insertion order determines slot positions after rehash).
         for (i, &(mat_id, _row)) in class_entries.iter().enumerate() {
             hm.put(mat_id, i);
+        }
+        // Emit the class cache children-first: every ClassImpl's `subClasses`
+        // list is then a set of plain back-references to already-written
+        // ClassImpls (MAT stores the *same* ClassImpl instances, and
+        // GarbageCleaner later hangs its `cacheEntry` — and therefore
+        // `getObjectIds()` — off exactly those instances, so duplicates would
+        // break every "include subclasses" query). MAT's reader re-inserts each
+        // entry with `putQuick`, so the stream order does not change the map.
+        let val_of: std::collections::HashMap<i32, usize> = class_entries
+            .iter()
+            .enumerate()
+            .map(|(i, &(m, _))| (m, i))
+            .collect();
+        // Only reference subclasses we actually emit: a class object can be
+        // reachable without its row resolving to it, and referencing one of
+        // those would leave a dangling forward reference in the stream.
+        let mut subs_by_mat: std::collections::HashMap<i32, Vec<(i32, u64)>> =
+            std::collections::HashMap::new();
+        for &(mat_id, _) in class_entries.iter() {
+            if let Some(&addr) = meta.class_mat_to_addr.get(&mat_id) {
+                if let Some(kids) = meta.subclasses_by_addr.get(&addr) {
+                    let v: Vec<(i32, u64)> = kids
+                        .iter()
+                        .filter_map(|&kaddr| {
+                            let km = *meta.class_addr_to_mat.get(&kaddr)?;
+                            if val_of.contains_key(&km) {
+                                Some((km, kaddr))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if !v.is_empty() {
+                        subs_by_mat.insert(mat_id, v);
+                    }
+                }
+            }
+        }
+        // The `java.lang.Class` class object is every class's `classInstance`
+        // (MAT's `ClassImpl.getClazz()` resolves through it, and the class
+        // grouping in Top Consumers / the Class Histogram depends on it), so it
+        // must be on the wire before any class that references it. It has no
+        // subclasses of its own, so hoisting it does not break the
+        // children-first invariant below.
+        let jlc_mat: Option<i32> = meta
+            .class_name_by_addr
+            .iter()
+            .find(|(_, n)| *n == "java.lang.Class" || *n == "java/lang/Class")
+            .and_then(|(&a, _)| meta.class_addr_to_mat.get(&a).copied())
+            .filter(|m| val_of.contains_key(m));
+        // Iterative post-order (children first) over the subclass forest.
+        let mut emit_order: Vec<usize> = Vec::with_capacity(class_entries.len());
+        {
+            let mut state: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
+            if let Some(jm) = jlc_mat {
+                // Hoisted to the front AND marked visited, so the post-order
+                // walk below (which would otherwise reach it through its
+                // superclass) does not emit it a second time.
+                emit_order.push(val_of[&jm]);
+                state.insert(jm, usize::MAX);
+            }
+            let empty: Vec<(i32, u64)> = Vec::new();
+            for &(root, _) in class_entries.iter() {
+                if state.contains_key(&root) {
+                    continue;
+                }
+                let mut stack: Vec<i32> = vec![root];
+                state.insert(root, 0);
+                while let Some(&m) = stack.last() {
+                    let idx = state[&m];
+                    let kids = subs_by_mat.get(&m).unwrap_or(&empty);
+                    if idx < kids.len() {
+                        state.insert(m, idx + 1);
+                        let k = kids[idx].0;
+                        if let std::collections::hash_map::Entry::Vacant(e) = state.entry(k) {
+                            e.insert(0);
+                            stack.push(k);
+                        }
+                    } else {
+                        stack.pop();
+                        emit_order.push(val_of[&m]);
+                    }
+                }
+            }
         }
 
         // Build ClassImpl chain descriptor (shared, written once via handle table).
@@ -931,7 +1292,7 @@ impl MatEmitter {
                     ),
                     f_obj("name", "Ljava/lang/String;"),
                     f_arr("staticFields", "[Lorg.eclipse.mat.snapshot.model.Field;"),
-                    f_arr("subClasses", "Ljava/util/List;"),
+                    f_obj("subClasses", "Ljava/util/Collection;"),
                 ],
             },
             ClassDesc {
@@ -946,9 +1307,10 @@ impl MatEmitter {
             },
         ];
 
-        ser.write_hashmap_int_object(
+        ser.write_hashmap_int_object_custom(
             "org.eclipse.mat.collect.HashMapIntObject",
             &hm,
+            &emit_order,
             |s, val_idx| {
                 let (mat_id, row) = class_entries[val_idx];
                 // Real class-object address (resolved in main.rs while the
@@ -969,16 +1331,25 @@ impl MatEmitter {
                 };
                 let (super_addr, _loader_addr_ci, inst_size) =
                     meta.class_info.get(&addr).copied().unwrap_or((0, 0, 0));
+                let _ = inst_size;
                 // superClassId is a MAT id, resolved from the super's address.
-                // Keep the (address, id) pair consistent: if the super's class
-                // object is not in the cache, emit "no superclass" rather than a
-                // dangling id — ClassImpl.getSuperClass() keys off the address.
+                // java.lang.Object has no superclass, and MAT records that as id
+                // 0 (the id of address 0x0, the synthetic system class loader)
+                // rather than -1 — its own index has `superClassId=0` for
+                // java.lang.Object. Keep the (address, id) pair consistent: if
+                // the super's class object is not in the cache, emit
+                // "no superclass" rather than a dangling id — ClassImpl
+                // .getSuperClass() keys off the address.
                 let super_mat_id = meta
                     .class_addr_to_mat
                     .get(&super_addr)
                     .copied()
-                    .unwrap_or(-1);
-                let super_addr = if super_mat_id < 0 { 0 } else { super_addr };
+                    .unwrap_or(0);
+                let super_addr = if super_mat_id <= 0 { 0 } else { super_addr };
+                // MAT recomputes the per-instance heap size from the declared
+                // fields (see compute_instance_sizes); the HPROF instance_size
+                // field is only used for the `<method>` pseudo-class.
+                let inst_size = instance_sizes.get(&addr).copied().unwrap_or(0);
                 let is_array = name.starts_with('[');
                 // MAT stores the source form of the name, not the HPROF
                 // descriptor form.
@@ -1031,7 +1402,7 @@ impl MatEmitter {
                                 ),
                                 f_obj("name", "Ljava/lang/String;"),
                                 f_arr("staticFields", "[Lorg.eclipse.mat.snapshot.model.Field;"),
-                                f_arr("subClasses", "Ljava/util/List;"),
+                                f_obj("subClasses", "Ljava/util/Collection;"),
                             ],
                             values: vec![
                                 (
@@ -1040,7 +1411,7 @@ impl MatEmitter {
                                 ),
                                 ("classLoaderId".into(), FieldVal::Int(loader_mid)),
                                 ("instanceCount".into(), FieldVal::Int(inst_count_val)),
-                                ("instanceSize".into(), FieldVal::Int(inst_size as i32)),
+                                ("instanceSize".into(), FieldVal::Int(inst_size)),
                                 ("isArrayType".into(), FieldVal::Bool(is_array)),
                                 (
                                     "superClassAddress".into(),
@@ -1084,20 +1455,41 @@ impl MatEmitter {
                                 ),
                                 (
                                     "staticFields".into(),
-                                    FieldVal::ObjRef(Box::new(|s: &mut Ser| {
-                                        s.write_object_array(
-                                            "[Lorg.eclipse.mat.snapshot.model.Field;",
-                                            uid::FIELD_ARRAY,
-                                            0,
-                                            |_| {},
-                                        );
-                                    })),
+                                    FieldVal::ObjRef({
+                                        let sf = meta
+                                            .class_statics
+                                            .get(&addr)
+                                            .cloned()
+                                            .unwrap_or_default();
+                                        Box::new(move |s: &mut Ser| {
+                                            write_static_fields(s, &sf);
+                                        })
+                                    }),
                                 ),
                                 (
                                     "subClasses".into(),
-                                    FieldVal::ObjRef(Box::new(|s: &mut Ser| {
-                                        s.write_array_list(0, vec![]);
-                                    })),
+                                    FieldVal::ObjRef({
+                                        // Direct subclasses, as back-references
+                                        // to the ClassImpls written earlier
+                                        // (children-first order above).
+                                        let kids: Vec<u64> = subs_by_mat
+                                            .get(&mat_id)
+                                            .map(|v| v.iter().map(|&(_, a)| a).collect())
+                                            .unwrap_or_default();
+                                        Box::new(move |s: &mut Ser| {
+                                            let elems: Vec<Box<dyn FnOnce(&mut Ser)>> = kids
+                                                .iter()
+                                                .map(|&kaddr| {
+                                                    let k = format!("class_0x{:x}", kaddr);
+                                                    Box::new(move |s: &mut Ser| {
+                                                        s.ref_object(&k);
+                                                    })
+                                                        as Box<dyn FnOnce(&mut Ser)>
+                                                })
+                                                .collect();
+                                            s.write_array_list(kids.len() as i32, elems);
+                                        })
+                                    }),
                                 ),
                             ],
                         },
@@ -1116,9 +1508,20 @@ impl MatEmitter {
                                 (
                                     "classInstance".into(),
                                     FieldVal::ObjRef({
+                                        // A class object's class is java.lang.Class
+                                        // (MAT's own index resolves every
+                                        // ClassImpl.getClazz() to that ClassImpl).
+                                        // Falls back to a self-reference only if
+                                        // java.lang.Class is absent from the cache.
                                         let k = key_str.clone();
-                                        Box::new(move |s: &mut Ser| {
-                                            s.ref_object(&k);
+                                        let jlc = jlc_key.clone();
+                                        Box::new(move |s: &mut Ser| match jlc {
+                                            Some(ref j)
+                                                if s.object_handle(j).is_some() && *j != k =>
+                                            {
+                                                s.ref_object(j);
+                                            }
+                                            _ => s.ref_object(&k),
                                         })
                                     }),
                                 ),
@@ -1131,40 +1534,94 @@ impl MatEmitter {
         );
 
         // --- 3. roots: HashMapIntObject<XGCRootInfo[]> ---
-        // Key = object mat-id, value = XGCRootInfo[1] (one root per object).
-        let roots_hm = MatIntMap::new(meta.gc_root_addrs.len() as i32);
-        let mut _root_entries: Vec<(i32, u8)> = Vec::new();
-        for (i, &addr) in meta.gc_root_addrs.iter().enumerate() {
-            // addr is the GC-root object address; translate to mat-id via address lookup.
-            // We don't have a reverse addr→old_id map here, so we skip roots we can't resolve.
-            // Use a simple approach: iterate mm.sorted() to find the right old-id.
-            // For now emit an empty roots map (MAT opens fine without roots in .index on modern versions).
-            let _ = (i, addr);
+        // Key = object mat-id, value = the object's XGCRootInfo[] (an object can
+        // be a root for more than one reason). `roots.roots` was already
+        // filtered to objects MAT can resolve, and translated into MAT id space
+        // by the caller (the only place the address table is still live).
+        let mut roots_hm = MatIntMap::new(roots.roots.len() as i32);
+        for (i, &(key, _)) in roots.roots.iter().enumerate() {
+            roots_hm.put(key, i);
         }
-        // For the GC-root type code conversion (HPROF type byte → XGCRootInfo.type int):
-        // This is a best-effort approximation; byte-identity is not a goal here.
         ser.write_hashmap_int_object(
             "org.eclipse.mat.collect.HashMapIntObject",
             &roots_hm,
-            |_s, _val_idx| {
-                // No entries: empty map
+            |s, val_idx| {
+                let recs = &roots.roots[val_idx].1;
+                let mut it = recs.iter();
+                s.write_object_array(
+                    "[Lorg.eclipse.mat.parser.model.XGCRootInfo;",
+                    uid::X_GC_ROOT_INFO_ARRAY,
+                    recs.len() as i32,
+                    move |s: &mut Ser| {
+                        for r in it.by_ref() {
+                            s.write_xgcroot_info(
+                                r.object_id,
+                                r.object_address,
+                                r.context_id,
+                                r.context_address,
+                                r.ty,
+                            );
+                        }
+                    },
+                );
             },
         );
 
-        // --- 4. rootsPerThread: HashMapIntObject<List<XGCRootInfo[]>> ---
-        let roots_pt_hm = MatIntMap::new(1);
+        // --- 4. rootsPerThread: HashMapIntObject<HashMapIntObject<XGCRootInfo[]>> ---
+        // MAT routes a thread-local root (JAVA_FRAME / JNI_LOCAL / NATIVE_STACK /
+        // THREAD_BLOCK whose thread serial was already known) into
+        // `threadAddressToLocals` instead of `gcRoots`.
+        let mut roots_pt_hm = MatIntMap::new(roots.per_thread.len() as i32);
+        for (i, &(key, _)) in roots.per_thread.iter().enumerate() {
+            roots_pt_hm.put(key, i);
+        }
         ser.write_hashmap_int_object(
             "org.eclipse.mat.collect.HashMapIntObject",
             &roots_pt_hm,
-            |_s, _val_idx| {},
+            |s, val_idx| {
+                let locals = &roots.per_thread[val_idx].1;
+                let mut inner = MatIntMap::new(locals.len() as i32);
+                for (j, &(key, _)) in locals.iter().enumerate() {
+                    inner.put(key, j);
+                }
+                s.write_hashmap_int_object(
+                    "org.eclipse.mat.collect.HashMapIntObject",
+                    &inner,
+                    |s, j| {
+                        let recs = &locals[j].1;
+                        let mut it = recs.iter();
+                        s.write_object_array(
+                            "[Lorg.eclipse.mat.parser.model.XGCRootInfo;",
+                            uid::X_GC_ROOT_INFO_ARRAY,
+                            recs.len() as i32,
+                            move |s: &mut Ser| {
+                                for r in it.by_ref() {
+                                    s.write_xgcroot_info(
+                                        r.object_id,
+                                        r.object_address,
+                                        r.context_id,
+                                        r.context_address,
+                                        r.ty,
+                                    );
+                                }
+                            },
+                        );
+                    },
+                );
+            },
         );
 
         // --- 5. loaderLabels: HashMapIntObject<String> ---
-        let loader_hm = MatIntMap::new(1);
+        let mut loader_hm = MatIntMap::new(roots.loader_labels.len() as i32);
+        for (i, &(key, _)) in roots.loader_labels.iter().enumerate() {
+            loader_hm.put(key, i);
+        }
         ser.write_hashmap_int_object(
             "org.eclipse.mat.collect.HashMapIntObject",
             &loader_hm,
-            |_s, _val_idx| {},
+            |s, val_idx| {
+                s.string(&roots.loader_labels[val_idx].1);
+            },
         );
 
         // --- 6. BitField arrayObjects: n+1 bits (mat-id 0..=n), bit set for array objects ---
@@ -1276,6 +1733,39 @@ fn write_field_descriptors(s: &mut serial::Ser, fields: &[(String, u8)]) {
                         ],
                     }],
                 );
+            }
+        },
+    );
+}
+
+/// Write a MAT `Field[]` for a class's static (constant-pool) fields.
+///
+/// `fields` is `(name, HPROF typecode, raw big-endian value bits)`. MAT's
+/// `AbstractParser.readValue` boxes the value by type — an object field becomes
+/// an `ObjectReference` (or `null` when the address is 0), a primitive becomes
+/// the corresponding `java.lang` wrapper — and several MAT reports read these
+/// (the System Properties view reads `java.lang.System.props`).
+fn write_static_fields(s: &mut serial::Ser, fields: &[(String, u8, u64)]) {
+    use serial::{Ser, uid};
+    let mut it = fields.iter();
+    s.write_object_array(
+        "[Lorg.eclipse.mat.snapshot.model.Field;",
+        uid::FIELD_ARRAY,
+        fields.len() as i32,
+        move |s: &mut Ser| {
+            for (name, ty, val) in it.by_ref() {
+                let (ty, val) = (*ty, *val);
+                s.write_field(name, ty as i32, move |s: &mut Ser| {
+                    if ty == 2 {
+                        if val == 0 {
+                            s.null();
+                        } else {
+                            s.write_object_reference(val);
+                        }
+                    } else {
+                        s.write_boxed_primitive(ty, val);
+                    }
+                });
             }
         },
     );

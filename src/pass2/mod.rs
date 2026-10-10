@@ -1161,7 +1161,9 @@ impl Pass2 {
         // per-thread cap. Zero cost on the default path.
         let mut thread_local_frame_samples: std::collections::HashMap<u32, Vec<(u32, u32)>> =
             std::collections::HashMap::new();
-        for &(thread_serial, frame_number, local_addr) in &p1.thread_local_pairs {
+        for tlr in &p1.thread_local_pairs {
+            let (thread_serial, frame_number, local_addr) =
+                (tlr.thread_serial, tlr.frame_number, tlr.local_addr);
             let thread_obj_addr = match p1.thread_serial_to_obj_id.get(&thread_serial) {
                 Some(&a) => a,
                 None => continue,

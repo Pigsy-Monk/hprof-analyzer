@@ -20,11 +20,29 @@ use crate::{
     types::{HprofType, heap, tags},
 };
 
-/// A thread-local GC-root edge: `(threadSerial, frameNumber, localAddr)`.
-/// `frameNumber` is the 0-based stack-frame index (topmost = 0) for
+/// A thread-local GC-root edge.
+/// `frame_number` is the 0-based stack-frame index (topmost = 0) for
 /// ROOT_JAVA_FRAME; `u32::MAX` means "no associated frame" (JNI local / native
 /// stack / thread block).
-pub type ThreadLocalRoot = (u32, u32, u64);
+///
+/// `referrer_addr` mirrors MAT's `addGCRoot(id, referrer, type)` argument: the
+/// thread OBJECT address when the record's `threadSerial` was already known
+/// (i.e. a ROOT_THREAD_OBJ with that serial had been read earlier in the same
+/// pass), else 0. MAT routes a root with `referrer != 0` into
+/// `rootsPerThread` and one with `referrer == 0` into the plain `roots` map, so
+/// the emitted `.index` cannot be reproduced without recording this.
+///
+/// `tag` is the HPROF heap sub-tag byte (ROOT_JNI_LOCAL / ROOT_JAVA_FRAME /
+/// ROOT_NATIVE_STACK / ROOT_THREAD_BLOCK), which selects MAT's
+/// `GCRootInfo.Type`.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct ThreadLocalRoot {
+    pub thread_serial: u32,
+    pub frame_number: u32,
+    pub local_addr: u64,
+    pub referrer_addr: u64,
+    pub tag: u8,
+}
 
 /// One HPROF STACK_FRAME (0x04) record. String ids resolve against `strings`;
 /// `class_serial` resolves against `class_serial_to_addr` → `class_map`.
@@ -51,6 +69,12 @@ pub struct ClassInfo {
     pub static_obj_count: u32,
     /// Number of static primitive bytes (for class-object shallow size)
     pub static_prim_bytes: u32,
+    /// Static (constant-pool) fields in HPROF order: `(name_id, HPROF typecode,
+    /// raw big-endian value bytes zero-extended into a u64)`. MAT stores these
+    /// as `ClassImpl.staticFields` (`Field[]`) and several MAT reports read them
+    /// (System Properties reads `java.lang.System.props`), so they must survive
+    /// into the `.index`.
+    pub statics: Vec<(u64, u8, u64)>,
 }
 
 /// Result of pass 1: interned strings, class/thread metadata, the `id_map`, and
@@ -545,7 +569,17 @@ fn scan_heap_segment(
                 let frame_number = r.u4()?;
                 sub_remaining(&mut remaining, ids + 8)?;
                 // NOT a direct GC root — synthetic edge from thread object (MAT parity)
-                thread_local_pairs.push((thread_serial, frame_number, local_id));
+                let referrer_addr = thread_serial_to_obj_id
+                    .get(&thread_serial)
+                    .copied()
+                    .unwrap_or(0);
+                thread_local_pairs.push(ThreadLocalRoot {
+                    thread_serial,
+                    frame_number,
+                    local_addr: local_id,
+                    referrer_addr,
+                    tag: sub_tag,
+                });
             }
             heap::ROOT_NATIVE_STACK | heap::ROOT_THREAD_BLOCK => {
                 *gc_root_tag_counts.entry(sub_tag).or_insert(0) += 1;
@@ -554,7 +588,17 @@ fn scan_heap_segment(
                 sub_remaining(&mut remaining, ids + 4)?;
                 // NOT a direct GC root — synthetic edge from thread object (MAT parity).
                 // No stack-frame index in these records → sentinel u32::MAX.
-                thread_local_pairs.push((thread_serial, u32::MAX, local_id));
+                let referrer_addr = thread_serial_to_obj_id
+                    .get(&thread_serial)
+                    .copied()
+                    .unwrap_or(0);
+                thread_local_pairs.push(ThreadLocalRoot {
+                    thread_serial,
+                    frame_number: u32::MAX,
+                    local_addr: local_id,
+                    referrer_addr,
+                    tag: sub_tag,
+                });
             }
             heap::ROOT_STICKY_CLASS => {
                 *gc_root_tag_counts.entry(sub_tag).or_insert(0) += 1;
@@ -773,14 +817,20 @@ fn read_class_dump(
     consumed += 2;
     let mut static_obj_count = 0u32;
     let mut static_prim_bytes = 0u32;
+    let mut statics: Vec<(u64, u8, u64)> = Vec::with_capacity(static_count as usize);
     for _ in 0..static_count {
-        r.skip(ids)?;
+        let name_id = r.id()?;
         consumed += ids; // name_id
         let field_type = r.u1()?;
         consumed += 1;
         let vs = value_size(field_type, id_size);
-        r.skip(vs)?;
+        // Capture the value as a big-endian u64 (values are at most 8 bytes).
+        let mut val: u64 = 0;
+        for _ in 0..vs {
+            val = (val << 8) | r.u1()? as u64;
+        }
         consumed += vs;
+        statics.push((name_id, field_type, val));
         if field_type == 2 {
             static_obj_count += 1;
         } else {
@@ -808,6 +858,7 @@ fn read_class_dump(
     entry.fields = fields;
     entry.static_obj_count = static_obj_count;
     entry.static_prim_bytes = static_prim_bytes;
+    entry.statics = statics;
 
     Ok((class_addr, consumed))
 }
