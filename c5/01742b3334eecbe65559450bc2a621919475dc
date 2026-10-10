@@ -1,0 +1,38 @@
+src/query/server.rs
+  s_693092c3ed91bb::t_056312c39137f7 449-453
+  s_693092c3ed91bb::t_f064f583161315 369-431
+  s_693092c3ed91bb::t_b99d79063cc8c4 468-477,482
+  s_693092c3ed91bb::t_59a84c3df4af79 172-178
+  s_693092c3ed91bb::t_26e4f02d2495a8 36-43
+  s_693092c3ed91bb::t_e0dec96f75f6c2 203-209
+  s_693092c3ed91bb::t_3547f3aec09a47 633,641
+  s_693092c3ed91bb::t_a32f9435a79697 672
+  s_693092c3ed91bb::t_af213bf97f2d90 870,872,880
+  s_693092c3ed91bb::t_c71107470d7a12 35,44-68
+  s_693092c3ed91bb::t_828ba15da1cf70 1057-1109
+src/serve.rs
+  s_693092c3ed91bb::t_73a5682d8af7f2 400
+  s_693092c3ed91bb::t_440fe62acdd040 361
+  s_693092c3ed91bb::t_6317cbba3bc7cd 36-42
+  s_693092c3ed91bb::t_82dbca490161dd 503
+src/main.rs
+  s_693092c3ed91bb::t_91c741cced2dbb 1101-1105
+  s_693092c3ed91bb::t_b418e5e3be4287 315-328
+  s_693092c3ed91bb::t_46e2a36a71a91f 1119-1121
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.45-trip",
+  "base_commit_sha": "c501742b3334eecbe65559450bc2a621919475dc",
+  "prompts": {},
+  "sessions": {
+    "s_693092c3ed91bb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8aedcf42-f422-450b-911c-f2b4c41e1747",
+        "model": "deepseek-v4-1-flash-260910"
+      },
+      "human_author": null
+    }
+  }
+}
