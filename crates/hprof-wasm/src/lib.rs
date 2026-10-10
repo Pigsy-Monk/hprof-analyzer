@@ -6,6 +6,9 @@
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 
+use hprof_analyzer::query::execute::ClassResolver;
+use hprof_analyzer::types::{HprofType, heap, tags};
+
 #[wasm_bindgen(start)]
 pub fn init() {
     console_error_panic_hook::set_once();
@@ -20,6 +23,390 @@ fn call_progress(cb: &js_sys::Function, phase: &str, fraction: f32) {
         &JsValue::from_f64(fraction as f64),
     );
 }
+// ──────────────────────────────────────────────────────────────────────────────
+// Reading an object's fields out of the in-memory dump
+// ──────────────────────────────────────────────────────────────────────────────
+//
+// Why not OQL. `SELECT *` is not "expand the fields" in this engine (nor in
+// MAT) — it means "the object itself", so the panel used to get one column
+// named `*` holding a reference and no fields at all. Spelling the fields out
+// (`SELECT s.a, s.b, ...`) fixes the column *names*, but every reference-typed
+// field still comes back Null: `decode_field` in the query engine ends in
+// `HprofType::Object => QueryValue::Null`, so no statement can produce a
+// reference value. The panel exists to *navigate* reference fields, so the
+// values have to come from the dump itself.
+//
+// Why a scan rather than a seek. WASM has no filesystem, so the CLI's cached
+// record offset and single `seek` are unavailable, and this session keeps only
+// a *compressed* copy of the dump (see `load`'s memory strategy) — there is no
+// seekable slice to index into. The one route to an object's bytes is to walk
+// the heap-dump segments until its `INSTANCE_DUMP` record turns up. Field
+// *offsets* still come from the engine's own `LiveResolver::field`, so a value
+// read here cannot disagree with what `SELECT s.name` would report.
+
+/// Longest field list one object's read returns. A class with more fields than
+/// this gets its first `MAX_FIELD_COLUMNS` plus a `fields_omitted` count, so the
+/// response stays bounded rather than growing with the class declaration.
+const MAX_FIELD_COLUMNS: usize = 128;
+
+/// Field names of the class at `class_addr`, subclass fields first and inherited
+/// ones after — the order HPROF lays the values down in, and the order the
+/// engine's own `owner_of` walk resolves them in.
+///
+/// A field the subclass re-declares shadows the inherited one: the engine
+/// resolves `s.name` to the first declaration down the chain, so the name is
+/// emitted once.
+fn field_names_of_class(p1: &hprof_analyzer::Pass1, class_addr: u64) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = class_addr;
+    // Guard a malformed `super_id` cycle rather than looping forever.
+    let mut hops = 0usize;
+    while let Some(ci) = p1.class_map.get(&cur) {
+        hops += 1;
+        if hops > 10_000 {
+            break;
+        }
+        for &(fname_id, _ty) in &ci.fields {
+            let Some(name) = p1.strings.get(&fname_id) else {
+                continue;
+            };
+            if !out.iter().any(|f| f == name) {
+                out.push(name.clone());
+            }
+        }
+        if ci.super_id == 0 {
+            break;
+        }
+        cur = ci.super_id;
+    }
+    out
+}
+
+/// Big-endian unsigned read of `n` (<= 8) bytes at `off`; `None` when the blob
+/// is too short — a corrupt record must yield nulls, not a panic.
+fn be(blob: &[u8], off: usize, n: usize) -> Option<u64> {
+    let bytes = blob.get(off..off + n)?;
+    Some(bytes.iter().fold(0u64, |a, &b| (a << 8) | b as u64))
+}
+
+/// Byte width of a constant-pool / static-field value: object refs are
+/// `id_size`, primitives their type width, unknown codes 1 (mirrors
+/// `pass1::value_size` so the walk stays aligned on a corrupt class dump).
+fn hprof_value_size(type_code: u8, id_size: u8) -> u64 {
+    match HprofType::from_code(type_code) {
+        Some(HprofType::Object) => id_size as u64,
+        Some(t) => t.byte_size() as u64,
+        None => 1,
+    }
+}
+
+/// Charge `n` bytes to a heap-dump segment's remaining length.
+fn consume(remaining: &mut u64, n: u64) -> std::io::Result<()> {
+    if *remaining < n {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "heap-dump segment ended mid-record while reading an object's fields",
+        ));
+    }
+    *remaining -= n;
+    Ok(())
+}
+
+/// Walk the dump once and return the instance blob of every address in
+/// `targets`, keyed by address. Each value is `(class_addr, blob)` where `blob`
+/// is the raw instance data `LiveResolver::field`'s offsets index into.
+///
+/// Stops as soon as every target has been seen, so the cost is bounded by the
+/// furthest target in the stream. The sub-record grammar mirrors
+/// `pass1::scan_heap_segment`; anything unrecognised is an error rather than a
+/// guess, so a mis-parse cannot silently produce wrong field values.
+fn collect_instance_blobs(
+    source: &hprof_analyzer::HprofSource,
+    id_size: u8,
+    targets: &std::collections::HashSet<u64>,
+) -> std::io::Result<std::collections::HashMap<u64, (u64, Vec<u8>)>> {
+    let ids = id_size as u64;
+    let mut found: std::collections::HashMap<u64, (u64, Vec<u8>)> =
+        std::collections::HashMap::with_capacity(targets.len());
+    if targets.is_empty() {
+        return Ok(found);
+    }
+    let mut r = source.open()?;
+    while let Some((tag, len)) = r.next_record()? {
+        if tag != tags::HEAP_DUMP && tag != tags::HEAP_DUMP_SEGMENT {
+            r.skip(len)?;
+            continue;
+        }
+        let mut remaining = len;
+        while remaining > 0 {
+            let sub_tag = r.u1()?;
+            consume(&mut remaining, 1)?;
+            match sub_tag {
+                heap::INSTANCE_DUMP => {
+                    let addr = r.id()?;
+                    r.skip(4)?; // stack_trace_serial
+                    let class_addr = r.id()?;
+                    let data_len = r.u4()? as u64;
+                    if targets.contains(&addr) {
+                        let blob = r.read_bytes(data_len as usize)?;
+                        found.insert(addr, (class_addr, blob));
+                        if found.len() == targets.len() {
+                            return Ok(found);
+                        }
+                    } else {
+                        r.skip(data_len)?;
+                    }
+                    consume(&mut remaining, ids + 4 + ids + 4 + data_len)?;
+                }
+                heap::OBJ_ARRAY_DUMP => {
+                    r.skip(ids + 4)?; // addr + stack_trace_serial
+                    let count = r.u4()? as u64;
+                    r.skip(ids)?; // element class id
+                    let byte_len = count.saturating_mul(ids);
+                    r.skip(byte_len)?;
+                    consume(&mut remaining, ids + 4 + 4 + ids + byte_len)?;
+                }
+                heap::PRIM_ARRAY_DUMP => {
+                    r.skip(ids + 4)?; // addr + stack_trace_serial
+                    let count = r.u4()? as u64;
+                    let elem_type = r.u1()?;
+                    let elem_size = HprofType::from_code(elem_type)
+                        .map(|t| t.byte_size() as u64)
+                        .unwrap_or(1);
+                    let byte_len = count.saturating_mul(elem_size);
+                    r.skip(byte_len)?;
+                    consume(&mut remaining, ids + 4 + 4 + 1 + byte_len)?;
+                }
+                heap::CLASS_DUMP => {
+                    // class_addr + stack_serial + super + loader + signers +
+                    // protection_domain + reserved1 + reserved2 + instance_size
+                    let mut n = 7 * ids + 8;
+                    r.skip(n)?;
+                    // Constant pool: u2 count, then (u2 index, u1 type, value).
+                    let cp = r.u2()? as u64;
+                    n += 2;
+                    for _ in 0..cp {
+                        r.skip(2)?;
+                        let t = r.u1()?;
+                        let vs = hprof_value_size(t, id_size);
+                        r.skip(vs)?;
+                        n += 3 + vs;
+                    }
+                    // Static fields: u2 count, then (id name, u1 type, value).
+                    let statics = r.u2()? as u64;
+                    n += 2;
+                    for _ in 0..statics {
+                        r.skip(ids)?;
+                        let t = r.u1()?;
+                        let vs = hprof_value_size(t, id_size);
+                        r.skip(vs)?;
+                        n += ids + 1 + vs;
+                    }
+                    // Instance fields: u2 count, then (id name, u1 type).
+                    let inst = r.u2()? as u64;
+                    n += 2;
+                    r.skip(inst.saturating_mul(ids + 1))?;
+                    n += inst * (ids + 1);
+                    consume(&mut remaining, n)?;
+                }
+                // Android ART: header identical to PRIM_ARRAY_DUMP, no payload.
+                heap::PRIM_ARRAY_NODATA_DUMP => {
+                    r.skip(ids + 4 + 4 + 1)?;
+                    consume(&mut remaining, ids + 4 + 4 + 1)?;
+                }
+                heap::HEAP_DUMP_INFO => {
+                    r.skip(4 + ids)?;
+                    consume(&mut remaining, 4 + ids)?;
+                }
+                // Roots whose payload is a single `id`.
+                heap::ROOT_UNKNOWN
+                | heap::ROOT_MONITOR_USED
+                | heap::ROOT_STICKY_CLASS
+                | heap::ROOT_SYSTEM_CLASS
+                | heap::ROOT_INTERNED_STRING
+                | heap::ROOT_DEBUGGER
+                | heap::ROOT_VM_INTERNAL => {
+                    r.skip(ids)?;
+                    consume(&mut remaining, ids)?;
+                }
+                heap::ROOT_JNI_GLOBAL => {
+                    r.skip(2 * ids)?;
+                    consume(&mut remaining, 2 * ids)?;
+                }
+                // `id` + thread serial + frame number.
+                heap::ROOT_JNI_LOCAL | heap::ROOT_JAVA_FRAME | heap::ROOT_JNI_MONITOR => {
+                    r.skip(ids + 8)?;
+                    consume(&mut remaining, ids + 8)?;
+                }
+                // `id` + thread serial.
+                heap::ROOT_NATIVE_STACK | heap::ROOT_THREAD_BLOCK => {
+                    r.skip(ids + 4)?;
+                    consume(&mut remaining, ids + 4)?;
+                }
+                // `id` + thread serial + stack_trace_serial.
+                heap::ROOT_THREAD_OBJ => {
+                    r.skip(ids + 8)?;
+                    consume(&mut remaining, ids + 8)?;
+                }
+                other => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "unknown heap sub-tag 0x{other:02x} while reading an object's fields"
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// Decode one field out of an instance blob into the panel's field JSON.
+///
+/// `kind` values are the ones the frontend already switches on (`null`, `bool`,
+/// `int`, `float`, `str`, `ref`); a reference carries the target's `dense_idx`
+/// and `display_class` so the panel can navigate to it.
+fn field_json(
+    name: &str,
+    ty: HprofType,
+    blob: &[u8],
+    off: usize,
+    id_size: usize,
+    resolver: &hprof_analyzer::query::run::LiveResolver<'_>,
+    class_names_by_idx: &[String],
+) -> serde_json::Value {
+    let null = || serde_json::json!({"name": name, "kind": "null", "value": null});
+    match ty {
+        HprofType::Object => {
+            let Some(addr) = be(blob, off, id_size) else {
+                return null();
+            };
+            if addr == 0 {
+                return null();
+            }
+            let idx = resolver.index_of_addr(addr);
+            let display_class = idx
+                .and_then(|i| class_names_by_idx.get(i).cloned())
+                .unwrap_or_else(|| "?".to_string());
+            let mut v = serde_json::json!({
+                "name": name,
+                "kind": "ref",
+                "display_class": display_class,
+            });
+            if let Some(i) = idx {
+                v["dense_idx"] = serde_json::json!(i as u32);
+            }
+            v
+        }
+        HprofType::Boolean => match blob.get(off) {
+            Some(&b) => serde_json::json!({"name": name, "kind": "bool", "value": b != 0}),
+            None => null(),
+        },
+        HprofType::Byte => match be(blob, off, 1) {
+            Some(v) => serde_json::json!({"name": name, "kind": "int", "value": v as u8 as i8}),
+            None => null(),
+        },
+        HprofType::Short => match be(blob, off, 2) {
+            Some(v) => serde_json::json!({"name": name, "kind": "int", "value": v as u16 as i16}),
+            None => null(),
+        },
+        // A char is its code point (the engine's `decode_field` does the same).
+        HprofType::Char => match be(blob, off, 2) {
+            Some(v) => serde_json::json!({"name": name, "kind": "int", "value": v}),
+            None => null(),
+        },
+        HprofType::Int => match be(blob, off, 4) {
+            Some(v) => serde_json::json!({"name": name, "kind": "int", "value": v as u32 as i32}),
+            None => null(),
+        },
+        HprofType::Long => match be(blob, off, 8) {
+            Some(v) => serde_json::json!({"name": name, "kind": "int", "value": v as i64}),
+            None => null(),
+        },
+        HprofType::Float => match be(blob, off, 4) {
+            Some(v) => serde_json::json!({
+                "name": name, "kind": "float", "value": f32::from_bits(v as u32) as f64
+            }),
+            None => null(),
+        },
+        HprofType::Double => match be(blob, off, 8) {
+            Some(v) => serde_json::json!({
+                "name": name, "kind": "float", "value": f64::from_bits(v)
+            }),
+            None => null(),
+        },
+    }
+}
+
+/// Decode `class_addr`'s instance fields out of `blob`. Returns the field JSON
+/// plus how many fields the class declares (so the caller can report what the
+/// [`MAX_FIELD_COLUMNS`] cap left out).
+fn decode_instance_fields(
+    p1: &hprof_analyzer::Pass1,
+    resolver: &hprof_analyzer::query::run::LiveResolver<'_>,
+    class_names_by_idx: &[String],
+    class_addr: u64,
+    blob: &[u8],
+    id_size: usize,
+) -> (Vec<serde_json::Value>, usize) {
+    let names = field_names_of_class(p1, class_addr);
+    let declared = names.len();
+    let mut out = Vec::new();
+    for name in names.into_iter().take(MAX_FIELD_COLUMNS) {
+        // A name with no resolvable offset is not a field of this class after
+        // all — skip it rather than report a phantom null.
+        let Some((off, ty)) = resolver.field(class_addr, &name) else {
+            continue;
+        };
+        out.push(field_json(
+            &name,
+            ty,
+            blob,
+            off as usize,
+            id_size,
+            resolver,
+            class_names_by_idx,
+        ));
+    }
+    (out, declared)
+}
+
+/// What reading one object's fields produced.
+enum FieldsOut {
+    /// The object's fields, plus how many the class declares (the
+    /// [`MAX_FIELD_COLUMNS`] cap may have left some out).
+    Decoded(Vec<serde_json::Value>, usize),
+    /// The dense index does not name an instance record — an array, a class
+    /// object, or an index the dump no longer holds. The string says which, so
+    /// the panel can explain the empty list instead of showing nothing.
+    NotAnInstance(String),
+}
+
+/// Shape one read outcome as the panel's response JSON.
+fn fields_response(out: &FieldsOut) -> String {
+    match out {
+        FieldsOut::Decoded(fields, declared) => {
+            let mut v = serde_json::json!({"ok": true, "fields": fields});
+            let omitted = declared.saturating_sub(fields.len());
+            if omitted > 0 {
+                // Bounded output: say what the cap (or an unresolvable offset)
+                // left out rather than returning a partial list silently.
+                v["fields_omitted"] = serde_json::json!(omitted);
+                v["fields_omitted_note"] = serde_json::json!(format!(
+                    "read {} of the {declared} instance fields this class declares \
+                     (cap: MAX_FIELD_COLUMNS = {MAX_FIELD_COLUMNS})",
+                    fields.len()
+                ));
+            }
+            v.to_string()
+        }
+        FieldsOut::NotAnInstance(note) => {
+            serde_json::json!({"ok": true, "fields": [], "note": note}).to_string()
+        }
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // ExplorationHolder
 // ──────────────────────────────────────────────────────────────────────────────
@@ -964,110 +1351,141 @@ impl HprofSession {
 
     /// Returns primitive and reference field values for a single object.
     ///
-    /// Uses the OQL engine to run `SELECT * FROM ClassName s WHERE s.@objectId = N`
-    /// and maps the result columns to typed field entries.
+    /// The values are read out of the dump's bytes — see the "Reading an
+    /// object's fields" section above for why the OQL engine cannot answer this
+    /// (`SELECT *` means "the object itself", and a spelled-out projection
+    /// returns Null for every reference-typed field).
     ///
     /// Returns `{"ok":true,"fields":[{"name":"size","kind":"int","value":47823},{"name":"table","kind":"ref","display_class":"Entry[]","dense_idx":1234},...]}`.
-    /// On failure: `{"ok":false,"error":"..."}`.
-    /// Requires the OQL cache to have been built (call `query()` at least once, or `run_full_analysis()`).
+    /// An array or a class object has no instance fields: `fields` is empty and
+    /// `note` says so, rather than leaving the panel to guess. On failure:
+    /// `{"ok":false,"error":"..."}`.
+    /// Requires `enable_exploration()` to have been called first.
     pub fn get_field_values(&mut self, dense_idx: u32) -> String {
-        use hprof_analyzer::query::model::QueryValue;
-        use hprof_analyzer::query::{optimize, parse, plan, run};
-
-        let exp = match self.exploration.as_ref() {
-            Some(e) => &e.result,
-            None => {
-                return serde_json::json!({"ok":false,"error":"exploration_not_enabled"})
-                    .to_string();
-            }
-        };
-
-        let i = dense_idx as usize;
-        let class_name = match exp.class_names_by_idx.get(i) {
-            Some(c) if !c.is_empty() => c.clone(),
-            _ => return serde_json::json!({"ok":false,"error":"out_of_range"}).to_string(),
-        };
-
-        // Build a single-object OQL query
-        let oql = format!(
-            "SELECT * FROM {} s WHERE s.@objectId = {}",
-            class_name, dense_idx
-        );
-
-        let q = match parse::parse_or_report(&oql) {
-            Ok(q) => q,
+        let mut outs = match self.object_fields(&[dense_idx]) {
+            Ok(v) => v,
             Err(e) => return serde_json::json!({"ok":false,"error":e}).to_string(),
         };
-        let plan_result = match plan::plan_query(&q, 5) {
-            Ok(p) => p,
-            Err(e) => return serde_json::json!({"ok":false,"error":e.0}).to_string(),
+        fields_response(&outs.remove(0))
+    }
+
+    /// Like `get_field_values`, but for many objects in ONE pass over the dump.
+    ///
+    /// The panel's "scan a field across instances" view asks about up to 50
+    /// objects at once; one pass per object would decompress and walk the dump
+    /// 50 times. Returns `{"ok":true,"objects":[...]}` in the order asked, each
+    /// entry shaped like a single `get_field_values` result plus its
+    /// `dense_idx`.
+    pub fn get_field_values_many(&mut self, indices: Vec<u32>) -> String {
+        let outs = match self.object_fields(&indices) {
+            Ok(v) => v,
+            Err(e) => return serde_json::json!({"ok":false,"error":e}).to_string(),
         };
-        let optimized = optimize::optimize(plan_result, &q, &optimize::SchemaStats::default());
-
-        if self.cache.is_none() {
-            match run::ReplCache::build(&self.source, true) {
-                Ok(c) => self.cache = Some(c),
-                Err(e) => return serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
-            }
-        }
-        let cache = self.cache.as_ref().unwrap();
-
-        let results = if !self.has_any_retained() {
-            run::run_resident_only(cache, &[(q, optimized)], true)
-        } else {
-            match self.decompress_retained() {
-                Ok(retained) => {
-                    run::run_resident_with_retained(cache, &[(q, optimized)], true, &retained)
-                }
-                Err(e) => return serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
-            }
-        };
-
-        let result = match results {
-            Ok(mut r) => r.remove(0),
-            Err(e) => return serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
-        };
-
-        if let Some(err) = &result.error {
-            return serde_json::json!({"ok":false,"error":err}).to_string();
-        }
-
-        // Columns are the field names; rows[0] is the single matching object
-        let row = match result.rows.into_iter().next() {
-            Some(r) => r,
-            None => return serde_json::json!({"ok":true,"fields":[]}).to_string(),
-        };
-
-        let fields: Vec<serde_json::Value> = result
-            .columns
+        let objects: Vec<serde_json::Value> = indices
             .iter()
-            .zip(row.iter())
-            .map(|(col, val)| match val {
-                QueryValue::Null => {
-                    serde_json::json!({"name": col.name, "kind": "null", "value": null})
-                }
-                QueryValue::Bool(b) => {
-                    serde_json::json!({"name": col.name, "kind": "bool", "value": b})
-                }
-                QueryValue::Int(n) => {
-                    serde_json::json!({"name": col.name, "kind": "int", "value": n})
-                }
-                QueryValue::Float(f) => {
-                    serde_json::json!({"name": col.name, "kind": "float", "value": f})
-                }
-                QueryValue::Str(s) => {
-                    serde_json::json!({"name": col.name, "kind": "str", "value": s})
-                }
-                QueryValue::ObjRef { index, class, .. } => serde_json::json!({
-                    "name": col.name,
-                    "kind": "ref",
-                    "display_class": class,
-                    "dense_idx": index,
-                }),
+            .zip(outs.iter())
+            .map(|(&i, o)| {
+                let mut v: serde_json::Value =
+                    serde_json::from_str(&fields_response(o)).unwrap_or_default();
+                v["dense_idx"] = serde_json::json!(i);
+                v
             })
             .collect();
+        serde_json::json!({"ok": true, "objects": objects}).to_string()
+    }
 
-        serde_json::json!({"ok": true, "fields": fields}).to_string()
+    /// Read the fields of every requested object in a single pass over the dump.
+    ///
+    /// One `Err` for the whole call when the dump cannot be read at all;
+    /// per-object outcomes (including "this is an array, not an instance") come
+    /// back as [`FieldsOut`] entries in the order requested.
+    fn object_fields(&mut self, indices: &[u32]) -> Result<Vec<FieldsOut>, String> {
+        if self.exploration.is_none() {
+            return Err("exploration_not_enabled".into());
+        }
+        if self.cache.is_none() {
+            match hprof_analyzer::query::run::ReplCache::build(&self.source, true) {
+                Ok(c) => self.cache = Some(c),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        let cache = self.cache.as_ref().expect("cache just built");
+        let id_size = cache.id_size;
+        let n = cache.p1.kind.len();
+        let resolver = hprof_analyzer::query::run::LiveResolver::new(
+            &cache.p1.class_map,
+            &cache.p1.strings,
+            cache.id_size,
+            &cache.p1.id_map,
+            &cache.shallow,
+        );
+
+        // Resolve every requested index to an address up front so the walk below
+        // needs a single pass for all of them. A non-instance object has no
+        // address to look for — its `kind` says what it is.
+        let mut addrs: Vec<Option<u64>> = Vec::with_capacity(indices.len());
+        let mut targets: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for &i in indices {
+            let idx = i as usize;
+            if idx < n && cache.p1.kind[idx] == 0 {
+                let a = resolver.addr_of(idx).unwrap_or(0);
+                if a != 0 {
+                    targets.insert(a);
+                }
+                addrs.push((a != 0).then_some(a));
+            } else {
+                addrs.push(None);
+            }
+        }
+
+        let blobs = collect_instance_blobs(&self.source, id_size as u8, &targets)
+            .map_err(|e| e.to_string())?;
+        let no_names: Vec<String> = Vec::new();
+        let class_names_by_idx: &[String] = match self.exploration.as_ref() {
+            Some(e) => &e.result.class_names_by_idx,
+            None => &no_names,
+        };
+
+        let mut out = Vec::with_capacity(indices.len());
+        for (k, &i) in indices.iter().enumerate() {
+            let idx = i as usize;
+            if idx >= n {
+                out.push(FieldsOut::NotAnInstance(format!(
+                    "dense index {i} is out of range (0..{n})"
+                )));
+                continue;
+            }
+            match addrs[k] {
+                None => {
+                    let what = match cache.p1.kind[idx] {
+                        1 => "an object array",
+                        2 => "a primitive array",
+                        3 => "a class object",
+                        _ => "not an instance record",
+                    };
+                    out.push(FieldsOut::NotAnInstance(format!(
+                        "object {i} is {what}; it has no instance fields to read"
+                    )));
+                }
+                Some(a) => match blobs.get(&a) {
+                    Some((class_addr, blob)) => {
+                        let (fields, declared) = decode_instance_fields(
+                            &cache.p1,
+                            &resolver,
+                            class_names_by_idx,
+                            *class_addr,
+                            blob,
+                            id_size,
+                        );
+                        out.push(FieldsOut::Decoded(fields, declared));
+                    }
+                    None => out.push(FieldsOut::NotAnInstance(format!(
+                        "object {i} (0x{a:x}) has no INSTANCE_DUMP record in this dump"
+                    ))),
+                },
+            }
+        }
+        Ok(out)
     }
 
     /// Returns up to `max_paths` distinct shortest paths from `dense_idx` to GC roots.
@@ -1194,8 +1612,7 @@ impl HprofSession {
     ///
     /// Strategy:
     /// 1. Identify the collection kind + backing-array field via `collection_info`.
-    /// 2. Run `SELECT * FROM ClassName WHERE @objectId = N` to get the field values,
-    ///    locate the backing array field, and retrieve its dense index.
+    /// 2. Read the object's fields and locate the backing array's dense index.
     /// 3. Call `outbound_refs` on the array to enumerate entries.
     ///
     /// Returns `{"ok":true,"type":"map","entries":[{"key_idx":N,"key_class":"...","val_idx":M,"val_class":"..."},...],"truncated":bool}`
@@ -1203,9 +1620,6 @@ impl HprofSession {
     /// for list/set types.
     /// Returns `{"ok":true,"type":"unknown"}` when the class is not a known collection.
     pub fn get_collection_entries(&mut self, dense_idx: u32, limit: u32) -> String {
-        use hprof_analyzer::query::model::QueryValue;
-        use hprof_analyzer::query::{optimize, parse, plan, run};
-
         // Extract class_name from exploration (borrow released after clone)
         let class_name: String = {
             let h = match self.exploration.as_ref() {
@@ -1227,61 +1641,31 @@ impl HprofSession {
             None => return serde_json::json!({"ok":true,"type":"unknown"}).to_string(),
         };
 
-        // Step 1: get field values for this object to find the backing array dense_idx
-        let oql = format!(
-            "SELECT * FROM {} s WHERE s.@objectId = {}",
-            class_name, dense_idx
-        );
-        let q = match parse::parse_or_report(&oql) {
-            Ok(q) => q,
+        // Step 1: read this object's fields to find the backing array's dense
+        // index. This used to run `SELECT *` and look for a column named after
+        // the array field — but `SELECT *` yields a single column named `*`, so
+        // the lookup always failed and every collection reported "unknown".
+        let mut outs = match self.object_fields(&[dense_idx]) {
+            Ok(v) => v,
             Err(e) => return serde_json::json!({"ok":false,"error":e}).to_string(),
         };
-        let plan_result = match plan::plan_query(&q, 5) {
-            Ok(p) => p,
-            Err(e) => return serde_json::json!({"ok":false,"error":e.0}).to_string(),
+        let array_dense_idx: u32 = match outs.remove(0) {
+            FieldsOut::Decoded(fields, _) => fields
+                .iter()
+                .find(|f| f["name"] == serde_json::json!(array_field) && f["kind"] == "ref")
+                .and_then(|f| f["dense_idx"].as_u64())
+                .map(|i| i as u32)
+                .unwrap_or_else(|| {
+                    // The field is absent or null: an empty collection, or a
+                    // class whose backing array is not where we expect it.
+                    u32::MAX
+                }),
+            FieldsOut::NotAnInstance(_) => u32::MAX,
         };
-        let optimized = optimize::optimize(plan_result, &q, &optimize::SchemaStats::default());
-
-        if self.cache.is_none() {
-            match run::ReplCache::build(&self.source, true) {
-                Ok(c) => self.cache = Some(c),
-                Err(e) => return serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
-            }
+        if array_dense_idx == u32::MAX {
+            return serde_json::json!({"ok":true,"type":coll_type,"entries":[],"truncated":false})
+                .to_string();
         }
-        let cache = self.cache.as_ref().unwrap();
-
-        let results = if !self.has_any_retained() {
-            run::run_resident_only(cache, &[(q, optimized)], true)
-        } else {
-            match self.decompress_retained() {
-                Ok(retained) => {
-                    run::run_resident_with_retained(cache, &[(q, optimized)], true, &retained)
-                }
-                Err(e) => return serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
-            }
-        };
-
-        let result = match results {
-            Ok(mut r) => r.remove(0),
-            Err(e) => return serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
-        };
-
-        if let Some(err) = &result.error {
-            return serde_json::json!({"ok":false,"error":err}).to_string();
-        }
-
-        // Find the backing array field in the OQL result columns
-        let array_dense_idx: u32 = {
-            let col_idx = result.columns.iter().position(|c| c.name == array_field);
-            let row = result.rows.into_iter().next();
-            match (col_idx, row) {
-                (Some(ci), Some(ref row)) => match row.get(ci) {
-                    Some(QueryValue::ObjRef { index, .. }) => *index as u32,
-                    _ => return serde_json::json!({"ok":true,"type":"unknown"}).to_string(),
-                },
-                _ => return serde_json::json!({"ok":true,"type":"unknown"}).to_string(),
-            }
-        };
 
         // Step 2: outbound refs of the backing array — these are the entries
         let h = match self.exploration.as_ref() {
@@ -1874,4 +2258,325 @@ pub fn complete(line: &str, cursor_pos: usize, class_names: Vec<String>) -> Stri
         })
         .collect();
     serde_json::Value::Array(arr).to_string()
+}
+
+#[cfg(test)]
+mod field_reading_tests {
+    use super::*;
+    use hprof_analyzer::types::HprofType;
+    use hprof_analyzer::{ClassInfo, Pass1};
+
+    /// Build a `Pass1` with one class whose super-chain declares `fields`.
+    ///
+    /// `chain[0]` is the class itself (subclass), later entries its supers —
+    /// the order HPROF lays instance values down in.
+    fn class_with_chain(chain: &[Vec<&str>]) -> Pass1 {
+        let mut p1 = Pass1::default();
+        let mut next_string = 1u64;
+        let mut name_ids: Vec<u64> = Vec::new();
+        for (i, _) in chain.iter().enumerate() {
+            name_ids.push(next_string);
+            p1.strings.insert(next_string, format!("com.example.C{i}"));
+            next_string += 1;
+        }
+        for (i, fields) in chain.iter().enumerate() {
+            let mut f = Vec::new();
+            for name in fields {
+                p1.strings.insert(next_string, (*name).to_string());
+                f.push((next_string, HprofType::Int));
+                next_string += 1;
+            }
+            let super_id = if i + 1 < chain.len() {
+                0x1000 + i as u64 + 1
+            } else {
+                0
+            };
+            p1.class_map.insert(
+                0x1000 + i as u64,
+                ClassInfo {
+                    name_id: name_ids[i],
+                    super_id,
+                    loader_id: 0,
+                    instance_size: 0,
+                    fields: f,
+                    static_obj_count: 0,
+                    static_prim_bytes: 0,
+                    statics: Vec::new(),
+                },
+            );
+        }
+        p1
+    }
+
+    /// A subclass field shadows an inherited one of the same name: the engine
+    /// resolves a field to the first declaration down the chain, so the name
+    /// must appear exactly once, subclass first.
+    #[test]
+    fn inherited_fields_are_included_and_shadowed_ones_collapse() {
+        let p1 = class_with_chain(&[vec!["value", "own"], vec!["value", "inherited"]]);
+        let names = field_names_of_class(&p1, 0x1000);
+        assert_eq!(names, vec!["value", "own", "inherited"]);
+    }
+
+    /// An unknown class address yields no field names, not a panic.
+    #[test]
+    fn unknown_class_address_has_no_instance_fields() {
+        let p1 = class_with_chain(&[vec!["value"]]);
+        assert!(field_names_of_class(&p1, 0x9999).is_empty());
+    }
+
+    /// Big-endian reads of every width, and a short blob yielding `None`
+    /// rather than a panic.
+    #[test]
+    fn be_reads_big_endian_and_refuses_short_blobs() {
+        assert_eq!(be(&[0x01, 0x02, 0x03, 0x04], 0, 4), Some(0x0102_0304));
+        assert_eq!(be(&[0x01, 0x02, 0x03, 0x04], 0, 1), Some(1));
+        assert_eq!(be(&[0x01, 0x02], 1, 2), None);
+        assert_eq!(be(&[], 0, 1), None);
+    }
+
+    /// A capped read reports what it left out rather than a silently short list.
+    #[test]
+    fn fields_response_reports_what_the_cap_left_out() {
+        let fields = vec![serde_json::json!({"name": "a", "kind": "int", "value": 1})];
+        let out: serde_json::Value =
+            serde_json::from_str(&fields_response(&FieldsOut::Decoded(fields, 5))).unwrap();
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["fields_omitted"], 4);
+        assert!(
+            out["fields_omitted_note"]
+                .as_str()
+                .unwrap()
+                .contains("MAX_FIELD_COLUMNS")
+        );
+    }
+
+    /// An array's read outcome carries a reason, never a bare empty list.
+    #[test]
+    fn non_instance_outcome_explains_itself() {
+        let out: serde_json::Value = serde_json::from_str(&fields_response(
+            &FieldsOut::NotAnInstance("object 7 is a primitive array".into()),
+        ))
+        .unwrap();
+        assert_eq!(out["ok"], true);
+        assert!(out["fields"].as_array().unwrap().is_empty());
+        assert!(
+            out["note"].as_str().unwrap().contains("primitive array"),
+            "got {out}"
+        );
+    }
+
+    // ── end-to-end through the real session ──────────────────────────────────
+
+    fn fixture_bytes() -> Option<Vec<u8>> {
+        let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/dump_4_philosophers.hprof");
+        let b = std::fs::read(&p).ok()?;
+        (b.len() >= 1024).then_some(b)
+    }
+
+    fn session() -> Option<HprofSession> {
+        let mut s = HprofSession::load(fixture_bytes()?, "dump_4_philosophers.hprof").ok()?;
+        s.enable_exploration().ok()?;
+        Some(s)
+    }
+
+    /// The first dense index whose Pass1 `kind` byte is `kind`
+    /// (0 = instance, 1 = object array, 2 = primitive array, 3 = class object).
+    fn first_index_of_kind(s: &HprofSession, kind: u8) -> Option<u32> {
+        let cache = s.cache.as_ref()?;
+        cache
+            .p1
+            .kind
+            .iter()
+            .position(|&k| k == kind)
+            .map(|i| i as u32)
+    }
+
+    fn dense_index_of(s: &HprofSession, class_needle: &str) -> Option<u32> {
+        let m: serde_json::Value = serde_json::from_str(&s.find_instances(class_needle, 5)).ok()?;
+        m["matches"][0]["dense_idx"].as_u64().map(|i| i as u32)
+    }
+
+    /// The bug this fixes: the panel got one column named `*` (and no fields),
+    /// because `SELECT *` means "the object itself". Field values must now come
+    /// back decoded — including the *reference* fields, which the OQL engine
+    /// cannot produce at all (its `decode_field` ends in `Object => Null`).
+    #[test]
+    fn field_values_decode_primitives_and_references() {
+        let Some(s) = session() else {
+            return;
+        };
+        let Some(idx) = dense_index_of(&s, "HashMap$Node") else {
+            return;
+        };
+        let mut s = s;
+        let v: serde_json::Value = serde_json::from_str(&s.get_field_values(idx)).unwrap();
+        assert_eq!(v["ok"], true, "got {v}");
+        let fields = v["fields"].as_array().expect("fields");
+        let names: Vec<&str> = fields.iter().filter_map(|f| f["name"].as_str()).collect();
+        assert!(!names.contains(&"*"), "SELECT * regression: {names:?}");
+        assert!(names.contains(&"hash"), "got {names:?}");
+        assert!(names.contains(&"key"), "got {names:?}");
+        assert!(names.contains(&"value"), "got {names:?}");
+        assert!(names.contains(&"next"), "got {names:?}");
+
+        // `hash` is a primitive and must decode to a number...
+        let hash = fields.iter().find(|f| f["name"] == "hash").unwrap();
+        assert_eq!(hash["kind"], "int");
+        assert!(hash["value"].is_number(), "primitive must decode: {hash}");
+
+        // ...and `key` a reference to a String, which the panel navigates by
+        // `dense_idx`. This is exactly what the OQL route returns Null for.
+        let key = fields.iter().find(|f| f["name"] == "key").unwrap();
+        assert_eq!(key["kind"], "ref", "reference field must decode: {key}");
+        assert_eq!(key["display_class"], "java.lang.String");
+        assert!(key["dense_idx"].is_number(), "ref must carry dense_idx");
+    }
+
+    /// Digit-for-digit parity with the CLI for one known object.
+    ///
+    /// `heap inspect <dump> --index 2 --json` on this fixture reports
+    /// `hash` 97508, `key` -> String 220348, `value` -> String 224154, and a
+    /// null `next`. The WASM reader must agree exactly, or the two entry points
+    /// are describing different objects.
+    #[test]
+    fn field_values_match_the_cli_for_a_known_object() {
+        let Some(mut s) = session() else {
+            return;
+        };
+        let v: serde_json::Value = serde_json::from_str(&s.get_field_values(2)).unwrap();
+        assert_eq!(v["ok"], true, "got {v}");
+        let fields = v["fields"].as_array().expect("fields");
+        let get = |n: &str| {
+            fields
+                .iter()
+                .find(|f| f["name"] == n)
+                .unwrap_or_else(|| panic!("no field {n} in {v}"))
+                .clone()
+        };
+        assert_eq!(get("hash")["value"], 97508);
+        assert_eq!(get("key")["kind"], "ref");
+        assert_eq!(get("key")["dense_idx"], 220348);
+        assert_eq!(get("key")["display_class"], "java.lang.String");
+        assert_eq!(get("value")["dense_idx"], 224154);
+        assert_eq!(get("next")["kind"], "null");
+    }
+
+    /// The dense indices this reader reports agree with the exploration's own
+    /// tables — otherwise the panel would navigate to the wrong object.
+    #[test]
+    fn addresses_agree_with_the_exploration_index() {
+        let Some(s) = session() else {
+            return;
+        };
+        let cache = s.cache.as_ref().expect("cache built by load()");
+        let exp = &s.exploration.as_ref().unwrap().result;
+        assert!(!exp.addrs.is_empty(), "exploration must carry addresses");
+        for i in [0usize, 1, 2, 100, 1000] {
+            if i >= exp.addrs.len() {
+                continue;
+            }
+            let a = cache.p1.id_map.addr_at(i);
+            assert_eq!(
+                a, exp.addrs[i],
+                "dense index {i}: query cache says 0x{a:x}, exploration says 0x{:x}",
+                exp.addrs[i]
+            );
+        }
+    }
+
+    /// An array has no instance fields, so the panel gets an empty list plus a
+    /// reason — never a silent empty result.
+    #[test]
+    fn field_values_explain_array_classes() {
+        let Some(mut s) = session() else {
+            return;
+        };
+        // kind 2 is a primitive array (see `pass1`); pick one directly rather
+        // than by class name, which for an array is not a dotted name.
+        let Some(idx) = first_index_of_kind(&s, 2) else {
+            return;
+        };
+        let v: serde_json::Value = serde_json::from_str(&s.get_field_values(idx)).unwrap();
+        assert_eq!(v["ok"], true, "got {v}");
+        assert!(v["fields"].as_array().unwrap().is_empty());
+        let note = v["note"].as_str().unwrap_or("");
+        assert!(
+            note.contains("array"),
+            "an array must explain why it has no fields, got {note:?}"
+        );
+    }
+
+    /// A class object has no instance record either; it must say so.
+    #[test]
+    fn field_values_explain_class_objects() {
+        let Some(mut s) = session() else {
+            return;
+        };
+        // kind 3 is a class object.
+        let Some(idx) = first_index_of_kind(&s, 3) else {
+            return;
+        };
+        let v: serde_json::Value = serde_json::from_str(&s.get_field_values(idx)).unwrap();
+        assert_eq!(v["ok"], true, "got {v}");
+        assert!(v["fields"].as_array().unwrap().is_empty());
+        assert!(
+            v["note"].as_str().unwrap_or("").contains("class object"),
+            "got {v}"
+        );
+    }
+
+    /// The batch call answers for many objects in one pass, in the order asked.
+    #[test]
+    fn many_field_values_keep_the_order_and_the_shape() {
+        let Some(mut s) = session() else {
+            return;
+        };
+        let Some(idx) = dense_index_of(&s, "HashMap$Node") else {
+            return;
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&s.get_field_values_many(vec![idx, 0])).unwrap();
+        assert_eq!(v["ok"], true, "got {v}");
+        let objects = v["objects"].as_array().expect("objects");
+        assert_eq!(objects.len(), 2);
+        assert_eq!(objects[0]["dense_idx"], idx);
+        assert_eq!(objects[1]["dense_idx"], 0);
+        assert!(
+            objects[0]["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["name"] == "hash"),
+            "first entry must be the requested object: {v}"
+        );
+    }
+
+    /// A HashMap's backing-array field must resolve now: `get_collection_entries`
+    /// used to look for a column named `table` in a `SELECT *` result, which
+    /// never had one, so every collection reported "unknown".
+    #[test]
+    fn collection_entries_resolve_the_backing_array() {
+        let Some(mut s) = session() else {
+            return;
+        };
+        let m: serde_json::Value = serde_json::from_str(&s.find_instances("HashMap", 50)).unwrap();
+        // `collection_info` keys on the exact class name, so pick the real
+        // `java.util.HashMap` and not, say, one of its `$Node`s.
+        let Some(idx) = m["matches"].as_array().and_then(|a| {
+            a.iter()
+                .find(|x| x["display_class"] == "java.util.HashMap")
+                .and_then(|x| x["dense_idx"].as_u64())
+        }) else {
+            return;
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&s.get_collection_entries(idx as u32, 10)).unwrap();
+        assert_eq!(v["ok"], true, "got {v}");
+        assert_ne!(
+            v["type"], "unknown",
+            "a HashMap must be recognised and its backing array resolved: {v}"
+        );
+    }
 }
