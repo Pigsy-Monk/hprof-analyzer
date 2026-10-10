@@ -139,27 +139,31 @@ pub struct ArrayRead {
     pub elem_class_addr: u64,
     /// Total element count, whether or not every element was decoded.
     pub count: u64,
-    /// The first `cap` elements (fewer when `count` is smaller).
+    /// How many leading elements were skipped (see `read_array_at`'s `skip`).
+    pub skipped: u64,
+    /// The first `cap` elements at or after `skip` (fewer when the array runs out).
     pub values: Vec<FieldValue>,
 }
 
 impl ArrayRead {
-    /// True when `values` holds only a prefix of the array.
+    /// True when `values` holds only a slice of the array.
     pub fn truncated(&self) -> bool {
-        self.count > self.values.len() as u64
+        self.count > self.skipped + self.values.len() as u64
     }
 }
 
 /// Read the array record (`OBJ_ARRAY_DUMP` / `PRIM_ARRAY_DUMP`) at `offset`.
 ///
-/// `cap` bounds how many elements are decoded and returned — a
-/// `byte[100_000_000]` must not become a 100 MB JSON array. Callers that want
-/// text pass a string-sized cap; callers rendering an array pass
-/// `MAX_ARRAY_ELEMENTS`.
+/// `skip` elements are stepped over before `cap` of them are decoded and
+/// returned — a `byte[100_000_000]` must not become a 100 MB JSON array, and a
+/// pre-Java-9 `String` whose `value` is a slice of a shared `char[]` must be
+/// readable from its own `offset` rather than from element 0. Callers rendering
+/// an array pass `skip = 0`.
 pub fn read_array_at(
     path: &Path,
     offset: u64,
     id_size: usize,
+    skip: u64,
     cap: usize,
 ) -> io::Result<Option<ArrayRead>> {
     if offset == 0 {
@@ -209,12 +213,24 @@ pub fn read_array_at(
         (Some(ty), 0)
     };
 
-    let n = count.min(cap as u64) as usize;
     let elem_size = if is_obj {
         id_size
     } else {
         elem_ty.map(|t| t.byte_size()).unwrap_or(0)
     };
+    // Never skip past the end: a bogus offset in a corrupt dump would otherwise
+    // seek beyond the record and read whatever follows it.
+    let skipped = skip.min(count);
+    let n = (count - skipped).min(cap as u64) as usize;
+    if skipped > 0 && elem_size > 0 {
+        let step = (skipped as u128) * (elem_size as u128);
+        f.seek(SeekFrom::Current(i64::try_from(step).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("implausible array skip {skipped}×{elem_size} at offset {offset}"),
+            )
+        })?))?;
+    }
     let mut values = Vec::with_capacity(n);
     if elem_size > 0 && n > 0 {
         // n is capped, so this is at most `cap * 8` bytes.
@@ -238,6 +254,7 @@ pub fn read_array_at(
         elem_ty,
         elem_class_addr,
         count,
+        skipped,
         values,
     }))
 }

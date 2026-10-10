@@ -6099,6 +6099,7 @@ fn inspect_array(
         path,
         offset,
         sess.pass1.id_size as usize,
+        0,
         objread::MAX_ARRAY_ELEMENTS,
     )?
     else {
@@ -6210,6 +6211,12 @@ fn string_text(
     let path = std::path::Path::new(dump);
     let id_size = sess.pass1.id_size as usize;
     let idx = sess.index_of_addr(addr)?;
+    // Only a plain instance can be a String. Anything else — an array, a class
+    // object — is an expected miss, so it must not fall through to the
+    // error-swallowing read below and be mistaken for a read failure.
+    if sess.pass1.kind.get(idx).copied().unwrap_or(0) != 0 {
+        return None;
+    }
     let offset = *offsets.get(idx)?;
     if offset == 0 {
         return None;
@@ -6240,29 +6247,50 @@ fn string_text(
     if voff == 0 {
         return None;
     }
-    let arr = objread::read_array_at(path, voff, id_size, objread::MAX_STRING_CHARS).ok()??;
-    let (text, full_len) = match arr.elem_ty {
-        Some(HprofType::Byte) => (objread::text_from_bytes(&arr.values, coder), arr.count),
-        Some(HprofType::Char) => {
-            // Pre-9: `value` may be a shared backing array; `offset`/`count` select
-            // the window this String owns.
-            let off = joffset.unwrap_or(0).max(0) as usize;
-            let cnt = jcount
+    // Pre-9 a String may share a `char[]` and own a window of it, so start the
+    // read at that window rather than at element 0: a String whose text begins
+    // past the cap must still decode, not come back empty.
+    let skip = joffset.unwrap_or(0).max(0) as u64;
+    let arr =
+        objread::read_array_at(path, voff, id_size, skip, objread::MAX_STRING_CHARS).ok()??;
+    let ty = arr.elem_ty?;
+    let text = match ty {
+        HprofType::Byte => objread::text_from_bytes(&arr.values, coder),
+        // A shared `char[]` may extend past this String's own window.
+        HprofType::Char => {
+            let n = jcount
                 .map(|c| c.max(0) as usize)
-                .unwrap_or_else(|| arr.values.len().saturating_sub(off));
-            let end = off.saturating_add(cnt).min(arr.values.len());
-            let window: &[objread::FieldValue] = if off < arr.values.len() {
-                &arr.values[off..end]
-            } else {
-                &[]
-            };
-            (objread::text_from_chars(window), arr.count)
+                .unwrap_or(arr.values.len())
+                .min(arr.values.len());
+            objread::text_from_chars(&arr.values[..n])
         }
         _ => return None,
     };
-    let truncated = arr.truncated() || text.chars().count() > objread::MAX_STRING_CHARS;
+    let full_chars = full_char_len(ty, coder, arr.count, jcount);
+    let truncated = full_chars > text.chars().count() as u64;
     let text: String = text.chars().take(objread::MAX_STRING_CHARS).collect();
-    Some((text, full_len, truncated))
+    Some((text, full_chars, truncated))
+}
+
+/// How many characters the String's *full* text holds.
+///
+/// Java 9+ stores exactly the String's characters in `value`, so that array's
+/// element count is the character count — halved for UTF-16, which packs two
+/// bytes per character. A pre-9 `char[]` may be shared between Strings, so the
+/// String's own `count` is authoritative when present.
+fn full_char_len(
+    ty: hprof_analyzer::types::HprofType,
+    coder: i64,
+    arr_count: u64,
+    jcount: Option<i64>,
+) -> u64 {
+    use hprof_analyzer::types::HprofType as T;
+    match ty {
+        T::Byte if coder == 1 => arr_count / 2,
+        T::Byte => arr_count,
+        T::Char => jcount.map(|c| c.max(0) as u64).unwrap_or(arr_count),
+        _ => arr_count,
+    }
 }
 
 /// Human name for an array's element type.
@@ -6302,6 +6330,22 @@ fn render_field(v: &serde_json::Value) -> String {
 mod cli_tests {
     use super::*;
     use clap::Parser;
+
+    /// `@text_length` must mean *characters* on every path: a UTF-16 `byte[]`
+    /// holds two bytes per character, and a pre-9 `char[]` may be shared, so the
+    /// String's own `count` — not the backing array's length — is the answer.
+    #[test]
+    fn full_char_len_halves_utf16_and_prefers_the_strings_own_count() {
+        use hprof_analyzer::types::HprofType::{Byte, Char};
+        // Java 9+ LATIN1: one byte per character.
+        assert_eq!(full_char_len(Byte, 0, 7, None), 7);
+        // Java 9+ UTF-16: two bytes per character.
+        assert_eq!(full_char_len(Byte, 1, 14, None), 7);
+        // Pre-9: the String's own `count` wins over a shared char[]'s length.
+        assert_eq!(full_char_len(Char, 0, 1000, Some(3)), 3);
+        // ...and falls back to the array when the dump records no `count`.
+        assert_eq!(full_char_len(Char, 0, 12, None), 12);
+    }
 
     #[test]
     fn query_path_depth_default_is_5() {
