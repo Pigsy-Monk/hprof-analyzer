@@ -85,6 +85,27 @@ pub struct RootRecord {
     pub ty: i32,
 }
 
+/// Per-class aggregates for MAT's `UnreachableObjectsHistogram` property.
+///
+/// MAT builds it in `GarbageCleaner.createHistogramOfUnreachableObjects`: one
+/// record per class that has unreachable objects, carrying the class name, the
+/// class object's address, the unreachable instance count and their summed
+/// size. The per-object size is the array size when non-zero (`a2size`), else —
+/// for a *class object* — the used heap size of the class it represents, else
+/// the class's `heapSizePerInstance` (our `shallow`). Only the class-object case
+/// needs data the caller does not have, so those are passed as the row of the
+/// class each one represents.
+#[derive(Default)]
+pub struct MatUnreachableHist {
+    /// row -> number of unreachable objects of that class.
+    pub count: Vec<i32>,
+    /// row -> summed size of that class's unreachable objects, excluding class
+    /// objects (whose size is the represented class's used heap size instead).
+    pub shallow: Vec<i64>,
+    /// For every unreachable *class object*: the row of the class it represents.
+    pub classobj_rows: Vec<i32>,
+}
+
 /// Everything the master `.index` needs for its roots / rootsPerThread /
 /// loaderLabels maps, already translated into MAT id space by the caller
 /// (which is the only place the address table is still live).
@@ -881,6 +902,13 @@ impl MatEmitter {
         // entry in the `inbound` body, number of instances written there). See
         // `ClassImpl.cacheEntry` below.
         class_inb: &HashMap<i32, (i32, i32)>,
+        // Per-class aggregates of the objects MAT drops as unreachable; becomes
+        // the `UnreachableObjectsHistogram` SnapshotInfo property.
+        unreach: &MatUnreachableHist,
+        // row -> class-object address, for the class objects MAT drops
+        // altogether (absent from the class cache, yet named by the
+        // unreachable-objects histogram).
+        unreach_class_addr: &HashMap<u32, u64>,
     ) -> io::Result<()> {
         use serial::*;
 
@@ -1039,6 +1067,69 @@ impl MatEmitter {
         };
         let file_size = meta.file_size;
         let ts_ms = meta.timestamp_ms as i64;
+        // --- MAT's `UnreachableObjectsHistogram` property records ---
+        // MAT stores one record per *class object* that has unreachable
+        // instances, keyed by the class id, so several histogram rows that
+        // resolve to the same class object (canonical + per-loader aliases)
+        // merge into one record. MAT's list order is its
+        // `HashMap<Integer,Record>` iteration order, which for a table larger
+        // than the highest class id is ascending class id — i.e. ascending
+        // class-object address.
+        let unreach_records: Vec<(String, u64, i32, i64)> = {
+            let jlc_row = class_names
+                .iter()
+                .position(|n| mat_class_name(n) == "java.lang.Class");
+            // A class object contributes the *used heap size of the class it
+            // represents* (MAT's `ClassImpl.getUsedHeapSize`), not its own
+            // shallow size — which is why golden's `java.lang.Class` record
+            // shows a size of 0 for classes with no instances.
+            let classobj_shallow: i64 = unreach
+                .classobj_rows
+                .iter()
+                .map(|&r| used_heap.get(r as usize).copied().unwrap_or(0))
+                .sum();
+            let mut by_addr: HashMap<u64, (String, i32, i64)> = HashMap::new();
+            for row in 0..num_rows {
+                let count = unreach.count.get(row).copied().unwrap_or(0);
+                if count == 0 {
+                    continue;
+                }
+                // MAT drops some class objects entirely (their class never
+                // reaches the class cache) yet still records them here, so the
+                // address falls back to the map the caller built from the
+                // address table before it was freed.
+                let addr = match inv[row] {
+                    o if o >= 0 => {
+                        let mat_id = mm.translate(o);
+                        if mat_id > 0 {
+                            meta.class_mat_to_addr.get(&mat_id).copied()
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+                .or_else(|| unreach_class_addr.get(&(row as u32)).copied());
+                let addr = match addr {
+                    Some(a) => a,
+                    None => continue,
+                };
+                let mut shallow = unreach.shallow.get(row).copied().unwrap_or(0);
+                if Some(row) == jlc_row {
+                    shallow += classobj_shallow;
+                }
+                let e = by_addr
+                    .entry(addr)
+                    .or_insert_with(|| (mat_class_name(&class_names[row]), 0, 0));
+                e.1 += count;
+                e.2 += shallow;
+            }
+            let mut v: Vec<(u64, (String, i32, i64))> = by_addr.into_iter().collect();
+            v.sort_by_key(|&(addr, _)| addr);
+            v.into_iter()
+                .map(|(addr, (name, count, shallow))| (name, addr, count, shallow))
+                .collect()
+        };
         let snapshot_layers = vec![
             // XSnapshotInfo layer (subclass)
             LayerData {
@@ -1128,6 +1219,25 @@ impl MatEmitter {
                                 }),
                                 Box::new(move |s: &mut Ser| {
                                     s.write_long(file_size as i64);
+                                }),
+                            );
+                            entries.push(e);
+                            // MAT's `UnreachableObjectsHistogram`, stored as a
+                            // SnapshotInfo property under the class's own name.
+                            // MAT's Class Histogram / "Unreachable Objects"
+                            // reports read it back via
+                            // `ISnapshot.getSnapshotAddons`.
+                            let e: (i32, Box<dyn FnOnce(&mut Ser)>, Box<dyn FnOnce(&mut Ser)>) = (
+                                Ser::java_string_hashcode(
+                                    "org.eclipse.mat.snapshot.UnreachableObjectsHistogram",
+                                ),
+                                Box::new(|s: &mut Ser| {
+                                    s.string(
+                                        "org.eclipse.mat.snapshot.UnreachableObjectsHistogram",
+                                    );
+                                }),
+                                Box::new(move |s: &mut Ser| {
+                                    s.write_unreachable_objects_histogram(unreach_records);
                                 }),
                             );
                             entries.push(e);

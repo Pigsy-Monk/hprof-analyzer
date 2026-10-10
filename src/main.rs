@@ -4456,6 +4456,10 @@ fn run(
     let mut mat_roots: Option<mat::MatRoots> = None;
     let mut mat_instance_sizes: Option<std::collections::HashMap<u64, i32>> = None;
     let mut mat_root_instance_size: i32 = 0;
+    // class row -> class-object address, for class objects MAT drops outright
+    // (not in the class cache, yet named by the unreachable-objects histogram).
+    let mut mat_unreach_class_addr: std::collections::HashMap<u32, u64> =
+        std::collections::HashMap::new();
     // row -> "the row's class is java.lang.ClassLoader or a subclass". Built
     // while the address table is live; consumed later, where `class_idx` is
     // live, to find every class-loader instance in the heap.
@@ -4476,12 +4480,18 @@ fn run(
         // Both sets are small (~number of classes / loaders), so the lookups are
         // built here while `addrs` is still resident and then dropped with it.
         if let Some(ref mut meta) = mat_class_meta {
-            for &coid in g.class_obj_class_idx.keys() {
+            for (&coid, &row) in g.class_obj_class_idx.iter() {
+                let a = addrs[coid as usize];
                 let mid = mm.translate(coid as i32);
                 if mid > 0 {
-                    let a = addrs[coid as usize];
                     meta.class_addr_to_mat.insert(a, mid);
                     meta.class_mat_to_addr.insert(mid, a);
+                } else {
+                    // MAT drops this class object entirely, so it never reaches
+                    // the class cache — but MAT's unreachable-objects histogram
+                    // still names the class, and its record carries the class
+                    // object's address. `addrs` is the last place it is known.
+                    mat_unreach_class_addr.insert(row, a);
                 }
             }
             let mut loaders: Vec<u64> = g
@@ -5654,39 +5664,50 @@ fn run(
     }
 
     // MAT: emit i2sv2 (per-class retained-size cache) and .threads.
-    // Both depend on g.retained (just computed above) and mm (mat id map).
     if let Some(ref m) = mat {
         let mm = mat_map.as_ref().expect("mat_map built with mat");
         let inv = mat_inv.as_ref().expect("mat_inv built when mat present");
 
-        // i2sv2: sum retained sizes by class (in mat-id order of the class object).
-        // inv[row] = old_class_obj_dense_id; mm.translate → class mat-id.
-        // Accumulate per-row retained sums, then emit (class_mat_id, sum) pairs.
-        let num_rows = g.class_names.len();
-        let mut per_class_retained: Vec<i64> = vec![0i64; num_rows];
-        for i in 0..g.n {
-            if g.idom[i] != u32::MAX {
-                let row = g.class_idx[i] as usize;
-                if row < num_rows {
-                    per_class_retained[row] += g.retained[i] as i64;
-                }
-            }
-        }
-        let class_iter = (0..num_rows).filter_map(|row| {
-            let old_cobj = inv[row];
-            if old_cobj < 0 {
-                return None;
-            }
-            let mat_cid = mm.translate(old_cobj);
-            if mat_cid <= 0 {
-                return None;
-            }
-            Some((mat_cid, per_class_retained[row]))
-        });
-        m.emit_i2sv2(class_iter)?;
+        // i2sv2 (`RetainedSizeCache`) is deliberately NOT emitted. MAT's entry is
+        // `-getMinRetainedSize({class object} ∪ its instances)` — the *approximated*
+        // retained size of that set, stored negated — and MAT trusts the cache
+        // whenever the entry is present. Our aggregate was the plain sum of each
+        // instance's retained size, which differs from MAT's for 408 of the small
+        // dump's 2036 classes and made the Class Histogram's `Retained Heap`
+        // column too large (and its rows mis-ordered). MAT recomputes the cache
+        // itself when the file is absent, so leaving it out restores parity.
 
         // .threads: thread stacks (addresses from mm).
         m.emit_threads(&g.thread_stacks, mm, &g.thread_local_frame_samples)?;
+
+        // MAT's `UnreachableObjectsHistogram` aggregates: per class row, how many
+        // unreachable objects it holds and their summed size. MAT's per-object
+        // rule (`GarbageCleaner.createHistogramOfUnreachableObjects`): an array
+        // contributes its array size, a class object the used heap size of the
+        // class it represents, anything else its `heapSizePerInstance` — which is
+        // exactly our `shallow`. Class objects are recorded separately, as the
+        // row of the class each one represents, because only `emit_dot_index`
+        // knows those classes' used heap sizes.
+        let num_rows = g.class_names.len();
+        let mut unreach = mat::MatUnreachableHist {
+            count: vec![0i32; num_rows],
+            shallow: vec![0i64; num_rows],
+            classobj_rows: Vec::new(),
+        };
+        for i in 0..g.n {
+            if g.idom[i] != u32::MAX {
+                continue;
+            }
+            let row = g.class_idx[i] as usize;
+            if row >= num_rows {
+                continue;
+            }
+            unreach.count[row] += 1;
+            match g.class_obj_class_idx.get(&(i as u32)) {
+                Some(&crow) => unreach.classobj_rows.push(crow as i32),
+                None => unreach.shallow[row] += g.shallow[i] as i64,
+            }
+        }
 
         // .index: master Java serialization stream.
         if let Some(ref meta) = mat_class_meta {
@@ -5707,6 +5728,8 @@ fn run(
                 mat_root_instance_size,
                 mat_classloader_mat.unwrap_or(0),
                 &class_inb,
+                &unreach,
+                &mat_unreach_class_addr,
             )?;
         }
     }

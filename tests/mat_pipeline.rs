@@ -186,34 +186,24 @@ fn mat_phase2_outputs_emitted() {
         eprintln!("  .index: {} bytes, magic OK", bytes.len());
     }
 
-    // 2. .i2sv2.index: size must be a multiple of 12 (4-byte classId + 8-byte retained)
+    // 2. .i2sv2.index must NOT be emitted.
+    //
+    // MAT's entry is `-getMinRetainedSize({class object} ∪ instances)` and MAT
+    // trusts the cache whenever an entry is present. Our aggregate was a plain
+    // per-class sum of instance retained sizes, which disagreed with MAT for 408
+    // of the small dump's 2036 classes and made the Class Histogram's
+    // `Retained Heap` column too large. MAT recomputes the cache itself when the
+    // file is absent, so we leave it out and let MAT own the values.
     {
         let path = out_dir.join("dump_.i2sv2.index");
-        let bytes = std::fs::read(&path).expect("dump_.i2sv2.index not emitted");
-        assert_eq!(
-            bytes.len() % 12,
-            0,
-            "dump_.i2sv2.index size {} is not a multiple of 12",
-            bytes.len()
-        );
-        // Should have at least one entry (the real dump has thousands of classes)
         assert!(
-            bytes.len() >= 12,
-            "dump_.i2sv2.index is empty — expected at least one class entry"
+            !path.exists(),
+            "dump_.i2sv2.index must not be emitted (MAT recomputes its own)"
         );
-        // Must match the real MAT fixture size exactly (same retained-size cache)
-        let real_i2sv2 = std::fs::read(Path::new(FIXTURE_DIR).join("dump_.i2sv2.index"))
-            .expect("real i2sv2 fixture absent");
-        let ours_count = bytes.len() / 12;
-        let real_count = real_i2sv2.len() / 12;
+        let real_i2sv2 = Path::new(FIXTURE_DIR).join("dump_.i2sv2.index");
         eprintln!(
-            "  .i2sv2.index: ours={} entries, real={} entries",
-            ours_count, real_count
-        );
-        // Entry count should be at least 50% of real MAT's count (same dump, same classes)
-        assert!(
-            ours_count * 2 >= real_count,
-            "our i2sv2 entry count {ours_count} is less than 50% of MAT's {real_count}"
+            "  .i2sv2.index: not emitted (MAT fixture present: {})",
+            real_i2sv2.exists()
         );
     }
 

@@ -53,7 +53,9 @@ pub mod uid {
     pub const FIELD_DESCRIPTOR_ARRAY: i64 = -4300540347928878330; // "[L...FieldDescriptor;"
     pub const FIELD_ARRAY: i64 = 2935640697646924767; // "[L...Field;"
     pub const ARRAY_LIST: i64 = 8683452581122892189;
+    /// `org.eclipse.mat.snapshot.UnreachableObjectsHistogram`
     pub const UNREACHABLE_OBJECTS_HISTOGRAM: i64 = 1;
+    /// `org.eclipse.mat.snapshot.UnreachableObjectsHistogram$Record`
     pub const UOH_RECORD: i64 = 1;
     pub const BOOLEAN: i64 = -3665804199014368530;
     pub const LONG: i64 = 4290774380558885855;
@@ -827,6 +829,89 @@ impl Ser {
             e(self);
         }
         self.u8(TC_ENDBLOCKDATA);
+    }
+
+    /// Write one MAT `UnreachableObjectsHistogram$Record` (uid 1).
+    ///
+    /// Declared fields are `className:String`, `objectCount:int`,
+    /// `shallowHeapSize:long`, `classAddress:long`; the JVM stream orders the
+    /// primitives alphabetically (`classAddress`, `objectCount`,
+    /// `shallowHeapSize`) before the object field.
+    pub fn write_unreachable_record(
+        &mut self,
+        name: &str,
+        address: u64,
+        object_count: i32,
+        shallow_heap_size: i64,
+    ) {
+        let fields = || {
+            vec![
+                f_long("classAddress"),
+                f_int("objectCount"),
+                f_long("shallowHeapSize"),
+                f_obj("className", "Ljava/lang/String;"),
+            ]
+        };
+        let n = name.to_string();
+        let layers = vec![LayerData {
+            fields: fields(),
+            values: vec![
+                ("classAddress".into(), FieldVal::Long(address as i64)),
+                ("objectCount".into(), FieldVal::Int(object_count)),
+                ("shallowHeapSize".into(), FieldVal::Long(shallow_heap_size)),
+                (
+                    "className".into(),
+                    FieldVal::ObjRef(Box::new(move |s: &mut Ser| s.string(&n))),
+                ),
+            ],
+        }];
+        self.write_object(
+            &[ClassDesc {
+                name: "org.eclipse.mat.snapshot.UnreachableObjectsHistogram$Record".into(),
+                uid: uid::UOH_RECORD,
+                flags: SC_SERIALIZABLE,
+                fields: fields(),
+            }],
+            layers,
+        );
+    }
+
+    /// Write MAT's `UnreachableObjectsHistogram` (a `SnapshotInfo` *property*,
+    /// keyed by the class's own name).
+    ///
+    /// One `histogram` field holding a `java.util.ArrayList` of `Record`s — the
+    /// class of every unreachable object, its class object's address, the
+    /// unreachable instance count and their summed size. MAT's Class Histogram
+    /// and "Unreachable Objects" reports read it.
+    pub fn write_unreachable_objects_histogram(&mut self, records: Vec<(String, u64, i32, i64)>) {
+        let fields = || vec![f_obj("histogram", "Ljava/util/List;")];
+        let layers = vec![LayerData {
+            fields: fields(),
+            values: vec![(
+                "histogram".into(),
+                FieldVal::ObjRef(Box::new(move |s: &mut Ser| {
+                    let capacity = records.len() as i32;
+                    let elems = records
+                        .into_iter()
+                        .map(|(name, addr, count, shallow)| {
+                            Box::new(move |s: &mut Ser| {
+                                s.write_unreachable_record(&name, addr, count, shallow);
+                            }) as Box<dyn FnOnce(&mut Ser)>
+                        })
+                        .collect();
+                    s.write_array_list(capacity, elems);
+                })),
+            )],
+        }];
+        self.write_object(
+            &[ClassDesc {
+                name: "org.eclipse.mat.snapshot.UnreachableObjectsHistogram".into(),
+                uid: uid::UNREACHABLE_OBJECTS_HISTOGRAM,
+                flags: SC_SERIALIZABLE,
+                fields: fields(),
+            }],
+            layers,
+        );
     }
 
     /// Expose handle allocation for callers that write TC_OBJECT manually (e.g. BitField).
