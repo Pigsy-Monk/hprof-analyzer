@@ -1,0 +1,20 @@
+tests/cli_inspect_fields.rs
+  s_d88b882af55fa9::t_8ee3e90260fea4 1-14,17-71,77-78,82-104,110-134,140-161
+  s_d88b882af55fa9::t_b8e3d3b22c5887 15-16,72-76,79-81,105-109,135-139
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.45-trip",
+  "base_commit_sha": "8a8719e93b4ca36aca6890444a5678840b41c4b4",
+  "prompts": {},
+  "sessions": {
+    "s_d88b882af55fa9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "99417d7d-eefa-47ba-a772-d0c0f9c0d8ed",
+        "model": "deepseek-v4-1-flash-260910"
+      },
+      "human_author": "zwsong <zwsong@trip.com>"
+    }
+  }
+}
