@@ -1,0 +1,26 @@
+src/mat/mod.rs
+  s_d88b882af55fa9::t_cd000a020f474b 1381
+  s_d88b882af55fa9::t_ceafd743005aa0 880-883
+  s_d88b882af55fa9::t_e5bdacf517f5a6 1380
+  s_d88b882af55fa9::t_74862b4dd37e5c 1434-1460,1462-1465
+  s_d88b882af55fa9::t_7143984d8577bb 1461
+src/main.rs
+  s_d88b882af55fa9::t_472867f5c39579 4847-4859,4897-4902,4932,5141-5159,5196,5220-5252,5709
+  s_d88b882af55fa9::t_55c1eca7b4cafd 5263-5264
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.45-trip",
+  "base_commit_sha": "426c747cd3842e585f945e4d28803b4747941b24",
+  "prompts": {},
+  "sessions": {
+    "s_d88b882af55fa9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "99417d7d-eefa-47ba-a772-d0c0f9c0d8ed",
+        "model": "deepseek-v4-1-flash-260910"
+      },
+      "human_author": "zwsong <zwsong@trip.com>"
+    }
+  }
+}
