@@ -32,6 +32,41 @@ pub fn run_query_json(
     prebuilt: Option<(crate::query::ast::Query, crate::query::plan::QueryPlan)>,
     retained: Option<&Arc<Vec<u64>>>,
 ) -> serde_json::Value {
+    run_query_json_policy(
+        path,
+        text,
+        path_depth,
+        reachable_only,
+        cache,
+        prebuilt,
+        retained,
+        false,
+    )
+}
+
+/// [`run_query_json`] with an explicit rescan policy.
+///
+/// `no_rescan` is the server's `--no-rescan` switch. When a query cannot be
+/// answered from what the server keeps resident, **refuse it** instead of
+/// re-reading the dump. Both escape hatches are covered: the escalated
+/// full-pipeline re-run (`needs_full`) and the per-request scan
+/// (`!cache_eligible`).
+///
+/// Why this exists: either hatch re-reads the dump *while the analysis's
+/// resident state is still held*, so peak memory is roughly additive. On a
+/// 32 GiB box one `needs_full` query pushed a `ready` server to 31.3 GiB and it
+/// was OOM-killed. Refusing turns that silent machine-killer into a message
+/// naming the capability the query wanted.
+pub fn run_query_json_policy(
+    path: &str,
+    text: &str,
+    path_depth: usize,
+    reachable_only: bool,
+    cache: &mut Option<ReplCache>,
+    prebuilt: Option<(crate::query::ast::Query, crate::query::plan::QueryPlan)>,
+    retained: Option<&Arc<Vec<u64>>>,
+    no_rescan: bool,
+) -> serde_json::Value {
     let started = Instant::now();
     let (cleaned, viz, warning) = crate::query::viz::split_directive(text);
 
@@ -134,6 +169,13 @@ pub fn run_query_json(
                     )
                 }
             }
+        } else if no_rescan {
+            return refuse_rescan(
+                needs_full_reason(&plan),
+                "The server keeps only the retained-size array across the full \
+                 analysis. Restart it without --no-rescan to allow the escalated \
+                 re-run, or ask this query of `heap query` instead.",
+            );
         } else {
             let (flat, union_groups) = crate::query::run::expand_union_queries(&[(q, plan)]);
             let opts = crate::opts::AnalyzeOptions {
@@ -158,6 +200,13 @@ pub fn run_query_json(
                 }
                 _ => crate::query::run::run_single_dump(path, &[(q, plan)], reachable_only),
             }
+        } else if no_rescan {
+            return refuse_rescan(
+                not_eligible_reason(&q, &plan),
+                "Under --no-rescan only queries the resident cache can answer are \
+                 served; restart without it to allow a per-request scan, or use \
+                 `heap query`.",
+            );
         } else {
             crate::query::run::run_single_dump(path, &[(q, plan)], reachable_only)
         }
@@ -317,6 +366,69 @@ fn internal_error(e: io::Error) -> serde_json::Value {
     })
 }
 
+/// Refusal returned under `--no-rescan` instead of re-reading the dump.
+/// `what` names the capability the query wanted; `hint` says what to do about it.
+fn refuse_rescan(what: String, hint: &str) -> serde_json::Value {
+    serde_json::json!({
+        "ok": false,
+        "error": {
+            "kind": "rescan_refused",
+            "message": format!(
+                "query refused by --no-rescan: answering it needs {what}, which this \
+                 server does not keep resident, so it would have to re-read the dump \
+                 — roughly doubling peak memory while the analysis stays in memory. \
+                 {hint}"
+            )
+        }
+    })
+}
+
+/// Which cross-phase capability pushed the query onto the escalated path.
+fn needs_full_reason(plan: &crate::query::plan::QueryPlan) -> String {
+    let mut why: Vec<&str> = Vec::new();
+    if plan.needs.retained {
+        why.push("retained sizes");
+    }
+    if plan.needs.dominator_children {
+        why.push("dominator children");
+    }
+    if plan.needs.gc_roots {
+        why.push("GC roots");
+    }
+    if plan.needs.ref_walk {
+        why.push("a reference walk");
+    }
+    if !plan.late_ops.is_empty() {
+        why.push("a cross-phase operator (edge lookup or bounded path)");
+    }
+    if why.is_empty() {
+        "the full analysis pipeline".to_string()
+    } else {
+        why.join(" + ")
+    }
+}
+
+/// Why the resident cache cannot serve this query. Mirrors
+/// [`crate::query::repl::cache_eligible`]; keep the two in step.
+fn not_eligible_reason(
+    q: &crate::query::ast::Query,
+    plan: &crate::query::plan::QueryPlan,
+) -> String {
+    if !plan.is_resident_only() {
+        "per-object data the resident cache does not hold (string values, dominators, \
+         edges, or GC roots)"
+            .to_string()
+    } else if plan.from_subplan.is_some() || !plan.in_subplans.is_empty() {
+        "a subquery".to_string()
+    } else if q.from.class_spec().is_none() {
+        "a FROM that is not a single concrete class (a class-name regex, INSTANCEOF, \
+         or OBJECTS)"
+            .to_string()
+    } else {
+        "a class the resident cache does not index (an array class)".to_string()
+    }
+}
+
 /// Shared server state. `path`/`path_depth` are immutable; `reachable_only`
 /// starts `true` and is atomically lowered to `false` once the full analysis
 /// pipeline completes. The warm ReplCache is behind a Mutex so worker threads
@@ -334,6 +446,11 @@ pub struct ServerState {
     path: String,
     path_depth: usize,
     reachable_only: AtomicBool,
+    /// Refuse any query that would re-read the dump instead of answering from
+    /// what is resident. Set from `server --no-rescan`. See
+    /// [`run_query_json_policy`] for why: both escape hatches re-read the dump
+    /// while the analysis stays resident, roughly doubling peak memory.
+    no_rescan: bool,
     cache: Mutex<Option<ReplCache>>,
     help_cache: OnceLock<serde_json::Value>,
     plan_cache: Mutex<HashMap<String, (crate::query::ast::Query, crate::query::plan::QueryPlan)>>,
@@ -348,10 +465,21 @@ const PLAN_CACHE_CAP: usize = 256;
 
 impl ServerState {
     pub fn load(path: &str, path_depth: usize, reachable_only: bool) -> io::Result<Self> {
+        Self::load_with_policy(path, path_depth, reachable_only, false)
+    }
+
+    /// [`Self::load`] plus the `--no-rescan` policy (see [`run_query_json_policy`]).
+    pub fn load_with_policy(
+        path: &str,
+        path_depth: usize,
+        reachable_only: bool,
+        no_rescan: bool,
+    ) -> io::Result<Self> {
         Ok(ServerState {
             path: path.to_string(),
             path_depth,
             reachable_only: AtomicBool::new(reachable_only),
+            no_rescan,
             cache: Mutex::new(None),
             help_cache: OnceLock::new(),
             plan_cache: Mutex::new(HashMap::new()),
@@ -502,7 +630,7 @@ impl ServerState {
                 // would kill every worker that later touches the cache.
                 let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
                 let prebuilt = self.lookup_plan(&oql);
-                let v = run_query_json(
+                let v = run_query_json_policy(
                     &self.path,
                     &oql,
                     self.path_depth,
@@ -510,6 +638,7 @@ impl ServerState {
                     &mut guard,
                     prebuilt,
                     self.retained_data.get(),
+                    self.no_rescan,
                 );
                 if v["ok"] == serde_json::json!(true) {
                     // Cache the plan on success so subsequent identical queries skip parse+plan.
@@ -540,6 +669,7 @@ impl ServerState {
                     &mut guard,
                     prebuilt,
                     self.retained_data.get(),
+                    self.no_rescan,
                 );
                 (status, body, "application/x-ndjson")
             }
@@ -737,8 +867,9 @@ fn run_query_ndjson_prebuilt(
     cache: &mut Option<ReplCache>,
     prebuilt: Option<(crate::query::ast::Query, crate::query::plan::QueryPlan)>,
     retained: Option<&Arc<Vec<u64>>>,
+    no_rescan: bool,
 ) -> (u16, String) {
-    let v = run_query_json(
+    let v = run_query_json_policy(
         path,
         text,
         path_depth,
@@ -746,6 +877,7 @@ fn run_query_ndjson_prebuilt(
         cache,
         prebuilt,
         retained,
+        no_rescan,
     );
     if v["ok"] != serde_json::json!(true) {
         let line = serde_json::json!({ "kind": "error", "error": v["error"].clone() });
@@ -919,6 +1051,59 @@ mod tests {
         assert!(
             v["result"]["columns"].is_array(),
             "columns present, got: {v}"
+        );
+    }
+
+    /// `--no-rescan` must refuse a query that would re-read the dump, and say
+    /// which capability it wanted — rather than silently re-running the
+    /// pipeline on top of the resident analysis and OOM-killing the server.
+    #[test]
+    fn no_rescan_refuses_an_escalating_query() {
+        let mut cache = None;
+        // `reachable_only = false` is the post-analysis state; `@retainedHeapSize`
+        // sets plan.needs.retained, and with no retained array handed over the
+        // fast path cannot apply — so this is exactly the escalating case.
+        let v = run_query_json_policy(
+            FIXTURE,
+            "SELECT @retainedHeapSize FROM java.lang.Thread",
+            5,
+            false,
+            &mut cache,
+            None,
+            None,
+            true,
+        );
+        assert_eq!(v["ok"], serde_json::json!(false), "must refuse, got: {v}");
+        assert_eq!(
+            v["error"]["kind"],
+            serde_json::json!("rescan_refused"),
+            "got: {v}"
+        );
+        let msg = v["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("retained sizes") && msg.contains("--no-rescan"),
+            "message should name the missing capability and the flag, got: {msg}"
+        );
+    }
+
+    /// Without the flag the same query is not refused — it escalates, as before.
+    #[test]
+    fn without_no_rescan_the_same_query_is_not_refused() {
+        let mut cache = None;
+        let v = run_query_json_policy(
+            FIXTURE,
+            "SELECT @retainedHeapSize FROM java.lang.Thread",
+            5,
+            false,
+            &mut cache,
+            None,
+            None,
+            false,
+        );
+        assert_ne!(
+            v["error"]["kind"],
+            serde_json::json!("rescan_refused"),
+            "must not refuse without the flag, got: {v}"
         );
     }
 

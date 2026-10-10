@@ -33,8 +33,13 @@ pub struct ServeState {
 }
 
 impl ServeState {
-    pub fn new(path: &str, opts: AnalyzeOptions) -> io::Result<Self> {
-        let oql = Arc::new(OqlState::load(path, opts.query_path_depth, true)?);
+    pub fn new(path: &str, opts: AnalyzeOptions, no_rescan: bool) -> io::Result<Self> {
+        let oql = Arc::new(OqlState::load_with_policy(
+            path,
+            opts.query_path_depth,
+            true,
+            no_rescan,
+        )?);
         Ok(ServeState {
             path: path.to_string(),
             opts,
@@ -353,7 +358,7 @@ pub fn version_json() -> serde_json::Value {
     })
 }
 
-pub fn run_server(path: &str, port: u16, opts: AnalyzeOptions) -> io::Result<()> {
+pub fn run_server(path: &str, port: u16, opts: AnalyzeOptions, no_rescan: bool) -> io::Result<()> {
     let addr = format!("127.0.0.1:{port}");
     let server =
         Server::http(&addr).map_err(|e| io::Error::other(format!("bind {addr} failed: {e}")))?;
@@ -392,7 +397,7 @@ pub fn run_server(path: &str, port: u16, opts: AnalyzeOptions) -> io::Result<()>
     println!("  curl -s http://{bound}/ -d 'SELECT @retainedHeapSize FROM java.lang.Thread'");
     println!("(loopback only; Ctrl-C to stop)");
 
-    let state = Arc::new(ServeState::new(path, opts)?);
+    let state = Arc::new(ServeState::new(path, opts, no_rescan)?);
     // NOTE: we deliberately do NOT call `state.oql.prewarm()` here.
     //
     // It spawns a background thread that runs the full Pass1+Pass2 over the
@@ -495,7 +500,7 @@ mod tests {
     const FIXTURE: &str = "tests/fixtures/dump_4_philosophers.hprof";
 
     fn make_state() -> ServeState {
-        ServeState::new(FIXTURE, AnalyzeOptions::default()).expect("ServeState::new")
+        ServeState::new(FIXTURE, AnalyzeOptions::default(), false).expect("ServeState::new")
     }
 
     /// Shared, lazily-initialized state that has already completed analysis.

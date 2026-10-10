@@ -312,6 +312,20 @@ enum Cmd {
         /// Port to bind (default 7070; loopback only).
         #[arg(long, value_name = "N")]
         port: Option<u16>,
+        /// Never re-read the dump to answer a query: refuse it instead.
+        ///
+        /// Both of the server's escape hatches re-read the dump *while the
+        /// analysis stays resident*, so peak memory is roughly additive. On a
+        /// 32 GiB box a single query needing dominators, GC roots, edges or a
+        /// reference walk was enough to push a `ready` server from 14.6 GiB to
+        /// 31.3 GiB and get it OOM-killed — silently, minutes later. With this
+        /// flag such a query returns `{"kind":"rescan_refused"}` naming the
+        /// capability it wanted, instead of killing the server.
+        ///
+        /// Queries that the resident cache can answer — counts, histograms,
+        /// `@retainedHeapSize` — are unaffected.
+        #[arg(long)]
+        no_rescan: bool,
     },
     /// Run one or more OQL queries against a heap dump and print the results.
     /// Fast query-only path (no full report): retained-size, dominator, and
@@ -1084,7 +1098,11 @@ fn main() {
                 }
             }
         },
-        Some(Cmd::Server { input, port }) => {
+        Some(Cmd::Server {
+            input,
+            port,
+            no_rescan,
+        }) => {
             if !input_is_hprof(&input) {
                 fail(format!(
                     "'{input}' is not an HPROF dump; the `server` subcommand needs a .hprof[.gz/.zip/.tar.gz] file"
@@ -1098,7 +1116,9 @@ fn main() {
                 keep_oql_cache: true,
                 ..DetailLevel::Default.options()
             };
-            if let Err(e) = serve::run_server(&input, port.unwrap_or(serve::DEFAULT_PORT), opts) {
+            if let Err(e) =
+                serve::run_server(&input, port.unwrap_or(serve::DEFAULT_PORT), opts, no_rescan)
+            {
                 fail(analyze_error_hint(&input, &e));
             }
         }
