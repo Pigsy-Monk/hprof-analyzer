@@ -1,0 +1,20 @@
+src/main.rs
+  s_d88b882af55fa9::t_f3a698c2943a31 5455-5464,5495,5499-5503,5505-5507
+  s_d88b882af55fa9::t_f108c601265206 5470-5475,5478-5487,5489
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.45-trip",
+  "base_commit_sha": "f6975efed048cbe43e38ce2c1bca3bd0e7273a4e",
+  "prompts": {},
+  "sessions": {
+    "s_d88b882af55fa9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "99417d7d-eefa-47ba-a772-d0c0f9c0d8ed",
+        "model": "deepseek-v4-1-flash-260910"
+      },
+      "human_author": "zwsong <zwsong@trip.com>"
+    }
+  }
+}
