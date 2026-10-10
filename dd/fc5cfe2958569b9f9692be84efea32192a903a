@@ -1,0 +1,64 @@
+src/chunkvec.rs
+  s_d88b882af55fa9::t_1966aef4bf10c2 32-33
+tests/server_edge_no_rescan.rs
+  s_d88b882af55fa9::t_6a244491ea3c1c 5,15-19,22,25-37,53-60,63,65-68,79,84,88-89,92,100,118,122-125
+  s_d88b882af55fa9::t_e1aa5d3aa789ff 74,78
+  s_d88b882af55fa9::t_7bc667f8b31167 38-39
+  s_d88b882af55fa9::t_23b5b17c43f2e8 1-4,6-14,20-21,23-24,40-52,61-62,64,69-73,75-77,80-83,85-87,90-91,93-99,101-110,112-117,119-121
+src/main.rs
+  s_d88b882af55fa9::t_55490178dde9b6 2269-2275,2286
+  s_d88b882af55fa9::t_d797eb1d7a7e5b 3608
+  s_d88b882af55fa9::t_02c2e3ecde0a99 332-333
+  s_d88b882af55fa9::t_93b55561b4fee8 607-609
+src/run_oql.rs
+  s_d88b882af55fa9::t_bb8105c4c29964 245-252
+  s_d88b882af55fa9::t_1a435a96d49f32 48-120
+  s_d88b882af55fa9::t_4d11d3f272240f 397-399
+src/cache.rs
+  s_d88b882af55fa9::t_8614589a95e39d 326-333,343-347,354
+  s_d88b882af55fa9::t_375bc885f2a199 334-342
+src/serve.rs
+  s_d88b882af55fa9::t_3a41ef9de7a8ac 149,154
+  s_d88b882af55fa9::t_6f2b102f198760 153
+src/lib.rs
+  s_d88b882af55fa9::t_cb99f11c296fbf 558-564,575
+src/query/server.rs
+  s_d88b882af55fa9::t_800efdd8763ab2 157-160
+  s_d88b882af55fa9::t_08adbee577eb90 146-156,161-165
+src/query/run.rs
+  s_d88b882af55fa9::t_8886719c371f4a 628-706,718-721
+  s_d88b882af55fa9::t_e8f345e1aaca09 2022-2030,2038,2059
+  s_d88b882af55fa9::t_c521e99bd426f8 2094
+  s_d88b882af55fa9::t_ab483638586813 951-953
+  s_d88b882af55fa9::t_782af824962917 944-950
+  s_d88b882af55fa9::t_78eeb9bb9c320d 767-769
+  s_d88b882af55fa9::t_78d499a97f97ba 995-999,1006-1011,1022-1031
+  s_d88b882af55fa9::t_211b11dec6d546 1925-1984,1995
+  s_d88b882af55fa9::t_7da111aa6b8085 1000-1005,1013
+  s_d88b882af55fa9::t_7e26fa6cf32ccc 2123-2133,2145
+  s_d88b882af55fa9::t_9d636fed065e08 1423
+  s_d88b882af55fa9::t_6db7d9635a7ebd 828-833
+  s_d88b882af55fa9::t_3fcbbb0ee26690 1274
+  s_d88b882af55fa9::t_eccba1feef7cae 1985-1994
+  s_d88b882af55fa9::t_2dd523f155117b 865-875,884-894
+tests/edge_cache_parity.rs
+  s_d88b882af55fa9::t_c0f53f8af8e6eb 1-131
+tests/edge_resident_parity.rs
+  s_d88b882af55fa9::t_0345c8336dd4ea 1-29,31-32,34-92
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.45-trip",
+  "base_commit_sha": "ddfc5cfe2958569b9f9692be84efea32192a903a",
+  "prompts": {},
+  "sessions": {
+    "s_d88b882af55fa9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "99417d7d-eefa-47ba-a772-d0c0f9c0d8ed",
+        "model": "deepseek-v4-1-flash-260910"
+      },
+      "human_author": "zwsong <zwsong@trip.com>"
+    }
+  }
+}
