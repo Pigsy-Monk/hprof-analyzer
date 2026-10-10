@@ -119,19 +119,29 @@ pub fn run_query_json_policy(
         // Check if we can serve from the retained-size fast path: the query only
         // needs retained sizes (no dominators, edges, gc-roots) and we have cached
         // retained data from a completed full analysis, plus a warm ReplCache.
+        // The retained fast path can serve a query iff retained sizes are all it
+        // needs beyond the resident cache: no dominator children, no GC roots, no
+        // reference walk, and the ONLY cross-phase op is the retained join.
+        //
+        // The previous predicate excluded just `EdgeLookup`/`BoundedPath`, which
+        // let `RefWalkResolve` / `DominatorOf` / `RetainedSet` / `ResolveArrayIndex`
+        // / `ResolveStringValues` through — those need data the fast path does not
+        // have, so it has to be an allow-list, not a deny-list.
         let needs_only_retained = plan.needs.retained
             && !plan.needs.dominator_children
             && !plan.needs.gc_roots
-            && !plan.late_ops.iter().any(|op| {
-                matches!(
-                    op,
-                    crate::query::plan::StageOp::EdgeLookup { .. }
-                        | crate::query::plan::StageOp::BoundedPath { .. }
-                )
-            });
+            && !plan.needs.ref_walk
+            && plan
+                .late_ops
+                .iter()
+                .all(|op| matches!(op, crate::query::plan::StageOp::JoinRetained));
+        // `cache_shaped`, NOT `cache_eligible`: the latter also demands
+        // `is_resident_only()`, which is false whenever `needs.retained` is true —
+        // so requiring it here asked for `needs.retained` and `!needs.retained` at
+        // once and made this branch unreachable. See `cache_shaped`.
         let used_fast_path = needs_only_retained
             && retained.is_some()
-            && crate::query::repl::cache_eligible(&q, &plan);
+            && crate::query::repl::cache_shaped(&q, &plan);
 
         if used_fast_path {
             let ret = retained.unwrap();
@@ -385,21 +395,43 @@ fn refuse_rescan(what: String, hint: &str) -> serde_json::Value {
 
 /// Which cross-phase capability pushed the query onto the escalated path.
 fn needs_full_reason(plan: &crate::query::plan::QueryPlan) -> String {
+    use crate::query::plan::StageOp;
     let mut why: Vec<&str> = Vec::new();
+    let add = |w: &mut Vec<&str>, s: &'static str| {
+        if !w.contains(&s) {
+            w.push(s);
+        }
+    };
     if plan.needs.retained {
-        why.push("retained sizes");
+        add(&mut why, "retained sizes");
     }
     if plan.needs.dominator_children {
-        why.push("dominator children");
+        add(&mut why, "dominator children");
     }
     if plan.needs.gc_roots {
-        why.push("GC roots");
+        add(&mut why, "GC roots");
     }
     if plan.needs.ref_walk {
-        why.push("a reference walk");
+        add(&mut why, "a reference walk");
     }
-    if !plan.late_ops.is_empty() {
-        why.push("a cross-phase operator (edge lookup or bounded path)");
+    // Name the operators that are actually present. The previous wording
+    // hard-coded "edge lookup or bounded path" for *any* late op, which was
+    // simply wrong for e.g. `@retainedHeapSize` (its only late op is
+    // `JoinRetained`) and sent readers after the wrong thing.
+    for op in &plan.late_ops {
+        add(
+            &mut why,
+            match op {
+                StageOp::JoinRetained => "retained sizes",
+                StageOp::DominatorChildren { .. } => "dominator children",
+                StageOp::DominatorOf => "the immediate dominator",
+                StageOp::RetainedSet { .. } => "a retained set",
+                StageOp::RefWalkResolve { .. } => "a reference walk",
+                StageOp::EdgeLookup { .. } => "reference edges",
+                StageOp::BoundedPath { .. } => "a bounded path",
+                _ => "a cross-phase operator",
+            },
+        );
     }
     if why.is_empty() {
         "the full analysis pipeline".to_string()
@@ -1587,9 +1619,34 @@ mod tests {
             serde_json::json!(true),
             "fast path must succeed: {v}"
         );
-        // The result must be a number (SUM of fake 42-byte retained sizes).
+        // Discriminating assertion. If this query had escalated instead, SUM would
+        // be the dump's REAL retained sizes; only the fast path joins the fake
+        // array we handed in. The previous assertion checked just "ok" and
+        // "non-empty", which BOTH paths satisfy — so it could not tell them apart,
+        // and in fact the fast path was unreachable the whole time (it demanded
+        // `needs.retained` and `!needs.retained` at once; see `cache_shaped`).
         let rows = v["result"]["rows"].as_array().expect("rows array");
         assert!(!rows.is_empty(), "SUM must produce a row: {v}");
+        let sum = rows[0][0]["v"].as_u64().expect("SUM value");
+        let count_v = run_query_json(
+            FIXTURE,
+            "SELECT COUNT(*) FROM java.lang.Thread",
+            5,
+            false,
+            &mut cache_slot,
+            None,
+            Some(&retained_arc),
+        );
+        let n_threads = count_v["result"]["rows"][0][0]["v"]
+            .as_u64()
+            .expect("COUNT value");
+        assert_eq!(
+            sum,
+            42 * n_threads,
+            "the fast path must have joined the FAKE retained array \
+             (42 bytes each x {n_threads} threads); getting {sum} means it escalated \
+             and read the dump's real retained sizes instead: {v}"
+        );
     }
 
     #[test]

@@ -5245,6 +5245,27 @@ pub(crate) fn cache_eligible(
     q: &crate::query::ast::Query,
     plan: &crate::query::plan::QueryPlan,
 ) -> bool {
+    // Head + all union branches must be resident-only, subquery-free, class-FROM.
+    plan.is_resident_only()
+        && plan.union_branches.iter().all(|bp| bp.is_resident_only())
+        && cache_shaped(q, plan)
+}
+
+/// The structural half of [`cache_eligible`]: a concrete, non-array class FROM
+/// with no subqueries, in the head and in every union branch (paired positionally
+/// against `q.union_branches`, which `optimize` preserves). Says **nothing** about
+/// whether the plan needs data the resident cache holds — that is
+/// `is_resident_only()`, and it is deliberately *not* part of this.
+///
+/// Split out because the server's retained fast path
+/// (`run_resident_with_retained`) can serve `needs.retained` queries — which
+/// `is_resident_only()` excludes by definition — so it needs these structural
+/// checks but not that one. Using `cache_eligible` there made the fast path
+/// unsatisfiable: it demanded `needs.retained` and `!needs.retained` at once.
+pub(crate) fn cache_shaped(
+    q: &crate::query::ast::Query,
+    plan: &crate::query::plan::QueryPlan,
+) -> bool {
     fn is_array_name(n: &str) -> bool {
         n.starts_with('[') || n.ends_with("[]")
     }
@@ -5256,11 +5277,7 @@ pub(crate) fn cache_eligible(
             None => false,
         }
     }
-    // Head + all union branches must be resident-only, subquery-free, class-FROM.
-    let head_ok = plan.is_resident_only()
-        && plan.from_subplan.is_none()
-        && plan.in_subplans.is_empty()
-        && from_ok(q);
+    let head_ok = plan.from_subplan.is_none() && plan.in_subplans.is_empty() && from_ok(q);
     // `optimize` preserves `plan.union_branches` positionally against
     // `q.union_branches`, so pair them 1:1. If the counts disagree (defensive),
     // fail closed and route to the scan path.
@@ -5269,12 +5286,7 @@ pub(crate) fn cache_eligible(
             .union_branches
             .iter()
             .zip(q.union_branches.iter())
-            .all(|(bp, bq)| {
-                bp.is_resident_only()
-                    && bp.from_subplan.is_none()
-                    && bp.in_subplans.is_empty()
-                    && from_ok(bq)
-            });
+            .all(|(bp, bq)| bp.from_subplan.is_none() && bp.in_subplans.is_empty() && from_ok(bq));
     head_ok && branches_ok
 }
 
