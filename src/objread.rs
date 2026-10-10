@@ -12,9 +12,10 @@
 //! server's single query slot, so one such query stalls every other client.
 //! Reading by offset has neither cost.
 //!
-//! Scope: `INSTANCE_DUMP` records only (what a plain Java object — e.g.
-//! `FareSearchRequest` — is). Arrays and class objects report their kind and
-//! are left to the array/class paths.
+//! Scope: `INSTANCE_DUMP`, `OBJ_ARRAY_DUMP` and `PRIM_ARRAY_DUMP` records — a
+//! plain Java object, plus the arrays that hold the interesting part of one
+//! (`String.value`, `List`/`Map` backing arrays). Class objects have no raw
+//! HPROF record and report their kind.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -24,8 +25,19 @@ use std::path::Path;
 use crate::pass1::ClassInfo;
 use crate::types::HprofType;
 
-/// HPROF heap-dump sub-record tag for a plain object instance.
+/// HPROF heap-dump sub-record tags.
 const INSTANCE_DUMP: u8 = 0x21;
+const OBJ_ARRAY_DUMP: u8 = 0x22;
+const PRIM_ARRAY_DUMP: u8 = 0x23;
+
+/// How many array elements `read_array_at` decodes before it stops and reports
+/// the rest as a count. A `byte[100_000_000]` must not become a 100 MB JSON
+/// array — the point is to see what an object *holds*, not to dump it.
+pub const MAX_ARRAY_ELEMENTS: usize = 64;
+
+/// Longest string `decode_utf*` returns before truncating (the full length is
+/// still reported by the caller).
+pub const MAX_STRING_CHARS: usize = 512;
 
 /// One decoded field of an instance.
 pub struct InstanceField {
@@ -115,6 +127,152 @@ pub fn read_instance_at(
 
     let fields = decode_fields(class_addr, &blob, class_map, strings, id_size);
     Ok(Some((obj_addr, class_addr, fields)))
+}
+
+/// An array record's decoded contents, capped at the `cap` the caller asked for.
+pub struct ArrayRead {
+    pub addr: u64,
+    /// `Some(ty)` for a primitive array; `None` for an object array, whose
+    /// elements are references to instances of `elem_class_addr`.
+    pub elem_ty: Option<HprofType>,
+    /// Object arrays only: the element class id. `0` for primitive arrays.
+    pub elem_class_addr: u64,
+    /// Total element count, whether or not every element was decoded.
+    pub count: u64,
+    /// The first `cap` elements (fewer when `count` is smaller).
+    pub values: Vec<FieldValue>,
+}
+
+impl ArrayRead {
+    /// True when `values` holds only a prefix of the array.
+    pub fn truncated(&self) -> bool {
+        self.count > self.values.len() as u64
+    }
+}
+
+/// Read the array record (`OBJ_ARRAY_DUMP` / `PRIM_ARRAY_DUMP`) at `offset`.
+///
+/// `cap` bounds how many elements are decoded and returned — a
+/// `byte[100_000_000]` must not become a 100 MB JSON array. Callers that want
+/// text pass a string-sized cap; callers rendering an array pass
+/// `MAX_ARRAY_ELEMENTS`.
+pub fn read_array_at(
+    path: &Path,
+    offset: u64,
+    id_size: usize,
+    cap: usize,
+) -> io::Result<Option<ArrayRead>> {
+    if offset == 0 {
+        return Ok(None);
+    }
+    let mut f = File::open(path)?;
+    f.seek(SeekFrom::Start(offset))?;
+    let mut tag = [0u8; 1];
+    f.read_exact(&mut tag)?;
+    let is_obj = match tag[0] {
+        OBJ_ARRAY_DUMP => true,
+        PRIM_ARRAY_DUMP => false,
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "expected an array record (0x{OBJ_ARRAY_DUMP:02x}/0x{PRIM_ARRAY_DUMP:02x}) \
+                     at offset {offset}, found 0x{other:02x} — offsets.bin is stale or the \
+                     dump changed"
+                ),
+            ));
+        }
+    };
+    // addr(id) + stack_serial(u4) + count(u4)
+    let mut head = vec![0u8; id_size + 4 + 4];
+    f.read_exact(&mut head)?;
+    let addr = be_u64(&head[..id_size]);
+    let count = be_u64(&head[id_size + 4..id_size + 8]);
+
+    // Object arrays name their element class; primitive arrays name an element type.
+    let (elem_ty, elem_class_addr) = if is_obj {
+        let mut cbuf = vec![0u8; id_size];
+        f.read_exact(&mut cbuf)?;
+        (None, be_u64(&cbuf))
+    } else {
+        let mut code = [0u8; 1];
+        f.read_exact(&mut code)?;
+        let ty = HprofType::from_code(code[0]).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unknown primitive element type code {} at offset {offset}",
+                    code[0]
+                ),
+            )
+        })?;
+        (Some(ty), 0)
+    };
+
+    let n = count.min(cap as u64) as usize;
+    let elem_size = if is_obj {
+        id_size
+    } else {
+        elem_ty.map(|t| t.byte_size()).unwrap_or(0)
+    };
+    let mut values = Vec::with_capacity(n);
+    if elem_size > 0 && n > 0 {
+        // n is capped, so this is at most `cap * 8` bytes.
+        let mut buf = vec![0u8; n * elem_size];
+        f.read_exact(&mut buf)?;
+        for chunk in buf.chunks_exact(elem_size) {
+            values.push(if let Some(ty) = elem_ty {
+                decode_value(ty, chunk, id_size)
+            } else {
+                let a = be_u64(chunk);
+                if a == 0 {
+                    FieldValue::Null
+                } else {
+                    FieldValue::Ref(a)
+                }
+            });
+        }
+    }
+    Ok(Some(ArrayRead {
+        addr,
+        elem_ty,
+        elem_class_addr,
+        count,
+        values,
+    }))
+}
+
+/// Decode a Java 9+ compact `String`'s `byte[] value` with its `byte coder`
+/// (`0` = LATIN1, `1` = UTF-16 big-endian) into text.
+pub fn text_from_bytes(elems: &[FieldValue], coder: i64) -> String {
+    let bytes: Vec<u8> = elems
+        .iter()
+        .map(|v| match v {
+            FieldValue::Prim(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(0) as u8,
+            _ => 0,
+        })
+        .collect();
+    if coder == 1 {
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16_lossy(&units)
+    } else {
+        bytes.iter().map(|&b| b as char).collect()
+    }
+}
+
+/// Decode a pre-Java-9 `String`'s `char[] value` (each element already rendered
+/// as a one-character string by `decode_value`).
+pub fn text_from_chars(elems: &[FieldValue]) -> String {
+    let mut s = String::new();
+    for v in elems {
+        if let FieldValue::Prim(serde_json::Value::String(c)) = v {
+            s.push_str(c);
+        }
+    }
+    s
 }
 
 /// Walk the class's super-chain (child → parent, the order HPROF lays instance

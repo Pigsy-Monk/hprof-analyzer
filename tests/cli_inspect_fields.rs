@@ -124,12 +124,11 @@ fn inspect_without_offsets_degrades_loudly() {
     );
 }
 
-/// Arrays and class objects are out of scope for field decoding (their records
-/// have a different layout, and class objects have no record at all). They must
-/// report that, and must not be mistaken for instances with no fields.
+/// A `String`-valued field carries the decoded text, not just a `byte[]` the
+/// caller would have to chase: `key` here points at a `java.lang.String`.
 #[test]
-fn inspect_non_instance_reports_kind() {
-    let Some((_dir, dump)) = staged_copy("kind") else {
+fn inspect_inlines_string_field_text() {
+    let Some((_dir, dump)) = staged_copy("strfld") else {
         return;
     };
     let load = Command::new(BIN)
@@ -139,23 +138,88 @@ fn inspect_non_instance_reports_kind() {
         .unwrap();
     assert!(load.status.success(), "heap load failed");
 
-    // Object 72895 is a `byte[]` (kind 2, primitive array).
+    let obj = inspect_json(&dump, 100);
+    let key = &obj["fields"]["key"];
+    assert_eq!(key["@class"], "java.lang.String");
+    assert_eq!(
+        key["@text"], "ymt",
+        "string-valued field must carry its text"
+    );
+}
+
+/// Inspecting a `String` itself shows the text, not only its `value` byte[].
+#[test]
+fn inspect_string_object_shows_text() {
+    let Some((_dir, dump)) = staged_copy("strobj") else {
+        return;
+    };
+    let load = Command::new(BIN)
+        .args(["heap", "load"])
+        .arg(&dump)
+        .output()
+        .unwrap();
+    assert!(load.status.success(), "heap load failed");
+
+    let s = inspect_json(&dump, 226452);
+    assert_eq!(s["class"], "java.lang.String");
+    assert_eq!(s["fields"]["@text"], "ymt");
+    // The raw fields are still there alongside the decoded text.
+    assert_eq!(s["fields"]["hash"], 119776);
+    assert_eq!(s["fields"]["coder"], 0);
+}
+
+/// Arrays are decoded now: elements (capped), element type, and the true count.
+///
+/// Object 72895 is a `byte[]`; the point is that a reference chain no longer
+/// dead-ends here — `String.value` → `byte[]` used to be unreadable.
+#[test]
+fn inspect_decodes_array_elements() {
+    let Some((_dir, dump)) = staged_copy("arr") else {
+        return;
+    };
+    let load = Command::new(BIN)
+        .args(["heap", "load"])
+        .arg(&dump)
+        .output()
+        .unwrap();
+    assert!(load.status.success(), "heap load failed");
+
     let arr = inspect_json(&dump, 72895);
     assert_eq!(arr["class"], "byte[]");
-    assert_eq!(arr["fields"], serde_json::Value::Null);
+    let f = &arr["fields"];
+    assert_eq!(f["@kind"], "primitive array");
+    assert_eq!(f["@element_type"], "byte");
     assert!(
-        arr["fields_note"].as_str().unwrap_or("").contains("kind 2"),
-        "array must report its kind, got {:?}",
-        arr["fields_note"]
+        f["@element_count"].is_number(),
+        "must report the true count"
     );
+    assert!(f["elements"].is_array(), "elements must be a list");
+}
+
+/// A class object has no HPROF record; it must say that rather than read garbage
+/// or print an empty object.
+#[test]
+fn inspect_class_object_reports_no_record() {
+    let Some((_dir, dump)) = staged_copy("cls") else {
+        return;
+    };
+    let load = Command::new(BIN)
+        .args(["heap", "load"])
+        .arg(&dump)
+        .output()
+        .unwrap();
+    assert!(load.status.success(), "heap load failed");
 
     // Object 233903 is a `java.lang.Class` (kind 3).
     let cls = inspect_json(&dump, 233903);
     assert_eq!(cls["class"], "java.lang.Class");
     assert_eq!(cls["fields"], serde_json::Value::Null);
     assert!(
-        cls["fields_note"].as_str().unwrap_or("").contains("kind 3"),
-        "class object must report its kind, got {:?}",
+        cls["fields_note"]
+            .as_str()
+            .unwrap_or("")
+            .contains("class object"),
+        "class object must report why it has no fields, got {:?}",
         cls["fields_note"]
     );
 }

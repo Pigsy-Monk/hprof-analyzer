@@ -5953,8 +5953,16 @@ fn dump_pass1_json(path: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Read one object's field values straight out of the dump and render them as a
-/// JSON object. See `objread` for why this is a seek rather than a rescan.
+/// Why `heap inspect` could not read values, in each case. Returned as the
+/// `fields_note` so the caller reports a reason instead of an empty object.
+const NO_OFFSETS_NOTE: &str = "this cache has no object-offset table (it predates offset \
+     capture). Re-analyze the dump, or pass --build-offsets (one pass-1 scan).";
+const COMPRESSED_NOTE: &str = "the dump is compressed (gzip/zip), so record offsets are not \
+     directly seekable; uncompress it and re-analyze to read fields.";
+
+/// Read one object's contents straight out of the dump and render them as a JSON
+/// object (or, for an array, an element list). See `objread` for why this is a
+/// seek rather than a rescan.
 ///
 /// Returns `(fields, address, note)`. `fields` is `None` — with `note` saying
 /// why — whenever the values cannot be read, so the caller reports the reason
@@ -5980,27 +5988,15 @@ fn inspect_fields(
         offsets = sess.cache.read_hprof_offsets()?;
     }
     let Some(offsets) = offsets else {
-        return Ok((
-            None,
-            None,
-            Some(
-                "this cache has no object-offset table (it predates offset capture). \
-                 Re-analyze the dump, or pass --build-offsets (one pass-1 scan)."
-                    .into(),
-            ),
-        ));
+        return Ok((None, None, Some(NO_OFFSETS_NOTE.into())));
     };
 
-    // 2. Only plain instances have an INSTANCE_DUMP record to decode.
-    if kind != 0 {
+    // 2. Class objects have no HPROF record (pass 1 records offset 0 for them).
+    if kind == 3 {
         return Ok((
             None,
             None,
-            Some(format!(
-                "object kind {kind} is not a plain instance (0=instance, 1=object \
-                 array, 2=primitive array, 3=class object); field values are decoded \
-                 for instances only"
-            )),
+            Some("this object is a class object; it has no HPROF record to decode".into()),
         ));
     }
     let offset = offsets.get(idx).copied().unwrap_or(0);
@@ -6016,17 +6012,30 @@ fn inspect_fields(
     //    an uncompressed dump. Refuse rather than silently rescan a gzip stream.
     let path = std::path::Path::new(dump);
     if !objread::is_seekable(path)? {
-        return Ok((
-            None,
-            None,
-            Some(
-                "the dump is compressed (gzip/zip), so record offsets are not \
-                 directly seekable; uncompress it and re-analyze to read fields."
-                    .into(),
-            ),
-        ));
+        return Ok((None, None, Some(COMPRESSED_NOTE.into())));
     }
 
+    if kind == 0 {
+        inspect_instance(dump, path, sess, class_idx, offset, &offsets)
+    } else {
+        inspect_array(dump, path, sess, class_idx, offset, &offsets)
+    }
+}
+
+/// Render a plain instance's fields.
+///
+/// A field whose value is a reference to a `java.lang.String` also carries the
+/// decoded text: without it the most interesting field of most objects (the
+/// string it holds) reads as an opaque `byte[]` the caller has to chase by hand.
+fn inspect_instance(
+    dump: &str,
+    path: &std::path::Path,
+    sess: &hprof_analyzer::cache::CachedSession,
+    class_idx: &[u32],
+    offset: u64,
+    offsets: &[u64],
+) -> anyhow::Result<(Option<serde_json::Value>, Option<String>, Option<String>)> {
+    use hprof_analyzer::objread;
     let Some((addr, _class_addr, fields)) = objread::read_instance_at(
         path,
         offset,
@@ -6042,8 +6051,8 @@ fn inspect_fields(
         ));
     };
 
-    // 4. A subclass field may shadow an inherited one of the same simple name;
-    //    qualify those with their declaring class so none is lost.
+    // A subclass field may shadow an inherited one of the same simple name;
+    // qualify those with their declaring class so none is lost.
     let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for f in &fields {
         *counts.entry(f.name.as_str()).or_insert(0) += 1;
@@ -6055,7 +6064,19 @@ fn inspect_fields(
         } else {
             f.name.clone()
         };
-        map.insert(key, field_json(f, sess, class_idx));
+        let v = match &f.value {
+            objread::FieldValue::Prim(v) => v.clone(),
+            objread::FieldValue::Null => serde_json::Value::Null,
+            objread::FieldValue::Ref(a) => ref_json(*a, sess, class_idx, dump, offsets),
+        };
+        map.insert(key, v);
+    }
+    // Inspecting a String itself should show the string, not just its `value` field.
+    if let Some((text, full_len, truncated)) = string_text(dump, sess, offsets, addr) {
+        map.insert("@text".into(), serde_json::json!(text));
+        if truncated {
+            map.insert("@text_length".into(), serde_json::json!(full_len));
+        }
     }
     Ok((
         Some(serde_json::Value::Object(map)),
@@ -6064,32 +6085,199 @@ fn inspect_fields(
     ))
 }
 
-/// Render one field value. Object references become
-/// `{"@ref": "0x…", "@index": N, "@class": "…"}` — the target's address plus its
-/// dense index (so it can be fed back to `heap inspect`), never a recursive
-/// expansion.
-fn field_json(
-    f: &hprof_analyzer::objread::InstanceField,
+/// Render an array's elements, capped at `objread::MAX_ARRAY_ELEMENTS`.
+fn inspect_array(
+    dump: &str,
+    path: &std::path::Path,
     sess: &hprof_analyzer::cache::CachedSession,
     class_idx: &[u32],
-) -> serde_json::Value {
+    offset: u64,
+    offsets: &[u64],
+) -> anyhow::Result<(Option<serde_json::Value>, Option<String>, Option<String>)> {
     use hprof_analyzer::objread;
-    match &f.value {
-        objread::FieldValue::Prim(v) => v.clone(),
-        objread::FieldValue::Null => serde_json::Value::Null,
-        objread::FieldValue::Ref(addr) => {
-            let mut o = serde_json::Map::new();
-            o.insert("@ref".into(), serde_json::json!(format!("0x{addr:x}")));
-            if let Some(i) = sess.index_of_addr(*addr) {
-                o.insert("@index".into(), serde_json::json!(i));
-                if let Some(&ci) = class_idx.get(i) {
-                    if let Some(n) = sess.class_names.get(ci as usize) {
-                        o.insert("@class".into(), serde_json::json!(n));
-                    }
-                }
-            }
-            serde_json::Value::Object(o)
+    let Some(arr) = objread::read_array_at(
+        path,
+        offset,
+        sess.pass1.id_size as usize,
+        objread::MAX_ARRAY_ELEMENTS,
+    )?
+    else {
+        return Ok((
+            None,
+            None,
+            Some("no array record at the recorded offset".into()),
+        ));
+    };
+    let mut o = serde_json::Map::new();
+    o.insert(
+        "@kind".into(),
+        serde_json::json!(if arr.elem_ty.is_some() {
+            "primitive array"
+        } else {
+            "object array"
+        }),
+    );
+    o.insert("@element_count".into(), serde_json::json!(arr.count));
+    match arr.elem_ty {
+        Some(ty) => {
+            o.insert("@element_type".into(), serde_json::json!(type_name(ty)));
         }
+        None => {
+            if let Some(n) = class_name_at(sess, arr.elem_class_addr) {
+                o.insert(
+                    "@element_class".into(),
+                    serde_json::json!(n.replace('/', ".")),
+                );
+            }
+        }
+    }
+    o.insert(
+        "elements".into(),
+        serde_json::Value::Array(
+            arr.values
+                .iter()
+                .map(|v| match v {
+                    objread::FieldValue::Prim(v) => v.clone(),
+                    objread::FieldValue::Null => serde_json::Value::Null,
+                    objread::FieldValue::Ref(a) => ref_json(*a, sess, class_idx, dump, offsets),
+                })
+                .collect(),
+        ),
+    );
+    if arr.truncated() {
+        o.insert("@truncated".into(), serde_json::json!(true));
+    }
+    Ok((
+        Some(serde_json::Value::Object(o)),
+        Some(format!("0x{:x}", arr.addr)),
+        None,
+    ))
+}
+
+/// The slash-form name of the class object at `class_addr` (the form
+/// `pass1::strings` holds; callers dot it for display).
+fn class_name_at(sess: &hprof_analyzer::cache::CachedSession, class_addr: u64) -> Option<String> {
+    let ci = sess.pass1.class_map.get(&class_addr)?;
+    sess.pass1.strings.get(&ci.name_id).cloned()
+}
+
+/// Render an object reference as `{"@ref", "@index", "@class"}` — the target's
+/// address plus its dense index (so it can be fed back to `heap inspect`) —
+/// never a recursive expansion. Adds `@text` when the target is a
+/// `java.lang.String`, so a string-valued field reads as text.
+fn ref_json(
+    addr: u64,
+    sess: &hprof_analyzer::cache::CachedSession,
+    class_idx: &[u32],
+    dump: &str,
+    offsets: &[u64],
+) -> serde_json::Value {
+    let mut o = serde_json::Map::new();
+    o.insert("@ref".into(), serde_json::json!(format!("0x{addr:x}")));
+    if let Some(i) = sess.index_of_addr(addr) {
+        o.insert("@index".into(), serde_json::json!(i));
+        if let Some(&ci) = class_idx.get(i) {
+            if let Some(n) = sess.class_names.get(ci as usize) {
+                o.insert("@class".into(), serde_json::json!(n));
+            }
+        }
+    }
+    if let Some((text, full_len, truncated)) = string_text(dump, sess, offsets, addr) {
+        o.insert("@text".into(), serde_json::json!(text));
+        if truncated {
+            o.insert("@text_length".into(), serde_json::json!(full_len));
+        }
+    }
+    serde_json::Value::Object(o)
+}
+
+/// Decode the `java.lang.String` at `addr` into `(text, full_len, truncated)`.
+///
+/// `None` for anything that is not a String, or whose bytes cannot be reached —
+/// a String we cannot read must not fail the whole `inspect`.
+///
+/// Covers both layouts: Java 9+ compact strings (`byte[] value` + `byte coder`,
+/// 0 = LATIN1, 1 = UTF-16) and pre-9 (`char[] value` + `int offset` + `int count`).
+fn string_text(
+    dump: &str,
+    sess: &hprof_analyzer::cache::CachedSession,
+    offsets: &[u64],
+    addr: u64,
+) -> Option<(String, u64, bool)> {
+    use hprof_analyzer::objread;
+    use hprof_analyzer::types::HprofType;
+
+    let path = std::path::Path::new(dump);
+    let id_size = sess.pass1.id_size as usize;
+    let idx = sess.index_of_addr(addr)?;
+    let offset = *offsets.get(idx)?;
+    if offset == 0 {
+        return None;
+    }
+    let (_, class_addr, fields) = objread::read_instance_at(
+        path,
+        offset,
+        &sess.pass1.class_map,
+        &sess.pass1.strings,
+        id_size,
+    )
+    .ok()??;
+    if class_name_at(sess, class_addr).as_deref() != Some("java/lang/String") {
+        return None;
+    }
+    let (mut value_addr, mut coder, mut joffset, mut jcount) = (None, 0i64, None, None);
+    for f in &fields {
+        match (f.name.as_str(), &f.value) {
+            ("value", objread::FieldValue::Ref(a)) => value_addr = Some(*a),
+            ("coder", objread::FieldValue::Prim(v)) => coder = v.as_i64().unwrap_or(0),
+            ("offset", objread::FieldValue::Prim(v)) => joffset = v.as_i64(),
+            ("count", objread::FieldValue::Prim(v)) => jcount = v.as_i64(),
+            _ => {}
+        }
+    }
+    let vi = sess.index_of_addr(value_addr?)?;
+    let voff = *offsets.get(vi)?;
+    if voff == 0 {
+        return None;
+    }
+    let arr = objread::read_array_at(path, voff, id_size, objread::MAX_STRING_CHARS).ok()??;
+    let (text, full_len) = match arr.elem_ty {
+        Some(HprofType::Byte) => (objread::text_from_bytes(&arr.values, coder), arr.count),
+        Some(HprofType::Char) => {
+            // Pre-9: `value` may be a shared backing array; `offset`/`count` select
+            // the window this String owns.
+            let off = joffset.unwrap_or(0).max(0) as usize;
+            let cnt = jcount
+                .map(|c| c.max(0) as usize)
+                .unwrap_or_else(|| arr.values.len().saturating_sub(off));
+            let end = off.saturating_add(cnt).min(arr.values.len());
+            let window: &[objread::FieldValue] = if off < arr.values.len() {
+                &arr.values[off..end]
+            } else {
+                &[]
+            };
+            (objread::text_from_chars(window), arr.count)
+        }
+        _ => return None,
+    };
+    let truncated = arr.truncated() || text.chars().count() > objread::MAX_STRING_CHARS;
+    let text: String = text.chars().take(objread::MAX_STRING_CHARS).collect();
+    Some((text, full_len, truncated))
+}
+
+/// Human name for an array's element type.
+fn type_name(ty: hprof_analyzer::types::HprofType) -> &'static str {
+    use hprof_analyzer::types::HprofType as T;
+    match ty {
+        T::Object => "object",
+        T::Boolean => "boolean",
+        T::Char => "char",
+        T::Float => "float",
+        T::Double => "double",
+        T::Byte => "byte",
+        T::Short => "short",
+        T::Int => "int",
+        T::Long => "long",
     }
 }
 
