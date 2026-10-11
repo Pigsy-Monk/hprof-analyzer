@@ -1395,4 +1395,373 @@ mod tests {
         let err = w.finish().unwrap_err().to_string();
         assert!(err.contains("expected 4 arrays, got 3"), "{err}");
     }
+
+    // ── Chunked fwd_tgt: the cross-chunk paths ────────────────────────────────
+    //
+    // Every fixture dump has far fewer than `TGT_CHUNK_VALUES` (1,000,000) edges,
+    // so `add_chunked_delta_u32` writes a single chunk and `ChunkedTgt`'s `base`
+    // link, per-chunk table and `copy_range` cross-chunk loop never execute
+    // against a real fixture. The tests below are the only place they do.
+
+    /// A directory to hold a `graph.bin` — `ChunkedTgt::open` takes a cache
+    /// directory, not a file.
+    fn tmp_dir(name: &str) -> PathBuf {
+        let dir = tmp_path(name);
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_file(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Deterministic filler: no RNG dependency, and reproducible, so a failure's
+    /// index can be re-derived by hand.
+    fn pseudo_u32(i: usize) -> u32 {
+        (i as u32)
+            .wrapping_mul(2_654_435_761)
+            .wrapping_add(0x9E37_79B9)
+    }
+
+    /// Element-wise compare that names the offending index. A whole-vector
+    /// `assert_eq!` on 2.5M elements would print ~10 MB of numbers before it
+    /// said which one was wrong.
+    fn assert_u32_slice_eq(got: &[u32], want: &[u32], ctx: &str) {
+        assert_eq!(got.len(), want.len(), "{ctx}: length");
+        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert_eq!(g, w, "{ctx}: index {i}");
+        }
+    }
+
+    /// Values chosen so that the *difference* between adjacent entries does not
+    /// fit in `i32`: 0 → 3e9 and 4e9 → 0 both overflow (i32::MAX ≈ 2.147e9).
+    /// The writer truncates such a delta with `as i32`; the reader has to undo
+    /// that with `wrapping_add`. The seam pairs below sit exactly on a chunk
+    /// boundary, so the wrap also crosses the `base` link, not just an
+    /// intra-chunk pair.
+    fn apply_wrap_hotspots(want: &mut [u32], total: usize) {
+        want[0] = 0;
+        // Each seam below is an adjacent pair whose difference does not fit in
+        // i32, sitting ON a chunk boundary so the wrap also crosses the `base`
+        // link. Both sides of each pair are set, so the guard at the end is
+        // deterministic whatever the filler happened to be.
+        want[TGT_CHUNK_VALUES - 1] = 4_000_000_000; // delta from 0 ≈ 4e9 > i32::MAX
+        want[TGT_CHUNK_VALUES] = 0; // delta from 4e9 ≈ -4e9 < i32::MIN
+        let mut seams = vec![TGT_CHUNK_VALUES];
+        if total > 2 * TGT_CHUNK_VALUES {
+            want[2 * TGT_CHUNK_VALUES - 1] = u32::MAX;
+            want[2 * TGT_CHUNK_VALUES] = 0; // delta ≈ -4.29e9 < i32::MIN
+            seams.push(2 * TGT_CHUNK_VALUES);
+        }
+        // Extremes, not necessarily wrap pairs.
+        want[TGT_CHUNK_VALUES + 1] = u32::MAX;
+        want[TGT_CHUNK_VALUES + 2] = 0;
+        want[total - 1] = 3_000_000_000;
+        // Guard: the seam deltas really must not fit in i32, otherwise an edit
+        // to the values above would quietly turn the wrap tests into plain
+        // monotonic round trips that pass without touching the wrapping path.
+        for seam in seams {
+            let d = want[seam] as i64 - want[seam - 1] as i64;
+            assert!(
+                d > i32::MAX as i64 || d < i32::MIN as i64,
+                "hotspot at index {seam} (delta {d}) must overflow i32 to be a wrap case"
+            );
+        }
+    }
+
+    /// The first four bytes of a `graph.bin`'s `fwd_tgt` entry — what the
+    /// reader sniffs to pick between the two formats.
+    fn entry_head(dir: &Path) -> [u8; 4] {
+        let (mut f, _) = seek_to_entry(&dir.join("graph.bin"), "fwd_tgt")
+            .unwrap()
+            .unwrap();
+        let mut h = [0u8; 4];
+        f.read_exact(&mut h).unwrap();
+        h
+    }
+
+    /// Write `want` as the chunked `fwd_tgt` of a fresh `<dir>/graph.bin` and
+    /// return the opened reader. `want.len()` must equal `total`.
+    fn write_chunked_tgt(dir: &Path, want: &[u32]) -> ChunkedTgt {
+        let mut w = IndexedWriter::create(&dir.join("graph.bin"), 1).unwrap();
+        w.add_chunked_delta_u32("fwd_tgt", want.len(), want.iter().copied())
+            .unwrap();
+        w.finish().unwrap();
+        ChunkedTgt::open(dir).unwrap().expect("chunked container")
+    }
+
+    /// Three chunks (1M + 1M + 0.5M) with wrap-inducing values on the seams.
+    /// The `n_chunks() == 3` assertion is what proves the cross-chunk code ran
+    /// rather than the write degenerating into a single chunk.
+    #[test]
+    fn chunked_tgt_round_trips_across_three_chunks() {
+        let total = 2 * TGT_CHUNK_VALUES + TGT_CHUNK_VALUES / 2;
+        let mut want: Vec<u32> = (0..total).map(pseudo_u32).collect();
+        apply_wrap_hotspots(&mut want, total);
+
+        let dir = tmp_dir("chunked_three");
+        let t = write_chunked_tgt(&dir, &want);
+        assert_eq!(t.total(), total);
+        assert_eq!(
+            t.n_chunks(),
+            3,
+            "3 chunks is the point: fewer means the boundary paths never ran"
+        );
+
+        let mut got = Vec::new();
+        t.copy_range(0, total, &mut got).unwrap();
+        assert_u32_slice_eq(&got, &want, "3-chunk whole-array read");
+
+        // Each chunk read on its own: a chunk decoded with the wrong `base`
+        // reproduces the tail of the previous chunk, which the whole-array read
+        // alone cannot distinguish from a correct one.
+        for c in 0..t.n_chunks() {
+            let s = c * TGT_CHUNK_VALUES;
+            let e = (s + TGT_CHUNK_VALUES).min(total);
+            let mut one = Vec::new();
+            t.copy_range(s, e, &mut one).unwrap();
+            assert_u32_slice_eq(&one, &want[s..e], &format!("chunk {c} alone"));
+        }
+    }
+
+    /// `2 × TGT_CHUNK_VALUES` divides exactly, so the last chunk is full and
+    /// there is no ragged tail — the case the 2.5-chunk test cannot cover.
+    #[test]
+    fn chunked_tgt_round_trips_an_exact_multiple_of_the_chunk_size() {
+        let total = 2 * TGT_CHUNK_VALUES;
+        let want: Vec<u32> = (0..total).map(pseudo_u32).collect();
+
+        let dir = tmp_dir("chunked_exact");
+        let t = write_chunked_tgt(&dir, &want);
+        assert_eq!(t.total(), total);
+        assert_eq!(t.n_chunks(), 2);
+
+        let mut got = Vec::new();
+        t.copy_range(0, total, &mut got).unwrap();
+        assert_u32_slice_eq(&got, &want, "exact-multiple whole-array read");
+    }
+
+    /// `copy_range` has to iterate its `while i < end` loop more than once when
+    /// the range straddles a boundary, and to clamp at the array's end.
+    #[test]
+    fn chunked_tgt_copy_range_spans_chunk_boundaries() {
+        let total = 2 * TGT_CHUNK_VALUES + TGT_CHUNK_VALUES / 2;
+        let mut want: Vec<u32> = (0..total).map(pseudo_u32).collect();
+        apply_wrap_hotspots(&mut want, total);
+
+        let dir = tmp_dir("chunked_range");
+        let t = write_chunked_tgt(&dir, &want);
+
+        // Exactly one boundary: two loop iterations, with the wrap pair on the
+        // seam. 10 values, 5 on each side.
+        let (s, e) = (TGT_CHUNK_VALUES - 5, TGT_CHUNK_VALUES + 5);
+        let mut got = Vec::new();
+        t.copy_range(s, e, &mut got).unwrap();
+        assert_eq!(got.len(), e - s);
+        assert_u32_slice_eq(&got, &want[s..e], "range straddling one boundary");
+
+        // Three chunks in one call: the loop must re-enter for each.
+        let (s, e) = (TGT_CHUNK_VALUES - 3, 2 * TGT_CHUNK_VALUES + 3);
+        let mut got = Vec::new();
+        t.copy_range(s, e, &mut got).unwrap();
+        assert_eq!(got.len(), e - s);
+        assert_u32_slice_eq(&got, &want[s..e], "range spanning all three chunks");
+
+        // Entirely inside the ragged last chunk.
+        let (s, e) = (2 * TGT_CHUNK_VALUES + 1, total - 1);
+        let mut got = Vec::new();
+        t.copy_range(s, e, &mut got).unwrap();
+        assert_u32_slice_eq(&got, &want[s..e], "range inside the last chunk");
+
+        // An `end` past the array is clamped, not an error.
+        let mut got = Vec::new();
+        t.copy_range(total - 3, total + 100, &mut got).unwrap();
+        assert_u32_slice_eq(&got, &want[total - 3..], "clamped end");
+
+        // Empty and inverted ranges are no-ops.
+        for (s, e) in [(5usize, 5usize), (total, total), (total, total + 1)] {
+            let mut got = vec![7u32; 4];
+            t.copy_range(s, e, &mut got).unwrap();
+            assert!(got.is_empty(), "range {s}..{e} should be empty");
+        }
+    }
+
+    /// A `u32` difference can exceed `i32::MAX`, so the delta stream is not
+    /// plain arithmetic: the writer truncates with `as i32` and the reader
+    /// undoes it with `wrapping_add`. This is the pair that a "looks right"
+    /// implementation gets wrong while still passing a monotonic round trip.
+    #[test]
+    fn chunked_tgt_round_trips_deltas_that_do_not_fit_in_i32() {
+        // Two chunks, so the seam pair also restarts a delta chain at a
+        // non-zero `base`.
+        let total = TGT_CHUNK_VALUES + 3;
+        let mut want: Vec<u32> = (0..total).map(pseudo_u32).collect();
+        apply_wrap_hotspots(&mut want, total);
+        // Overwrite the first chunk's tail so the seam carries the extremes.
+        want[TGT_CHUNK_VALUES - 2] = 0;
+        want[TGT_CHUNK_VALUES - 1] = 4_000_000_000;
+        want[TGT_CHUNK_VALUES] = 0;
+        want[TGT_CHUNK_VALUES + 1] = u32::MAX;
+        want[TGT_CHUNK_VALUES + 2] = 0;
+
+        let dir = tmp_dir("chunked_wrap");
+        let t = write_chunked_tgt(&dir, &want);
+        assert_eq!(t.n_chunks(), 2);
+
+        let mut got = Vec::new();
+        t.copy_range(0, total, &mut got).unwrap();
+        assert_u32_slice_eq(&got, &want, "i32-overflowing deltas across a seam");
+
+        // The same arithmetic on a tiny array, so the failure is readable: 0 →
+        // 3e9 → 5 is the minimal pair that truncates.
+        let tiny = [
+            0u32,
+            3_000_000_000,
+            5,
+            u32::MAX,
+            0,
+            1,
+            u32::MAX,
+            3_000_000_000,
+            0,
+        ];
+        let tiny_dir = tmp_dir("chunked_wrap_tiny");
+        let tt = write_chunked_tgt(&tiny_dir, &tiny);
+        let mut tiny_got = Vec::new();
+        tt.copy_range(0, tiny.len(), &mut tiny_got).unwrap();
+        assert_u32_slice_eq(&tiny_got, &tiny, "tiny wrap sequence");
+    }
+
+    /// The strongest check: the chunked container is a *storage* change, so what
+    /// a reader gets back must be bit-identical to the old single-frame
+    /// `add_delta_u32` array. Round-tripping the chunked format through its own
+    /// reader only proves self-consistency — a self-consistent but wrong codec
+    /// passes that. Both formats are also read back through
+    /// `CacheDir::read_forward_targets`, whose four-byte sniff picks the branch,
+    /// because that is the production path (`mat caches`, the old-cache
+    /// fallback) the `.80` rebuild will exercise.
+    #[test]
+    fn chunked_fwd_tgt_is_bit_identical_to_the_flat_delta_format() {
+        let total = TGT_CHUNK_VALUES + 7; // genuinely two chunks, no ragged tail
+        let mut want: Vec<u32> = (0..total).map(pseudo_u32).collect();
+        apply_wrap_hotspots(&mut want, total);
+
+        // Old format: one delta frame for the whole array.
+        let flat_dir = tmp_dir("flat_delta");
+        let mut w = IndexedWriter::create(&flat_dir.join("graph.bin"), 1).unwrap();
+        w.add_delta_u32("fwd_tgt", want.iter().copied()).unwrap();
+        w.finish().unwrap();
+        let flat = read_delta_u32_array(&flat_dir.join("graph.bin"), "fwd_tgt")
+            .unwrap()
+            .unwrap();
+        assert_u32_slice_eq(&flat, &want, "flat delta array");
+
+        // New format: independent per-chunk frames.
+        let chunked_dir = tmp_dir("chunked_delta");
+        let t = write_chunked_tgt(&chunked_dir, &want);
+        assert_eq!(t.n_chunks(), 2);
+        let mut chunked = Vec::new();
+        t.copy_range(0, total, &mut chunked).unwrap();
+        assert_u32_slice_eq(&chunked, &want, "chunked array");
+
+        // The two must agree with each other, bit for bit.
+        assert_u32_slice_eq(&chunked, &flat, "chunked vs flat");
+
+        // And both through the production sniffer, which is what decides
+        // between the two decoders on a real cache.
+        let sniff_flat = CacheDir {
+            path: flat_dir.clone(),
+        }
+        .read_forward_targets(total)
+        .unwrap()
+        .expect("flat format must be recognised by the sniffer");
+        assert_u32_slice_eq(&sniff_flat, &want, "flat via read_forward_targets");
+
+        let sniff_chunked = CacheDir {
+            path: chunked_dir.clone(),
+        }
+        .read_forward_targets(total)
+        .unwrap()
+        .expect("chunked format must be recognised by the sniffer");
+        assert_u32_slice_eq(&sniff_chunked, &want, "chunked via read_forward_targets");
+        assert_u32_slice_eq(
+            &sniff_chunked,
+            &sniff_flat,
+            "read_forward_targets: chunked vs flat",
+        );
+
+        // The two entries are genuinely different on disk, so the comparison
+        // above is a cross-format one rather than a file compared with itself:
+        // the flat entry is a bare zstd frame, the chunked one is the HTGT
+        // container. This also pins down which branch the sniffer took.
+        assert_eq!(
+            entry_head(&flat_dir),
+            [0x28, 0xB5, 0x2F, 0xFD],
+            "flat fwd_tgt entry should be a bare zstd frame"
+        );
+        assert_eq!(
+            entry_head(&chunked_dir),
+            *TGT_MAGIC,
+            "chunked fwd_tgt entry should carry the HTGT magic"
+        );
+    }
+
+    /// Negative control for the cross-chunk `base` link: patch the stored base
+    /// of chunk 1 in the on-disk table and check the decoded values move by
+    /// exactly that amount. If `load_chunk` ignored the base — or if the tests
+    /// above were somehow passing without crossing a chunk — this would not
+    /// shift. Also asserts the writer stored the previous chunk's *last value*
+    /// as the base, which is the contract the whole design rests on.
+    #[test]
+    fn chunked_tgt_base_comes_from_the_table_and_is_load_bearing() {
+        let total = 2 * TGT_CHUNK_VALUES + TGT_CHUNK_VALUES / 2;
+        let mut want: Vec<u32> = (0..total).map(pseudo_u32).collect();
+        apply_wrap_hotspots(&mut want, total);
+
+        let dir = tmp_dir("chunked_base_patch");
+        let t = write_chunked_tgt(&dir, &want);
+        assert_eq!(t.n_chunks(), 3);
+        drop(t);
+
+        // The table lives at the end of the entry: locate it from the index.
+        let path = dir.join("graph.bin");
+        let (mut f, len) = seek_to_entry(&path, "fwd_tgt").unwrap().unwrap();
+        let entry_off = f.stream_position().unwrap();
+        let table_off =
+            entry_off + len as u64 - (total.div_ceil(TGT_CHUNK_VALUES) * TGT_TABLE_ENTRY) as u64;
+        let base_off = table_off + TGT_TABLE_ENTRY as u64; // chunk 1's base
+        f.seek(SeekFrom::Start(base_off)).unwrap();
+        let mut raw = [0u8; 8];
+        f.read_exact(&mut raw).unwrap();
+        let stored_base = u64::from_le_bytes(raw);
+        assert_eq!(
+            stored_base,
+            want[TGT_CHUNK_VALUES - 1] as u64,
+            "chunk 1's base must be the previous chunk's last value"
+        );
+        drop(f);
+
+        let new_base = 7u64;
+        let mut fw = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        fw.seek(SeekFrom::Start(base_off)).unwrap();
+        fw.write_all(&new_base.to_le_bytes()).unwrap();
+        fw.flush().unwrap();
+        drop(fw);
+
+        let patched = ChunkedTgt::open(&dir).unwrap().expect("still chunked");
+        let mut got = Vec::new();
+        patched
+            .copy_range(TGT_CHUNK_VALUES, TGT_CHUNK_VALUES + 4, &mut got)
+            .unwrap();
+        let shift = (new_base as u32).wrapping_sub(stored_base as u32);
+        assert_ne!(
+            got[0], want[TGT_CHUNK_VALUES],
+            "the patched base changed nothing"
+        );
+        for (i, v) in got.iter().enumerate() {
+            assert_eq!(
+                *v,
+                want[TGT_CHUNK_VALUES + i].wrapping_add(shift),
+                "chunk 1 shifted by the patched base, index {i}"
+            );
+        }
+    }
 }
