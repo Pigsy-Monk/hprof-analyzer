@@ -5238,9 +5238,10 @@ fn handle_meta(
 }
 
 /// A query is served from the warm ReplCache iff it is resident-only, has no
-/// subqueries, and its FROM (and every UNION branch's FROM) is a non-array class.
-/// Array-class FROM is excluded: `run_resident_only` can't reconstruct per-array
-/// class names without a real scan (v1 limitation), so those stay on the scan path.
+/// subqueries, its FROM (and every UNION branch's FROM) is a non-array class, and
+/// it cannot observe an array's element count. Array-class FROM stays on the scan
+/// path (a v1 limitation, see [`cache_shaped`]); a query that merely *can* match
+/// arrays is served here, since the resident path now delivers arrays too.
 pub(crate) fn cache_eligible(
     q: &crate::query::ast::Query,
     plan: &crate::query::plan::QueryPlan,
@@ -5336,7 +5337,20 @@ pub(crate) fn cache_shaped(
             None => false,
         }
     }
-    let head_ok = plan.from_subplan.is_none() && plan.in_subplans.is_empty() && from_ok(q);
+    /// The resident path delivers ARRAY objects (their class names come straight
+    /// out of the cached `class_map`/`strings`, mirroring pass2's `visit_array`)
+    /// but cannot know an array's element COUNT: Pass1's `elem_count` is freed by
+    /// pass2 and never reaches the cache. So a query that can observe a count
+    /// (`@length`, `length()`, `size()`) must take the scan path — otherwise the
+    /// server would answer 0 where `run_single_dump` answers the real length.
+    fn array_length_ok(q: &crate::query::ast::Query) -> bool {
+        !(crate::query::execute::from_may_match_arrays(q)
+            && crate::query::execute::query_observes_array_length(q))
+    }
+    let head_ok = plan.from_subplan.is_none()
+        && plan.in_subplans.is_empty()
+        && from_ok(q)
+        && array_length_ok(q);
     // `optimize` preserves `plan.union_branches` positionally against
     // `q.union_branches`, so pair them 1:1. If the counts disagree (defensive),
     // fail closed and route to the scan path.
@@ -5345,7 +5359,12 @@ pub(crate) fn cache_shaped(
             .union_branches
             .iter()
             .zip(q.union_branches.iter())
-            .all(|(bp, bq)| bp.from_subplan.is_none() && bp.in_subplans.is_empty() && from_ok(bq));
+            .all(|(bp, bq)| {
+                bp.from_subplan.is_none()
+                    && bp.in_subplans.is_empty()
+                    && from_ok(bq)
+                    && array_length_ok(bq)
+            });
     head_ok && branches_ok
 }
 
@@ -6164,6 +6183,31 @@ mod tests {
         // array FROM must NOT be cache-eligible (v1 limitation).
         let (rq, rp) = plan_of("SELECT * FROM int[]");
         assert!(!cache_eligible(&rq, &rp), "array FROM -> scan");
+
+        // A query that can match arrays but cannot observe an element count IS
+        // cache-eligible: the resident path now delivers the arrays themselves.
+        let (iq, ip) = plan_of("SELECT classof(s) FROM INSTANCEOF java.lang.Object s");
+        assert!(cache_eligible(&iq, &ip), "INSTANCEOF Object -> cache");
+
+        // ...but one that reads an array's element count is NOT: the cache holds
+        // no per-array count (Pass1's `elem_count` never reaches it), so it would
+        // answer 0 where the scan path answers the real length.
+        for oql in [
+            "SELECT COUNT(*) FROM INSTANCEOF java.lang.Object s WHERE s.@length > 8",
+            "SELECT COUNT(*) FROM INSTANCEOF java.lang.Object s WHERE s.size() > 8",
+            "SELECT s.@length FROM INSTANCEOF java.lang.Object s",
+        ] {
+            let (q, p) = plan_of(oql);
+            assert!(
+                !cache_eligible(&q, &p),
+                "{oql} observes an array element count -> scan"
+            );
+        }
+
+        // The same `@length` query against a FROM that cannot match an array
+        // stays eligible — no array is involved, so no count is missing.
+        let (sq, sp) = plan_of("SELECT COUNT(*) FROM java.lang.Thread t WHERE t.@length > 8");
+        assert!(cache_eligible(&sq, &sp), "non-array FROM @length -> cache");
     }
 
     fn meta_out(cmd: &str) -> (bool, String) {

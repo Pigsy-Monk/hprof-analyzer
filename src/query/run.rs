@@ -1174,6 +1174,44 @@ pub(crate) fn is_row_expanding_op(op: &crate::query::plan::StageOp) -> bool {
     )
 }
 
+/// Deliver the resident cache's ARRAY objects to `driver`, mirroring the pass2
+/// 2a scan's `visit_array` calls: an object array's class NAME is its element
+/// class's descriptor (`class_map` → `strings` — the same lookup the scan uses),
+/// a primitive array's is synthesized from its element type code.
+///
+/// The element COUNT is deliberately reported as 0: Pass1's `elem_count` is freed
+/// by pass2 and is not carried into the cache, so the resident path cannot know
+/// it. A query that can OBSERVE a count is kept off this path by
+/// `crate::query::repl::cache_shaped`; for every other query the value is never
+/// read, exactly as on the scan path.
+fn visit_cached_arrays<R: ClassResolver>(
+    driver: &mut ScanDriver<'_, R>,
+    p1: &crate::pass1::Pass1,
+    class_ids: &[u32],
+    n: usize,
+) {
+    for i in 0..n {
+        let name = match p1.kind[i] {
+            // Object array: the element-class descriptor IS the array's class name.
+            1 => p1
+                .class_addr_table
+                .get(class_ids[i] as usize)
+                .and_then(|addr| p1.class_map.get(addr))
+                .and_then(|ci| p1.strings.get(&ci.name_id))
+                .map(|raw| crate::report::format::pretty_class_name(raw)),
+            // Primitive array: synthesize the descriptor from the element type
+            // code (bits 0-29 of `class_ids`; the low byte survives the kind bits).
+            2 => Some(crate::report::format::pretty_class_name(
+                crate::pass2::sizing::prim_array_class_name(class_ids[i] as u8),
+            )),
+            _ => None,
+        };
+        if let Some(name) = name {
+            driver.visit_array(i, &name, 0);
+        }
+    }
+}
+
 /// Run the full pass1+pass2 pipeline against `path` for the given planned
 /// queries and return their results. Used by the REPL (and available to any
 /// one-shot caller). Does not build or render the full report.
@@ -1193,15 +1231,16 @@ pub(crate) fn is_row_expanding_op(op: &crate::query::plan::StageOp) -> bool {
 /// (safe: resident-only queries read only the resolver, never the blob).
 /// Reachability pruning + UNION collapse mirror `run_single_dump` exactly.
 ///
-/// v1 limitation: any query whose FROM targets an ARRAY class is NOT served here
-/// (array class names are only recoverable per-array by address during a real
-/// scan); the REPL router keeps those on the scan path. Only true instances
-/// (`kind == 0`) are driven through `visit_instance` with an EMPTY blob, exactly
-/// mirroring the scan path, which delivers ONLY INSTANCE_DUMP records to
-/// `visit_instance` (CLASS_DUMP class objects and array records are NOT — see
-/// pass2's 2a loop). Class objects (`kind == 3`), object arrays (`kind == 1`),
-/// and primitive arrays (`kind == 2`) are therefore skipped, so the row set
-/// matches the scan path bit-for-bit.
+/// True instances (`kind == 0`) are driven through `visit_instance` with an EMPTY
+/// blob, exactly mirroring the scan path, which delivers ONLY INSTANCE_DUMP
+/// records to `visit_instance` (CLASS_DUMP class objects are NOT — see pass2's 2a
+/// loop). Class objects (`kind == 3`) are therefore skipped.
+///
+/// Arrays (`kind == 1`/`2`) are delivered through `visit_array` whenever an armed
+/// query can match an array class — the same `wants_arrays` gate pass2 uses — so
+/// the row set matches the scan path bit-for-bit. What the resident cache cannot
+/// supply is an array's element COUNT, so a query that can observe one is kept
+/// off this path by `cache_shaped`.
 pub fn run_resident_only(
     cache: &ReplCache,
     queries: &[(Query, QueryPlan)],
@@ -1307,10 +1346,10 @@ pub fn run_resident_only(
 
     // Drive over cached dense indices. ONLY true instances (kind 0) go through
     // visit_instance — this mirrors the scan path exactly, which sends only
-    // INSTANCE_DUMP records to visit_instance. Class objects (kind 3) and arrays
-    // (kind 1/2) are skipped: array-FROM queries are routed to the scan path by
-    // the caller, and the scan never delivers class objects to visit_instance
-    // either.
+    // INSTANCE_DUMP records to visit_instance. Class objects (kind 3) are
+    // skipped: the scan never delivers them to visit_instance either. Arrays
+    // (kind 1/2) are NOT driven here; they go through `visit_array` below, the
+    // same way pass2's 2a scan delivers them.
     //
     // When every query pinned `@objectId` to a literal, visit ONLY those indices
     // (see `ScanDriver::pushdown_indices`) — the whole-heap loop collapses to a
@@ -1356,6 +1395,16 @@ pub fn run_resident_only(
                 visit_dense!(i);
             }
         }
+    }
+    // Arrays go through `visit_array`, gated on `wants_arrays` exactly as pass2's
+    // 2a scan gates its own per-array name construction — nothing above delivers
+    // them, so without this an `INSTANCEOF java.lang.Object` answered from the
+    // warm cache silently drops every `byte[]` / `Object[]`, the row set the scan
+    // path (and MAT) report. Skipped once every executor is saturated: a
+    // saturated executor ignores further objects at its cap check, so this is
+    // the same row set without a wasted full sweep of the cache.
+    if driver.wants_arrays() && !driver.is_done() {
+        visit_cached_arrays(&mut driver, &cache.p1, &cache.class_ids, cache.n);
     }
     drop(blob_reader);
 
@@ -1489,6 +1538,12 @@ pub fn run_resident_with_retained(
                 }
             }
         }
+    }
+    // See `run_resident_only`: arrays are delivered whenever an armed query can
+    // match one, mirroring pass2's 2a scan. Skipped once every executor is
+    // saturated, for the same reason (and with the same byte-identical result).
+    if driver.wants_arrays() && !driver.is_done() {
+        visit_cached_arrays(&mut driver, &cache.p1, &cache.class_ids, cache.n);
     }
     let state = driver.finish_state();
     let dfn: Option<&[u32]> = if reachable_only {
@@ -3141,6 +3196,53 @@ mod tests {
                 "row-value set parity for {oql}"
             );
         }
+    }
+
+    /// The resident path must deliver ARRAY objects whenever the FROM can match
+    /// one — `FROM INSTANCEOF java.lang.Object` included, since every array type
+    /// is a subtype of Object. Without it the cache silently dropped `byte[]` /
+    /// `java.lang.Object[]` from every histogram built that way, while the scan
+    /// path (and MAT) reported them as the top classes by shallow size.
+    ///
+    /// Discriminating: the assertions name the exact array counts, so a cache run
+    /// that omits arrays fails on the map lookup rather than merely on parity.
+    #[test]
+    fn resident_only_delivers_arrays_for_instanceof_object() {
+        let path = "tests/fixtures/dump_4_philosophers.hprof";
+        let cache = ReplCache::build(&crate::source::HprofSource::from(path), true).expect("cache");
+        let oql = "SELECT classof(s) AS cls, COUNT(*) AS n FROM INSTANCEOF java.lang.Object s \
+                   GROUP BY classof(s)";
+
+        let (q, plan) = parse_plan_opt(oql);
+        assert!(plan.is_resident_only(), "{oql} must be resident-only");
+
+        let cache_out =
+            run_resident_only(&cache, &[(q.clone(), plan.clone())], true).expect("cache run");
+        let scan_out = run_single_dump(path, &[(q, plan)], true).expect("scan run");
+
+        fn class_counts(r: &QueryResult) -> HashMap<String, i64> {
+            let mut m = HashMap::new();
+            for row in &r.rows {
+                if let (QueryValue::Str(cls), QueryValue::Int(n)) = (&row[0], &row[1]) {
+                    m.insert(cls.clone(), *n);
+                }
+            }
+            m
+        }
+        let cached = class_counts(&cache_out[0]);
+        let scanned = class_counts(&scan_out[0]);
+
+        assert_eq!(
+            cached.get("byte[]").copied(),
+            Some(25515),
+            "the resident path must deliver byte[] (scan path: {:?})",
+            scanned.get("byte[]")
+        );
+        assert_eq!(cached.get("java.lang.Object[]").copied(), Some(2418));
+        assert_eq!(
+            cached, scanned,
+            "resident and scan class histograms must agree row-for-row"
+        );
     }
 
     #[test]

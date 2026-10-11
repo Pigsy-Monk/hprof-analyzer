@@ -679,6 +679,149 @@ fn compile_from_query(query: &Query) -> Option<regex::Regex> {
         .and_then(|spec| compile_from_regex(spec).ok().flatten())
 }
 
+/// Whether a query's FROM pattern can match an ARRAY class — the AST-only form
+/// of [`SingleScanExecutor::wants_arrays`], for callers that must decide whether
+/// a scan has to deliver arrays *before* any executor exists (the server's
+/// resident-cache router, which cannot reconstruct a per-array element count).
+/// `wants_arrays` delegates here, so the two can never drift apart.
+pub fn from_may_match_arrays(q: &Query) -> bool {
+    // A FROM-subquery matches every object (identity is constrained by the
+    // outer semi-join), so it must see arrays too.
+    if q.from.as_subquery().is_some() {
+        return true;
+    }
+    // A `FROM OBJECTS <address>` object may itself be an array — we don't know
+    // its kind before resolving it — so the scan must deliver arrays too.
+    if matches!(q.from, FromSource::Object(_)) {
+        return true;
+    }
+    // A quoted regex could match an array class name (e.g. `.*` or
+    // `java\.lang\..*\[\]`) without a literal `*`, so a regex FROM must see
+    // arrays too. Arrays are a small minority; be conservative and include them.
+    if q.from.class_spec().is_some_and(|spec| spec.is_regex) {
+        return true;
+    }
+    let from = q.from.class_name();
+    // `FROM INSTANCEOF T` matches T and every subtype, and every array type is
+    // a subtype of Object, Cloneable and Serializable (JLS 4.10.3 / 10.7) — so
+    // an INSTANCEOF of one of those must deliver arrays even though the spec
+    // text carries no `[]`. Without this, `FROM INSTANCEOF java.lang.Object`
+    // silently drops every array: on the 44 GB fare dump that hid `Object[]`
+    // (29.6M instances) and `byte[]` (19.7M) — the top two classes by shallow
+    // size — from every histogram built that way, and made hprof's counts
+    // disagree with MAT's.
+    if q.from.instanceof()
+        && matches!(
+            from,
+            "java.lang.Object" | "java.lang.Cloneable" | "java.io.Serializable"
+        )
+    {
+        return true;
+    }
+    from.ends_with("[]") || from.contains('*')
+}
+
+/// Whether any part of `q` can observe an ARRAY's element count — `@length`,
+/// `length()`, or `size()`. That count is the one per-array datum a caller
+/// cannot supply without scanning: Pass1's `elem_count` is freed by pass2 and
+/// never carried into the resident cache. A caller that delivers arrays with an
+/// unknown count must therefore route such a query to the scan path instead.
+///
+/// The consumers are exactly the two length-reading sites in the scan-time
+/// array path — `project_array_attr`'s `Attr::Length` and `eval_expr_array`'s
+/// `length`/`size` method — so this walk mirrors them, over every clause that
+/// can carry an expression.
+pub fn query_observes_array_length(q: &Query) -> bool {
+    q.select.iter().any(select_item_reads_array_length)
+        || q.where_.as_ref().is_some_and(pred_reads_array_length)
+        || q.group_by.iter().any(expr_reads_array_length)
+        || q.having.as_ref().is_some_and(pred_reads_array_length)
+        || q.order_by
+            .as_ref()
+            .is_some_and(|ob| attr_reads_array_length(&ob.key))
+}
+
+fn select_item_reads_array_length(it: &SelectItem) -> bool {
+    match it {
+        SelectItem::Attr(a) => attr_reads_array_length(a),
+        SelectItem::Aggregate { arg, .. } => select_item_reads_array_length(arg),
+        SelectItem::Expr(e) => expr_reads_array_length(e),
+        // `path(a, b)` walks references; `toString(s)` decodes a String; `*` is
+        // the object itself. None reads an array element count. Neither does
+        // `jsonify(x)`: it re-decodes the object (arrays included) straight from
+        // the dump, so it never reads the count a caller would have to supply.
+        SelectItem::Star
+        | SelectItem::Path { .. }
+        | SelectItem::ToString(_)
+        | SelectItem::Jsonify { .. } => false,
+    }
+}
+
+fn attr_reads_array_length(a: &Attr) -> bool {
+    match a {
+        Attr::Length => true,
+        Attr::ToHex(inner) => expr_reads_array_length(inner),
+        Attr::ArrayIndex { base, index } => {
+            attr_reads_array_length(base) || expr_reads_array_length(index)
+        }
+        Attr::ArraySlice { base, start, end } => {
+            attr_reads_array_length(base)
+                || start.as_deref().is_some_and(expr_reads_array_length)
+                || end.as_deref().is_some_and(expr_reads_array_length)
+        }
+        // The tail is projected on the object the hops resolve to, which may be
+        // an array (`s.value.@length`).
+        Attr::RefPath { tail, .. } => attr_reads_array_length(tail),
+        _ => false,
+    }
+}
+
+fn expr_reads_array_length(e: &Expr) -> bool {
+    match e {
+        Expr::Attr(a) => attr_reads_array_length(a),
+        Expr::Lit(_) => false,
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_reads_array_length(lhs) || expr_reads_array_length(rhs)
+        }
+        Expr::Unary { arg, .. } => expr_reads_array_length(arg),
+        // On an array receiver these two names are answered from the element
+        // count; every other method name resolves to Null on an array.
+        Expr::Method {
+            receiver,
+            name,
+            args,
+        } => {
+            matches!(name.as_str(), "length" | "size")
+                || expr_reads_array_length(receiver)
+                || args.iter().any(expr_reads_array_length)
+        }
+        Expr::Aggregate { arg, .. } => select_item_reads_array_length(arg),
+        Expr::Case { branches, else_ } => {
+            branches
+                .iter()
+                .any(|(c, t)| pred_reads_array_length(c) || expr_reads_array_length(t))
+                || else_.as_deref().is_some_and(expr_reads_array_length)
+        }
+        Expr::Coalesce(args) => args.iter().any(expr_reads_array_length),
+        Expr::NullIf { lhs, rhs } => expr_reads_array_length(lhs) || expr_reads_array_length(rhs),
+    }
+}
+
+fn pred_reads_array_length(p: &crate::query::ast::Predicate) -> bool {
+    use crate::query::ast::Predicate;
+    match p {
+        Predicate::And(a, b) | Predicate::Or(a, b) => {
+            pred_reads_array_length(a) || pred_reads_array_length(b)
+        }
+        Predicate::Not(inner) => pred_reads_array_length(inner),
+        Predicate::Compare { lhs, rhs, .. } => {
+            expr_reads_array_length(lhs) || expr_reads_array_length(rhs)
+        }
+        Predicate::InSubquery { lhs, .. } => attr_reads_array_length(lhs),
+        Predicate::InstanceOf(_) | Predicate::Exists { .. } => false,
+    }
+}
+
 /// Compile the query's LIKE regexes for executor construction. They were already
 /// validated (with an actionable error) at plan time via [`compile_like_regexes`],
 /// so a compile failure here cannot happen for a query that planned successfully;
@@ -862,44 +1005,10 @@ impl<'a, R: ClassResolver> SingleScanExecutor<'a, R> {
 
     /// Whether this query's FROM pattern can match an array class, so the scan
     /// only pays the per-array name-construction cost when some executor might
-    /// consume it. Array class names end in `[]` (e.g. `char[]`,
-    /// `java.lang.Object[]`); a wildcard pattern (`*`) may also match them.
+    /// consume it. Delegates to [`from_may_match_arrays`] so the AST-only
+    /// callers (the server's resident-cache router) and this one cannot drift.
     pub fn wants_arrays(&self) -> bool {
-        // A FROM-subquery matches every object (identity is constrained by the
-        // outer semi-join), so it must see arrays too.
-        if self.query.from.as_subquery().is_some() {
-            return true;
-        }
-        // A `FROM OBJECTS <address>` object may itself be an array — we don't know
-        // its kind before resolving it — so the scan must deliver arrays too.
-        if matches!(self.query.from, FromSource::Object(_)) {
-            return true;
-        }
-        let from = self.query.from.class_name();
-        // A quoted regex could match an array class name (e.g. `.*` or
-        // `java\.lang\..*\[\]`) without a literal `*`, so a regex FROM must see
-        // arrays too. Compiling once and testing per-array would be cheaper to
-        // gate, but arrays are a small minority; be conservative and include them.
-        if self.from_regex.is_some() {
-            return true;
-        }
-        // `FROM INSTANCEOF T` matches T and every subtype, and every array type is
-        // a subtype of Object, Cloneable and Serializable (JLS 4.10.3 / 10.7) —
-        // so an INSTANCEOF of one of those must deliver arrays even though the
-        // spec text carries no `[]`. Without this, `FROM INSTANCEOF
-        // java.lang.Object` silently drops every array: on the 44 GB fare dump
-        // that hid `Object[]` (29.6M instances) and `byte[]` (19.7M) — the top
-        // two classes by shallow size — from every histogram built that way, and
-        // made hprof's counts disagree with MAT's.
-        if self.query.from.instanceof()
-            && matches!(
-                from,
-                "java.lang.Object" | "java.lang.Cloneable" | "java.io.Serializable"
-            )
-        {
-            return true;
-        }
-        from.ends_with("[]") || from.contains('*')
+        from_may_match_arrays(self.query)
     }
 
     /// The plan this executor runs (borrowed). Used by the driver to tag a

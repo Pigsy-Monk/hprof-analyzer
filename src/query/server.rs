@@ -528,6 +528,12 @@ fn not_eligible_reason(
         "a FROM that is not a single concrete class (a class-name regex, INSTANCEOF, \
          or OBJECTS)"
             .to_string()
+    } else if crate::query::execute::from_may_match_arrays(q)
+        && crate::query::execute::query_observes_array_length(q)
+    {
+        // The resident cache holds the arrays themselves but not their element
+        // counts (Pass1's `elem_count` is freed by pass2 and never carried over).
+        "an array element count the resident cache does not hold".to_string()
     } else {
         "a class the resident cache does not index (an array class)".to_string()
     }
