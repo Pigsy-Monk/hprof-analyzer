@@ -6296,89 +6296,93 @@ fn run(
     };
 
     if opts.skip_report {
-        // mat caches mode: no report needed, skip build_model + render entirely.
+        // `mat caches` without `--report`: there is no report to build, so skip
+        // `build_model` + `render` entirely. The MAT tail below still runs —
+        // `.threads` and the master `.index` are not report products, and MAT
+        // cannot open the cache at all without the master `.index`. (Returning
+        // here instead skipped both, which is how `mat caches` came to emit 9 of
+        // the 11 files the `--report` path emits.)
         drop(dc_off);
         drop(dc_tgt);
         log(verbose, "total", t_total.elapsed().as_secs_f64());
-        return Ok(());
+    } else {
+        let t = Instant::now();
+        progress::phase("building report");
+        crate::trace::probe("report: before build_model");
+        // build_model reads has_same_class_ancestor (system-overview group) and
+        // dc_off/dc_tgt (leak-suspect group) and stores only bounded aggregates,
+        // so both can be freed immediately after it returns. depth_counts is the
+        // B2 dominator-depth histogram tallied during compute_retained's DFS (no
+        // separate ~2GB per-object memo scan).
+        let mut report = report::build_model(
+            &mut g,
+            dc_off,
+            dc_tgt,
+            opts.leak_children_cap,
+            &depth_counts,
+            &opts,
+            alloc_sites,
+            precomputed_field_stats_main,
+            redacted,
+        );
+        crate::trace::probe("report: after build_model");
+        t_dark!("build_model done");
+        g.has_same_class_ancestor = crate::bitset::Bitset::default(); // consumed by build_model
+        // dc_off and dc_tgt were moved into build_model and freed early inside it.
+        crate::trace::trim();
+        // Fill in blank oql text and default names (from-target-derived, else
+        // `q{N}`) for the printed tables.
+        finalize_query_labels(&mut query_results, &query_texts, &parsed_queries);
+        attach_viz(&mut query_results, &collected);
+        report.queries = std::mem::take(&mut query_results);
+        report.truncated_input = truncated_input;
+
+        let out_text = match format {
+            OutputFormat::Md => {
+                let md = report::render_markdown(&report);
+                crate::trace::probe("report: after render_markdown");
+                md
+            }
+            OutputFormat::MdGraphs => {
+                let md = report::render_markdown_graphs(&report);
+                crate::trace::probe("report: after render_markdown_graphs");
+                md
+            }
+            OutputFormat::Json => {
+                // serde_json over a struct preserves field declaration order and
+                // carries no f64 (pct is #[serde(skip)]), so output is
+                // deterministic. The model holds only KB-scale aggregates, so
+                // serialization is trivially RSS-safe even for huge dumps.
+                let js = serde_json::to_string_pretty(&report).map_err(io::Error::other)?;
+                crate::trace::probe("report: after serialize_json");
+                js
+            }
+            OutputFormat::Html => {
+                let h = if opts.dev_report {
+                    html::render_html_dev(&report, opts.bundle_path.as_deref())
+                } else {
+                    html::render_html(&report)
+                };
+                crate::trace::probe("report: after render_html");
+                h
+            }
+        };
+        log(verbose, "report", t.elapsed().as_secs_f64());
+        t_dark!("render done");
+
+        // Clear the progress line before emitting output, so it does not linger on
+        // stderr next to the report (or leak into a piped tail).
+        progress::done();
+        write_output(output, &out_text).map_err(|e| {
+            // Name the OUTPUT path here so the analyze error hint does not later
+            // re-attribute an output-write failure to the input file.
+            let target = output.unwrap_or("<stdout>");
+            io::Error::new(e.kind(), format!("cannot write '{target}': {e}"))
+        })?;
+
+        log(verbose, "total", t_total.elapsed().as_secs_f64());
+        t_dark!("write+total done");
     }
-
-    let t = Instant::now();
-    progress::phase("building report");
-    crate::trace::probe("report: before build_model");
-    // build_model reads has_same_class_ancestor (system-overview group) and
-    // dc_off/dc_tgt (leak-suspect group) and stores only bounded aggregates,
-    // so both can be freed immediately after it returns. depth_counts is the
-    // B2 dominator-depth histogram tallied during compute_retained's DFS (no
-    // separate ~2GB per-object memo scan).
-    let mut report = report::build_model(
-        &mut g,
-        dc_off,
-        dc_tgt,
-        opts.leak_children_cap,
-        &depth_counts,
-        &opts,
-        alloc_sites,
-        precomputed_field_stats_main,
-        redacted,
-    );
-    crate::trace::probe("report: after build_model");
-    t_dark!("build_model done");
-    g.has_same_class_ancestor = crate::bitset::Bitset::default(); // consumed by build_model
-    // dc_off and dc_tgt were moved into build_model and freed early inside it.
-    crate::trace::trim();
-    // Fill in blank oql text and default names (from-target-derived, else
-    // `q{N}`) for the printed tables.
-    finalize_query_labels(&mut query_results, &query_texts, &parsed_queries);
-    attach_viz(&mut query_results, &collected);
-    report.queries = std::mem::take(&mut query_results);
-    report.truncated_input = truncated_input;
-
-    let out_text = match format {
-        OutputFormat::Md => {
-            let md = report::render_markdown(&report);
-            crate::trace::probe("report: after render_markdown");
-            md
-        }
-        OutputFormat::MdGraphs => {
-            let md = report::render_markdown_graphs(&report);
-            crate::trace::probe("report: after render_markdown_graphs");
-            md
-        }
-        OutputFormat::Json => {
-            // serde_json over a struct preserves field declaration order and
-            // carries no f64 (pct is #[serde(skip)]), so output is
-            // deterministic. The model holds only KB-scale aggregates, so
-            // serialization is trivially RSS-safe even for huge dumps.
-            let js = serde_json::to_string_pretty(&report).map_err(io::Error::other)?;
-            crate::trace::probe("report: after serialize_json");
-            js
-        }
-        OutputFormat::Html => {
-            let h = if opts.dev_report {
-                html::render_html_dev(&report, opts.bundle_path.as_deref())
-            } else {
-                html::render_html(&report)
-            };
-            crate::trace::probe("report: after render_html");
-            h
-        }
-    };
-    log(verbose, "report", t.elapsed().as_secs_f64());
-    t_dark!("render done");
-
-    // Clear the progress line before emitting output, so it does not linger on
-    // stderr next to the report (or leak into a piped tail).
-    progress::done();
-    write_output(output, &out_text).map_err(|e| {
-        // Name the OUTPUT path here so the analyze error hint does not later
-        // re-attribute an output-write failure to the input file.
-        let target = output.unwrap_or("<stdout>");
-        io::Error::new(e.kind(), format!("cannot write '{target}': {e}"))
-    })?;
-
-    log(verbose, "total", t_total.elapsed().as_secs_f64());
-    t_dark!("write+total done");
 
     // MAT: emit i2sv2 (deliberately not emitted — see below) and `.threads`,
     // then the master `.index`. These are the last two files precisely so the
