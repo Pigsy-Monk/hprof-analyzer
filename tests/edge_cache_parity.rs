@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use hprof_analyzer::cache::CacheMode;
 use hprof_analyzer::opts::AnalyzeOptions;
 use hprof_analyzer::query::run::ReplCache;
+use hprof_analyzer::run_oql::FwdTargets;
 use hprof_analyzer::source::HprofSource;
 
 /// Copy the committed fixture into a temp dir: the cache lives *next to the
@@ -79,11 +80,14 @@ fn cache_edges_equal_pipeline_edges_and_vanish_without_graph_bin() {
         "cache-assembled session must carry the forward CSR (got {})",
         cached.edges.summary()
     );
-    assert!(
-        cached.edges.has_inbound(),
-        "cache-assembled session must carry the inbound block CSR (got {})",
-        cached.edges.summary()
-    );
+    // The inbound block CSR is deliberately NOT asserted here any more: it is
+    // no longer part of what a warm session carries at all. Nothing in the query
+    // path ever read it — `compute_dominators` runs in the pipeline, on the live
+    // blocks — so holding it resident cost 5.41 GiB on the 44 GB dump for
+    // nothing, and `ReplCacheEdges` dropped it (see the type's docs). `@inbounds`
+    // is answered by transposing the forward CSR, exactly as the escalated path
+    // does. Asserting its absence would only re-state that; the forward half
+    // asserted here and compared below is the surviving observable contract.
 
     // ── Source (a): the pipeline, live ────────────────────────────────────────
     let live = ReplCache::build(&HprofSource::from(dump_str), false).expect("ReplCache::build");
@@ -100,10 +104,28 @@ fn cache_edges_equal_pipeline_edges_and_vanish_without_graph_bin() {
     let total = cached.edges.forward_edges();
     assert_eq!(total, live.edges.forward_edges());
     assert!(total > 0, "the fixture must actually have reference edges");
+    // `fwd_tgt` is no longer an indexable array: a warm session holds a
+    // `FwdTgtStore`, which for a chunked `graph.bin` decodes chunks on demand
+    // instead of keeping ~9 GB of `u32` resident. `copy_range` is the read the
+    // production consumers use (`build_retained_edges`), so comparing through it
+    // checks the same path a query would take — including the on-disk decode
+    // and its per-chunk delta base — rather than a test-only accessor.
+    let mut cached_tgt: Vec<u32> = Vec::new();
+    let mut live_tgt: Vec<u32> = Vec::new();
+    cached
+        .edges
+        .fwd_tgt
+        .copy_range(0, total, &mut cached_tgt)
+        .expect("read the graph.bin forward targets");
+    live.edges
+        .fwd_tgt
+        .copy_range(0, total, &mut live_tgt)
+        .expect("read the pipeline's forward targets");
+    assert_eq!(cached_tgt.len(), total, "graph.bin returned a short array");
+    assert_eq!(live_tgt.len(), total, "the pipeline returned a short array");
     for i in 0..total {
         assert_eq!(
-            cached.edges.fwd_tgt.get(i),
-            live.edges.fwd_tgt.get(i),
+            cached_tgt[i], live_tgt[i],
             "forward target {i} differs between graph.bin and the pipeline"
         );
     }

@@ -45,6 +45,31 @@ pub(crate) type RetainedEdgeStructs = (
     Option<(Vec<u32>, Vec<u32>)>,
 );
 
+/// Random-access source of a forward CSR's edge targets.
+///
+/// The escalated path reads a live [`crate::chunkvec::ChunkU32`]; a warm session
+/// reads a [`crate::query::run::FwdTgtStore`], which may be backed by
+/// `graph.bin` and decode chunks on demand instead of keeping ~9 GB of `u32`
+/// resident. Both feed [`build_retained_edges`] through this one method, so the
+/// escalated and warm paths share their edge-building code exactly rather than
+/// each having its own.
+///
+/// The only fallible implementation is the on-disk one; the in-memory one never
+/// errors but returns `io::Result` so callers have a single shape to handle.
+pub trait FwdTargets {
+    /// Copy `[start, end)` of the target array into `out` (cleared first).
+    fn copy_range(&self, start: usize, end: usize, out: &mut Vec<u32>) -> io::Result<()>;
+}
+
+impl FwdTargets for crate::chunkvec::ChunkU32 {
+    fn copy_range(&self, start: usize, end: usize, out: &mut Vec<u32>) -> io::Result<()> {
+        // UFCS: the inherent method of the same name would otherwise be picked,
+        // and this impl exists only to give it the trait's signature.
+        crate::chunkvec::ChunkU32::copy_range(self, start, end, out);
+        Ok(())
+    }
+}
+
 /// Build the query-gated edge structures from a forward CSR.
 ///
 /// `node_matches(s)` says whether dense index `s` is a node the query's FROM
@@ -56,14 +81,19 @@ pub(crate) type RetainedEdgeStructs = (
 /// exact same code. That identity is the point: it is what makes a warm
 /// session's `@inbounds`/`@outbounds`/`path()` answers indistinguishable from an
 /// escalated run's, rather than a second implementation that merely looks close.
-pub(crate) fn build_retained_edges(
+///
+/// `fwd_tgt` is a [`FwdTargets`] rather than a concrete store because a warm
+/// session's targets may live in `graph.bin`: the rows are walked in increasing
+/// `fwd_off` order, so an on-demand reader decodes each chunk once per pass
+/// rather than once per row.
+pub(crate) fn build_retained_edges<T: FwdTargets + ?Sized>(
     n: usize,
     fwd_off: &[u32],
-    fwd_tgt: &crate::chunkvec::ChunkU32,
+    fwd_tgt: &T,
     want_forward: bool,
     want_inbound: bool,
     node_matches: impl Fn(usize) -> bool,
-) -> RetainedEdgeStructs {
+) -> io::Result<RetainedEdgeStructs> {
     let retained_edges = if want_forward {
         let mut builder = crate::query::retained_edges::RetainedEdgesBuilder::new();
         let mut scratch: Vec<u32> = Vec::new();
@@ -72,7 +102,7 @@ pub(crate) fn build_retained_edges(
                 continue;
             }
             let (lo, hi) = (fwd_off[s] as usize, fwd_off[s + 1] as usize);
-            fwd_tgt.copy_range(lo, hi, &mut scratch);
+            fwd_tgt.copy_range(lo, hi, &mut scratch)?;
             scratch.sort_unstable();
             builder.push_row(s as u32, &scratch);
         }
@@ -86,7 +116,7 @@ pub(crate) fn build_retained_edges(
         let mut row: Vec<u32> = Vec::new();
         for s in 0..n {
             let (lo, hi) = (fwd_off[s] as usize, fwd_off[s + 1] as usize);
-            fwd_tgt.copy_range(lo, hi, &mut row);
+            fwd_tgt.copy_range(lo, hi, &mut row)?;
             for &t in &row {
                 if node_matches(t as usize) {
                     in_off[t as usize + 1] += 1;
@@ -101,7 +131,7 @@ pub(crate) fn build_retained_edges(
         let mut cursor = in_off.clone();
         for s in 0..n {
             let (lo, hi) = (fwd_off[s] as usize, fwd_off[s + 1] as usize);
-            fwd_tgt.copy_range(lo, hi, &mut row);
+            fwd_tgt.copy_range(lo, hi, &mut row)?;
             for &t in &row {
                 if node_matches(t as usize) {
                     let slot = &mut cursor[t as usize];
@@ -115,7 +145,7 @@ pub(crate) fn build_retained_edges(
         None
     };
 
-    (retained_edges, retained_inbound)
+    Ok((retained_edges, retained_inbound))
 }
 
 /// Auto-escalated `query`-subcommand path for cross-phase OQL features
@@ -259,7 +289,7 @@ pub(crate) fn run_oql_escalated(
             want_forward,
             want_inbound,
             node_matches,
-        )
+        )?
     } else {
         (None, None)
     };

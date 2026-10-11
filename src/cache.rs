@@ -19,11 +19,17 @@
 //! [index: n × { name[16B], offset: u64 LE, len: u64 LE }]
 //! [data: concatenated independent zstd frames, one per array]
 //! ```
+//!
+//! One entry — `graph.bin`'s `fwd_tgt`, the forward edge-target array — is
+//! itself a *chunked* container inside its frame, so it can be read a block at
+//! a time instead of whole. See [`ChunkedTgt`] and
+//! [`IndexedWriter::add_chunked_delta_u32`].
 
 use std::{
     fs::{self, File},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
 use crate::{chunkvec::ChunkU32, pass1::Pass1Snapshot, report::Report};
@@ -33,6 +39,29 @@ use crate::{chunkvec::ChunkU32, pass1::Pass1Snapshot, report::Report};
 const MAGIC: &[u8; 4] = b"HPCA";
 const VERSION: u16 = 1;
 const ENTRY_SIZE: usize = 16 + 8 + 8; // name[16] + offset:u64 + len:u64
+
+// ── Chunked edge-target container ─────────────────────────────────────────────
+
+/// Magic of the chunked `fwd_tgt` container, written inside the `fwd_tgt`
+/// entry's frame. Its first four bytes being `HTGT` instead of a zstd frame
+/// magic (`28 B5 2F FD`) is what lets a reader tell the new format from the old
+/// single-frame one without a version bump.
+const TGT_MAGIC: &[u8; 4] = b"HTGT";
+
+/// Values per chunk in the `fwd_tgt` container — 1,000,000 u32 = 4 MB raw.
+///
+/// Measured on the 44 GB dump's 2.33-billion-edge array: 2326 chunks, +0.45%
+/// on-disk versus the single frame, and 2.9–9.2 ms (mean 6.7 ms) to decompress
+/// one chunk. Smaller chunks shrink the random-access read but multiply the
+/// per-chunk zstd frame overhead; larger ones inflate the read. This is the
+/// value the C probe (`.tmp-chunkprobe.c`) measured.
+pub const TGT_CHUNK_VALUES: usize = 1_000_000;
+
+/// Header of the chunked container, in bytes: magic + total:u64 + n_chunks:u64.
+const TGT_HEADER_BYTES: usize = 4 + 8 + 8;
+
+/// One chunk's table row: base:u64 + comp_len:u64.
+const TGT_TABLE_ENTRY: usize = 8 + 8;
 
 // ── CacheMode ────────────────────────────────────────────────────────────────
 
@@ -229,12 +258,18 @@ impl CacheDir {
     ///
     /// Must run *before* `build_from_fwd` consumes the CSR, which is what lets
     /// `fwd_tgt` stream out of the chunked store without being flattened.
+    ///
+    /// `fwd_tgt` goes out in the chunked container
+    /// ([`IndexedWriter::add_chunked_delta_u32`]) rather than as one delta frame
+    /// so a warm session can read a row's edges without decoding the whole
+    /// 2.3-billion-entry array — see [`ChunkedTgt`].
     pub fn add_forward_to_graph(w: &mut IndexedWriter, g: &GraphForCache) -> io::Result<()> {
         w.add_u32("fwd_off", g.fwd_off.iter().copied())?;
         // `fwd_off` is the CSR offset table, so its last entry is the edge count.
         let total_edges = g.fwd_off.last().copied().unwrap_or(0) as usize;
-        w.add_delta_u32(
+        w.add_chunked_delta_u32(
             "fwd_tgt",
+            total_edges,
             g.fwd_tgt
                 .iter_live_chunks()
                 .flatten()
@@ -369,26 +404,51 @@ impl CacheDir {
         };
         let n = shallow.len();
         // Edges, so a warm session can answer `@inbounds` / `@outbounds` /
-        // `path()` without re-reading the dump. Best-effort and per-half: a
-        // `heap load` (CacheMode::Full) has no `graph.bin` at all, and a cache
-        // written before the inbound half was real has a forward half only, so
-        // neither absence is an error — `ReplCacheEdges` reports which halves
-        // arrived and the query path falls back when one is missing.
+        // `path()` without re-reading the dump. Best-effort: a `heap load`
+        // (CacheMode::Full) has no `graph.bin` at all, and a truncated or
+        // foreign one must degrade to "no edges" rather than panic.
+        //
+        // Only TWO things are taken resident: `fwd_off` (the row pointers —
+        // 2.26 GiB on the 44 GB dump) and, for an old-format `graph.bin`, the
+        // whole `fwd_tgt`. A chunked `fwd_tgt` is NOT read here: the session
+        // holds a [`ChunkedTgt`] that seeks to the chunks a query actually
+        // needs. That is the difference between a server that needs 16.33 GiB
+        // for its edges and one that needs 2.26 GiB — the former OOMs a 32 GB
+        // box, the latter does not.
+        //
+        // The inbound block CSR is deliberately NOT loaded: nothing in the
+        // query path consumes it (`compute_dominators` runs only in the
+        // pipeline, on the live blocks), so carrying it cost 5.41 GiB of
+        // resident memory for nothing. `mat caches` still reads it straight off
+        // disk via `read_inbound_blocks`.
         let mut edges = crate::query::run::ReplCacheEdges::default();
-        if let Ok(Some((fwd_off, fwd_tgt))) = self.read_forward_edges() {
+        if let Some(fwd_off) = self.read_forward_offsets().ok().flatten() {
             // Validate before accepting: a truncated or mismatched pair would
             // make the consumer index out of bounds (`fwd_off[s + 1]`,
             // `fwd_tgt.get(..)`). This is a best-effort read, so a bad pair means
             // "no edges", never a panic.
             let total = fwd_off.last().copied().unwrap_or(0) as usize;
-            if fwd_off.len() == n + 1 && total <= fwd_tgt.len() {
-                edges.fwd_tgt = ChunkU32::from_vec(fwd_tgt);
-                edges.fwd_off = fwd_off;
+            if fwd_off.len() == n + 1 {
+                let store = match ChunkedTgt::open(&self.path) {
+                    // Chunked (current) format: hold the file, not the array.
+                    Ok(Some(t)) if t.total() == total => {
+                        Some(crate::query::run::FwdTgtStore::OnDisk(Box::new(t)))
+                    }
+                    // Old single-frame format: fall back to reading it whole.
+                    // `read_forward_targets` handles both, so this is also the
+                    // path a partially-chunked or reverted cache takes.
+                    _ => match self.read_forward_targets(total) {
+                        Ok(Some(tgt)) if tgt.len() == total => Some(
+                            crate::query::run::FwdTgtStore::Resident(ChunkU32::from_vec(tgt)),
+                        ),
+                        _ => None,
+                    },
+                };
+                if let Some(store) = store {
+                    edges.fwd_tgt = store;
+                    edges.fwd_off = fwd_off;
+                }
             }
-        }
-        if let Ok(Some((inb_block_off, inb_data))) = self.read_inbound_blocks() {
-            edges.inb_block_off = inb_block_off;
-            edges.inb_data = inb_data;
         }
         Ok(Some(handover.into_cache(
             source,
@@ -428,37 +488,76 @@ impl CacheDir {
         })
     }
 
-    /// Returns `(fwd_off, fwd_tgt)` or `None` if graph not cached.
-    pub fn read_forward_edges(&self) -> io::Result<Option<(Vec<u32>, Vec<u32>)>> {
-        let off = read_u32_array(&self.path.join("graph.bin"), "fwd_off")?;
-        let tgt = read_delta_u32_array(&self.path.join("graph.bin"), "fwd_tgt")?;
-        Ok(match (off, tgt) {
-            (Some(o), Some(t)) => Some((o, t)),
-            _ => None,
-        })
-    }
-
     /// Read `fwd_off` (the forward CSR's offset table) on its own.
     pub fn read_forward_offsets(&self) -> io::Result<Option<Vec<u32>>> {
         read_u32_array(&self.path.join("graph.bin"), "fwd_off")
     }
 
-    /// Stream `fwd_tgt` from `graph.bin` into a flat `Vec<u32>`.
+    /// Returns `(fwd_off, fwd_tgt)` or `None` if the graph is not cached.
     ///
-    /// [`CacheDir::read_forward_edges`] materialises that array three times over
+    /// Materialises the whole target array (9.3 GB of `u32` on the 44 GB dump),
+    /// so it is only for callers that genuinely want all of it. A warm session
+    /// uses [`CacheDir::read_forward_offsets`] plus [`ChunkedTgt`] instead and
+    /// never holds the array. Works with both on-disk formats — see
+    /// [`CacheDir::read_forward_targets`].
+    pub fn read_forward_edges(&self) -> io::Result<Option<(Vec<u32>, Vec<u32>)>> {
+        let Some(off) = self.read_forward_offsets()? else {
+            return Ok(None);
+        };
+        let total = off.last().copied().unwrap_or(0) as usize;
+        Ok(match self.read_forward_targets(total)? {
+            Some(t) if t.len() == total => Some((off, t)),
+            _ => None,
+        })
+    }
+
+    /// Stream the whole `fwd_tgt` from `graph.bin` into a flat `Vec<u32>`.
+    ///
+    /// [`CacheDir::read_forward_edges`] materialised that array three times over
     /// — the compressed frame, the `Vec<i32>` deltas, then the `Vec<u32>`
     /// targets — which on the 44 GB dump (2.3 billion edges) is ~27 GB of
     /// transients for one array. This walks the zstd frame through a 64 KiB
     /// buffer and undeltas straight into the output, so the only large
     /// allocation is the result itself.
     ///
-    /// Returns `Ok(None)` when `graph.bin` has no `fwd_tgt` or the frame does not
-    /// hold exactly `total_edges` values (a stale or foreign cache).
+    /// Handles BOTH on-disk formats by sniffing the entry's first four bytes:
+    /// the chunked container (`HTGT`) is decoded chunk by chunk, and an older
+    /// single-frame cache takes the streaming path. Callers that want random
+    /// access should use [`ChunkedTgt`] instead — this exists for the whole-array
+    /// consumers (`mat caches`) and for the old-format fallback in
+    /// [`CacheDir::read_query_cache`].
+    ///
+    /// Returns `Ok(None)` when `graph.bin` has no `fwd_tgt` or the payload does
+    /// not hold exactly `total_edges` values (a stale or foreign cache).
     pub fn read_forward_targets(&self, total_edges: usize) -> io::Result<Option<Vec<u32>>> {
         let path = self.path.join("graph.bin");
-        let Some((f, len)) = seek_to_entry(&path, "fwd_tgt")? else {
+        let Some((mut f, len)) = seek_to_entry(&path, "fwd_tgt")? else {
             return Ok(None);
         };
+        let entry_off = f.stream_position()?;
+        let mut head = [0u8; 4];
+        if f.read_exact(&mut head).is_err() {
+            return Ok(None);
+        }
+        if &head == TGT_MAGIC {
+            // Chunked container: reuse the random-access reader and pull every
+            // chunk. `ChunkedTgt::open` re-reads the header, which is 20 bytes.
+            let Some(t) = ChunkedTgt::open(&self.path)? else {
+                return Ok(None);
+            };
+            if t.total() != total_edges {
+                return Ok(None);
+            }
+            let mut out = Vec::with_capacity(total_edges);
+            t.copy_range(0, total_edges, &mut out)?;
+            if out.len() != total_edges {
+                return Ok(None);
+            }
+            return Ok(Some(out));
+        }
+        // Old format: one delta frame for the whole array. Rewind over the four
+        // bytes we sniffed so the decoder sees the frame from its first byte.
+        f.seek(SeekFrom::Start(entry_off))?;
         let mut dec = zstd::stream::read::Decoder::new(f.take(len as u64))?;
         let mut buf = vec![0u8; STAGE_BYTES];
         // The entry is an i32 delta stream (see `IndexedWriter::add_delta_u32`);
@@ -620,6 +719,15 @@ impl IndexedWriter {
         let mut enc = zstd::stream::write::Encoder::new(&mut self.f, 3)?;
         emit(&mut enc)?;
         let _ = enc.finish()?;
+        self.record_raw(name, start)
+    }
+
+    /// Record an entry whose bytes were written to the file directly, from
+    /// `start` up to the current position. Used by
+    /// [`add_chunked_delta_u32`](Self::add_chunked_delta_u32), which emits one
+    /// independent zstd frame per chunk and so cannot go through `add_frame`'s
+    /// single encoder.
+    fn record_raw(&mut self, name: &str, start: u64) -> io::Result<()> {
         let end = self.f.stream_position()?;
         let mut name_bytes = [0u8; 16];
         let nb = name.as_bytes();
@@ -673,6 +781,68 @@ impl IndexedWriter {
             }
             Ok(())
         })
+    }
+
+    /// Deltas of the u32 stream, written as **independent per-chunk zstd
+    /// frames** in the chunked container [`ChunkedTgt`] reads.
+    ///
+    /// `total` must be the exact number of values `it` yields. It goes into the
+    /// header, and because it is known up front the header — including
+    /// `n_chunks` — can be written before any data, which is what lets the
+    /// per-chunk table live at the *end* of the entry and avoid a back-patch.
+    ///
+    /// Each chunk restarts the delta chain at `base` = the value immediately
+    /// preceding that chunk (0 for the first), so decoding the chunks in order
+    /// reproduces exactly the sequence [`add_delta_u32`](Self::add_delta_u32)
+    /// would have written — while any single chunk decodes on its own.
+    ///
+    /// Resident cost is one 4 MB raw buffer plus one compressed frame at a
+    /// time, regardless of `total`; on the 44 GB dump this is what lets a warm
+    /// session read one object's edges without materialising 9.3 GB of `u32`.
+    pub fn add_chunked_delta_u32<I: IntoIterator<Item = u32>>(
+        &mut self,
+        name: &str,
+        total: usize,
+        it: I,
+    ) -> io::Result<()> {
+        let n_chunks = total.div_ceil(TGT_CHUNK_VALUES);
+        let start = self.offset;
+        let mut it = it.into_iter();
+        // 16 bytes per chunk: ~37 KiB for the 44 GB dump's 2326 chunks.
+        let mut table: Vec<(u64, u64)> = Vec::with_capacity(n_chunks);
+
+        self.f.write_all(TGT_MAGIC)?;
+        self.f.write_all(&(total as u64).to_le_bytes())?;
+        self.f.write_all(&(n_chunks as u64).to_le_bytes())?;
+
+        let mut prev: i64 = 0;
+        let mut written = 0usize;
+        for _ in 0..n_chunks {
+            let take = TGT_CHUNK_VALUES.min(total - written);
+            let base = prev as u64;
+            let mut raw: Vec<u8> = Vec::with_capacity(take * 4);
+            for _ in 0..take {
+                let Some(v) = it.next() else {
+                    return Err(io::Error::other(format!(
+                        "chunked {name}: iterator yielded fewer than the declared {total} values"
+                    )));
+                };
+                // Wrapping: a u32 difference can exceed i32's range, and the
+                // reader accumulates with `wrapping_add` to match (the same
+                // two's-complement round trip `add_delta_u32` relies on).
+                raw.extend_from_slice(&((v as i64).wrapping_sub(prev) as i32).to_le_bytes());
+                prev = v as i64;
+            }
+            let comp = zstd::encode_all(raw.as_slice(), 3)?;
+            table.push((base, comp.len() as u64));
+            self.f.write_all(&comp)?;
+            written += take;
+        }
+        for (base, len) in &table {
+            self.f.write_all(&base.to_le_bytes())?;
+            self.f.write_all(&len.to_le_bytes())?;
+        }
+        self.record_raw(name, start)
     }
 
     /// i16 deltas of u16s, little-endian.
@@ -743,6 +913,165 @@ impl IndexedWriter {
         let dest = std::mem::take(&mut self.final_path);
         drop(self.f);
         fs::rename(tmp, dest)
+    }
+}
+
+// ── Random-access reader for the chunked fwd_tgt ──────────────────────────────
+
+/// The most recently decoded chunk, retained across reads.
+#[derive(Default)]
+struct ChunkState {
+    idx: Option<usize>,
+    vals: Vec<u32>,
+}
+
+/// Random-access reader for the chunked `fwd_tgt` container written by
+/// [`IndexedWriter::add_chunked_delta_u32`].
+///
+/// Holds the `graph.bin` path and the per-chunk table — base, absolute frame
+/// offset and compressed length, 24 bytes per chunk, so ~56 KiB for the 44 GB
+/// dump's 2326 chunks — and decompresses a chunk only when a query asks for a
+/// value inside it. The array itself (9.3 GB of `u32` there) is never resident.
+///
+/// The one-chunk cache is what makes the query path's access pattern cheap:
+/// `run_oql::build_retained_edges` walks rows in increasing `fwd_off` order, so
+/// a whole-heap scan decodes each chunk exactly once (~6.7 ms measured) and a
+/// single-object lookup decodes one or two. A class-level query still pays for
+/// every chunk — that is the inherent cost of answering `@inbounds`/`@outbounds`
+/// over a scattered match set from a forward CSR, and it is reported as such.
+///
+/// Interior mutability is a `Mutex` rather than a `RefCell` because a
+/// `ReplCache` lives behind a `Mutex` in the server and so must be `Send`.
+pub struct ChunkedTgt {
+    path: PathBuf,
+    total: usize,
+    /// `(base, absolute file offset of the chunk's frame, compressed length)`.
+    table: Vec<(u64, u64, u64)>,
+    state: Mutex<ChunkState>,
+}
+
+impl ChunkedTgt {
+    /// Open the chunked `fwd_tgt` inside `graph.bin` in `cache_dir`.
+    ///
+    /// `Ok(None)` means "not in the chunked format": an older cache, or no
+    /// `graph.bin` / `fwd_tgt` at all. Callers fall back to
+    /// [`CacheDir::read_forward_targets`], which handles the old single-frame
+    /// layout. A malformed *chunked* table is an `Err`, not a `None`, so a
+    /// corrupt container cannot be silently reinterpreted as the old format.
+    pub fn open(cache_dir: &Path) -> io::Result<Option<Self>> {
+        let path = cache_dir.join("graph.bin");
+        let Some((mut f, len)) = seek_to_entry(&path, "fwd_tgt")? else {
+            return Ok(None);
+        };
+        let entry_off = f.stream_position()?;
+        let mut head = [0u8; TGT_HEADER_BYTES];
+        if f.read_exact(&mut head).is_err() || &head[0..4] != TGT_MAGIC {
+            return Ok(None);
+        }
+        let total = u64::from_le_bytes(head[4..12].try_into().expect("8 bytes")) as usize;
+        let n_chunks = u64::from_le_bytes(head[12..20].try_into().expect("8 bytes")) as usize;
+        if n_chunks != total.div_ceil(TGT_CHUNK_VALUES) {
+            return Err(io::Error::other(format!(
+                "chunked fwd_tgt: header says {n_chunks} chunks for {total} values"
+            )));
+        }
+        let table_bytes = n_chunks * TGT_TABLE_ENTRY;
+        if (len as u64) < (TGT_HEADER_BYTES + table_bytes) as u64 {
+            return Err(io::Error::other(
+                "chunked fwd_tgt: entry too short to hold its chunk table",
+            ));
+        }
+        // The table sits at the END of the entry, so its position follows from
+        // the index's length — that is what let the writer avoid a back-patch.
+        f.seek(SeekFrom::Start(entry_off + len as u64 - table_bytes as u64))?;
+        let mut raw = vec![0u8; table_bytes];
+        f.read_exact(&mut raw)?;
+        let mut table = Vec::with_capacity(n_chunks);
+        let mut off = entry_off + TGT_HEADER_BYTES as u64;
+        for c in 0..n_chunks {
+            let b = &raw[c * TGT_TABLE_ENTRY..(c + 1) * TGT_TABLE_ENTRY];
+            let base = u64::from_le_bytes(b[0..8].try_into().expect("8 bytes"));
+            let clen = u64::from_le_bytes(b[8..16].try_into().expect("8 bytes"));
+            if clen == 0 || off + clen > entry_off + len as u64 {
+                return Err(io::Error::other(
+                    "chunked fwd_tgt: chunk frame outside the entry",
+                ));
+            }
+            table.push((base, off, clen));
+            off += clen;
+        }
+        // The frames must end exactly where the table begins. A gap or overlap
+        // means the container is inconsistent with its own index entry.
+        if off != entry_off + len as u64 - table_bytes as u64 {
+            return Err(io::Error::other(
+                "chunked fwd_tgt: chunk frames do not tile the entry",
+            ));
+        }
+        Ok(Some(Self {
+            path,
+            total,
+            table,
+            state: Mutex::new(ChunkState::default()),
+        }))
+    }
+
+    /// Number of values the container holds (`fwd_off`'s last entry).
+    pub fn total(&self) -> usize {
+        self.total
+    }
+
+    /// Number of chunks (the container's random-access granularity).
+    pub fn n_chunks(&self) -> usize {
+        self.table.len()
+    }
+
+    /// Copy `[start, end)` of the array into `out` (cleared first), decoding
+    /// only the chunks the range touches.
+    pub fn copy_range(&self, start: usize, end: usize, out: &mut Vec<u32>) -> io::Result<()> {
+        out.clear();
+        let end = end.min(self.total);
+        if start >= end {
+            return Ok(());
+        }
+        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut i = start;
+        while i < end {
+            let c = i / TGT_CHUNK_VALUES;
+            if g.idx != Some(c) {
+                g.vals = self.load_chunk(c)?;
+                g.idx = Some(c);
+            }
+            let o = i % TGT_CHUNK_VALUES;
+            let avail = g.vals.len().saturating_sub(o);
+            if avail == 0 {
+                return Err(io::Error::other(format!(
+                    "chunked fwd_tgt: chunk {c} is short of index {i}"
+                )));
+            }
+            let take = (TGT_CHUNK_VALUES - o).min(end - i).min(avail);
+            out.extend_from_slice(&g.vals[o..o + take]);
+            i += take;
+        }
+        Ok(())
+    }
+
+    /// Decompress one chunk and undo its delta chain, starting from the chunk's
+    /// stored base. The accumulator wraps, matching the writer's `as i32`
+    /// truncation of a difference that may not fit in `i32`.
+    fn load_chunk(&self, c: usize) -> io::Result<Vec<u32>> {
+        let (base, off, clen) = self.table[c];
+        let mut f = File::open(&self.path)?;
+        f.seek(SeekFrom::Start(off))?;
+        let mut buf = vec![0u8; clen as usize];
+        f.read_exact(&mut buf)?;
+        let raw = zstd::decode_all(buf.as_slice())?;
+        let mut vals: Vec<u32> = Vec::with_capacity(raw.len() / 4);
+        let mut acc = base as i64;
+        for ch in raw.chunks_exact(4) {
+            acc = acc.wrapping_add(i32::from_le_bytes([ch[0], ch[1], ch[2], ch[3]]) as i64);
+            vals.push(acc as u32);
+        }
+        Ok(vals)
     }
 }
 

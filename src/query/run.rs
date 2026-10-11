@@ -813,14 +813,26 @@ pub fn resident_edge_ctx(
             .iter()
             .any(|(pat, _inst)| crate::query::execute::class_name_matches(cn, pat))
     };
-    Some(crate::run_oql::build_retained_edges(
-        cache.n,
-        &cache.edges.fwd_off,
-        &cache.edges.fwd_tgt,
-        want_forward,
-        want_inbound,
-        node_matches,
-    ))
+    Some(
+        match crate::run_oql::build_retained_edges(
+            cache.n,
+            &cache.edges.fwd_off,
+            &cache.edges.fwd_tgt,
+            want_forward,
+            want_inbound,
+            node_matches,
+        ) {
+            Ok(v) => v,
+            // Only the on-disk target store can fail here (a short read or a
+            // corrupt chunk). Degrade to "no edge structures" so the query falls
+            // through to the rescan/refusal path rather than being answered from
+            // partial data.
+            Err(e) => {
+                eprintln!("hprof-analyzer: could not read cached forward edges: {e}");
+                return None;
+            }
+        },
+    )
 }
 
 /// True when this entry's late work is *only* edge lookups (`@inbounds` /
@@ -2433,38 +2445,66 @@ pub struct ReplCache {
     pub edges: ReplCacheEdges,
 }
 
+/// Where a warm session's forward edge targets live.
+///
+/// A [`ReplCache`] built from the live pipeline (`ReplCache::build`) *moves* its
+/// chunked store in; one assembled from `graph.bin`
+/// (`CacheDir::read_query_cache`) holds a handle to the on-disk chunked
+/// container instead, and decodes chunks only as queries ask for them.
+///
+/// That split is the whole point of this type. Keeping the 2.3-billion-edge
+/// array resident costs 8.66 GiB on a 44 GB dump, which — on top of the
+/// session's own ~18.7 GiB — is what made a 32 GB server OOM. Reading it a
+/// chunk at a time costs one 4 MB buffer.
+#[derive(Default)]
+pub enum FwdTgtStore {
+    /// No targets (no `graph.bin`, or a cache without a forward CSR).
+    #[default]
+    Empty,
+    /// The live chunked store, moved out of the pipeline's graph.
+    Resident(crate::chunkvec::ChunkU32),
+    /// The chunked container inside `graph.bin`, read on demand.
+    #[cfg(feature = "native")]
+    OnDisk(Box<crate::cache::ChunkedTgt>),
+}
+
+impl crate::run_oql::FwdTargets for FwdTgtStore {
+    fn copy_range(&self, start: usize, end: usize, out: &mut Vec<u32>) -> std::io::Result<()> {
+        match self {
+            FwdTgtStore::Empty => {
+                out.clear();
+                Ok(())
+            }
+            FwdTgtStore::Resident(c) => {
+                c.copy_range(start, end, out);
+                Ok(())
+            }
+            #[cfg(feature = "native")]
+            FwdTgtStore::OnDisk(t) => t.copy_range(start, end, out),
+        }
+    }
+}
+
 /// The reference-edge structures a warm [`ReplCache`] can carry.
 ///
-/// Two independent halves, each from a different source, which is why they are
-/// queried separately rather than through one `has_edges()`:
+/// Only the **forward** half — `fwd_off` (the CSR row pointers, kept resident:
+/// 2.26 GiB on the 44 GB dump) plus `fwd_tgt` behind a [`FwdTgtStore`] — because
+/// it is the only half anything consumes. The inbound block CSR
+/// (`inb_block_off` / `inb_data`, 5.41 GiB) used to be carried here too; nothing
+/// ever read it — `compute_dominators` runs in the pipeline on the live blocks,
+/// not on the cache — so it was dropped rather than paid for. `@inbounds` is
+/// answered by transposing the forward CSR, exactly as the escalated path does.
 ///
-/// * `fwd_off` / `fwd_tgt` — the forward CSR (out-edges). Comes from
-///   `graph.bin` on a cache-backed warm start, or is moved straight out of the
-///   live graph by [`ReplCache::build`], which never transposes the CSR and so
-///   still owns it when it is done.
-/// * `inb_block_off` / `inb_data` — the inbound CSR in the engine's own block
-///   format, i.e. exactly what `compute_dominators` consumes. Only a
-///   cache-backed session has this: the analysis pipeline hands it to
-///   `compute_dominators` and then drops it to get the memory back.
-///
-/// Both halves stay empty when the source could not supply them — no
-/// `graph.bin` (a `heap load` without `--with-graph`), or a cache written
-/// before the inbound half was written at all. That is the observable
-/// difference the fall-back-to-rescan path keys off.
+/// The half is empty when the source could not supply it: no `graph.bin` (a
+/// `heap load` without `--with-graph`). That is the observable difference the
+/// fall-back-to-rescan path keys off.
 #[derive(Default)]
 pub struct ReplCacheEdges {
     /// Forward CSR row pointers, len `n + 1` (`fwd_off[i]..fwd_off[i + 1]`
     /// slices `fwd_tgt` for object `i`'s out-edges).
     pub fwd_off: Vec<u32>,
-    /// Forward edge targets. Held as the chunked store for the same reason
-    /// `GraphForCache` does: on a large dump this is billions of entries, so
-    /// flattening it costs gigabytes, and `ReplCache::build` can *move* the
-    /// live store instead of copying it.
-    pub fwd_tgt: crate::chunkvec::ChunkU32,
-    /// Block-sampled byte offsets into `inb_data`; one entry per INB_BLOCK nodes.
-    pub inb_block_off: Vec<u64>,
-    /// Vbyte-encoded inbound parent lists (`pass2::INB_BLOCK` format).
-    pub inb_data: Vec<u8>,
+    /// Forward edge targets — resident, or read from `graph.bin` on demand.
+    pub fwd_tgt: FwdTgtStore,
 }
 
 impl ReplCacheEdges {
@@ -2473,14 +2513,9 @@ impl ReplCacheEdges {
         self.fwd_off.len() > 1
     }
 
-    /// True when the inbound block CSR is present (`compute_dominators`).
-    pub fn has_inbound(&self) -> bool {
-        !self.inb_block_off.is_empty() && !self.inb_data.is_empty()
-    }
-
-    /// True when neither half could be supplied.
+    /// True when no edges could be supplied.
     pub fn is_empty(&self) -> bool {
-        !self.has_forward() && !self.has_inbound()
+        !self.has_forward()
     }
 
     /// Forward edge count (`fwd_off`'s last entry), 0 when absent.
@@ -2488,16 +2523,18 @@ impl ReplCacheEdges {
         self.fwd_off.last().copied().unwrap_or(0) as usize
     }
 
-    /// One-line description of which halves arrived, for warm-start logging.
+    /// One-line description of what arrived, for warm-start logging.
     pub fn summary(&self) -> String {
         if self.is_empty() {
             return "none".to_string();
         }
-        format!(
-            "forward={} edges, inbound={}",
-            self.forward_edges(),
-            if self.has_inbound() { "yes" } else { "no" }
-        )
+        let where_ = match self.fwd_tgt {
+            FwdTgtStore::Empty => "none",
+            FwdTgtStore::Resident(_) => "resident",
+            #[cfg(feature = "native")]
+            FwdTgtStore::OnDisk(_) => "on-disk chunks",
+        };
+        format!("forward={} edges ({where_})", self.forward_edges(),)
     }
 }
 
@@ -2633,13 +2670,11 @@ impl ReplCache {
         // This constructor never transposes the CSR (it builds no inbound CSR and
         // no dominators), so the live forward CSR is still here and can be *moved*
         // into the cache rather than copied — no extra peak, only a longer
-        // lifetime. The inbound half is left empty: building it would mean a
-        // transpose this path has no other reason to pay for, and `@inbounds`
-        // can be served by transposing the forward half on demand.
+        // lifetime. `@inbounds` is served by transposing the forward half on
+        // demand.
         let edges = ReplCacheEdges {
             fwd_off: std::mem::take(&mut g.fwd_offsets),
-            fwd_tgt: std::mem::take(&mut g.fwd_targets),
-            ..Default::default()
+            fwd_tgt: FwdTgtStore::Resident(std::mem::take(&mut g.fwd_targets)),
         };
         Ok(ReplCache {
             p1: p1_owned,
