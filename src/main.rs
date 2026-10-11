@@ -3872,7 +3872,8 @@ struct MatCached {
     fwd_tgt: Vec<u32>,
     inb_block_off: Vec<u64>,
     inb_data: Vec<u8>,
-    /// Immediate dominator per object, dense-id space.
+    /// Immediate dominator per object, dense-id space, plus the virtual root at
+    /// index `n` — `n + 1` entries, the shape `compute_dominators` returns.
     idom: Vec<u32>,
     /// Dominator-children CSR, `n + 2` rows (the last is the virtual root).
     dc_off: Vec<u32>,
@@ -3887,6 +3888,7 @@ struct MatCached {
 fn load_mat_cache(input: &str, p1: &pass1::Pass1) -> io::Result<Option<MatCached>> {
     let cache = cache::CacheDir::for_dump(std::path::Path::new(input))?;
     if !cache.is_valid(cache::CacheMode::Graph) {
+        eprintln!("hprof-cache: no usable graph cache next to the dump; running the full pipeline");
         return Ok(None);
     }
     let n = p1.id_map.len();
@@ -3895,6 +3897,7 @@ fn load_mat_cache(input: &str, p1: &pass1::Pass1) -> io::Result<Option<MatCached
     // a shape mismatch here means a stale cache written by an older build (or a
     // half-written file) — refuse it rather than emit a wrong index.
     let Some(fwd_off) = cache.read_forward_offsets()? else {
+        eprintln!("hprof-cache: graph cache has no fwd_off; running the full pipeline");
         return Ok(None);
     };
     if fwd_off.len() != n + 1 {
@@ -3915,16 +3918,34 @@ fn load_mat_cache(input: &str, p1: &pass1::Pass1) -> io::Result<Option<MatCached
         return Ok(None);
     };
     let Some(idom) = cache.read_idom()? else {
+        eprintln!("hprof-cache: graph cache has no idom; running the full pipeline");
         return Ok(None);
     };
-    if idom.len() != n {
+    // `compute_dominators` returns `n + 1` entries: objects 0..n-1 plus the
+    // virtual root at index `n` (see `dominator.rs`'s "Indexing convention").
+    // Comparing against `n` here made this check false for every cache ever
+    // written, so the from-cache path never ran.
+    if idom.len() != n + 1 {
+        eprintln!(
+            "hprof-cache: graph cache has {} idoms for {n} objects (want {}); \
+             running the full pipeline",
+            idom.len(),
+            n + 1
+        );
         return Ok(None);
     }
     let Some((dc_off, dc_tgt)) = cache.read_dominator_children()? else {
+        eprintln!("hprof-cache: graph cache has no dominator children; running the full pipeline");
         return Ok(None);
     };
     // `build_dom_children_csr` emits one row per object plus the virtual root.
     if dc_off.len() != n + 2 || dc_tgt.len() != dc_off[n + 1] as usize {
+        eprintln!(
+            "hprof-cache: dominator-children CSR has {} rows for {n} objects (want {}); \
+             running the full pipeline",
+            dc_off.len(),
+            n + 2
+        );
         return Ok(None);
     }
     Ok(Some(MatCached {
@@ -4201,18 +4222,34 @@ fn run(
     // usable, and the full pipeline below then runs exactly as before.
     // `HPROF_MAT_NO_CACHE=1` forces that fallback, which is what the A/B parity
     // check compares against.
-    let mut mat_cached: Option<MatCached> =
-        if mat.is_some() && std::env::var_os("HPROF_MAT_NO_CACHE").is_none() {
-            match load_mat_cache(input, &p1) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("hprof-cache: {e}; running the full pipeline");
-                    None
-                }
+    // The from-cache path is NOT verified, so it is opt-in.
+    //
+    // It used to be dead: `load_mat_cache` compared `idom.len()` (always `n + 1`)
+    // against `n`, so it returned `None` for every cache ever written and the
+    // full pipeline ran instead. With that check fixed the path finally engages —
+    // and it then emits `dump.index`, `dump.inbound.index` and
+    // `dump.outbound.index` that differ from the full pipeline's (outbound comes
+    // out 205 KB short on the 4-philosophers fixture). The commit that added it
+    // claimed the two paths were byte-identical, but both of its A/B runs took
+    // the pipeline branch, so that comparison was vacuous.
+    //
+    // Until the three emitters are shown identical, a wrong index is worse than a
+    // slow one: keep the default on the pipeline and require `HPROF_MAT_USE_CACHE=1`
+    // to exercise the cached path.
+    let mut mat_cached: Option<MatCached> = if mat.is_some()
+        && std::env::var_os("HPROF_MAT_NO_CACHE").is_none()
+        && std::env::var_os("HPROF_MAT_USE_CACHE").is_some()
+    {
+        match load_mat_cache(input, &p1) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("hprof-cache: {e}; running the full pipeline");
+                None
             }
-        } else {
-            None
-        };
+        }
+    } else {
+        None
+    };
     // Sticky for the rest of the function: `mat_cached` is moved into the graph
     // builder below, but every later guard still needs to know which path ran.
     let mat_reused = mat_cached.is_some();
@@ -4232,7 +4269,8 @@ fn run(
     if mat_reused {
         eprintln!(
             "mat caches: reusing the graph cache next to the dump \
-             (HPROF_MAT_NO_CACHE=1 disables)"
+             (HPROF_MAT_USE_CACHE=1 opted in; this path is UNVERIFIED — its \
+             .index output is not yet byte-identical to the pipeline's)"
         );
     }
     let mut no_in_sets = std::collections::HashMap::new();
