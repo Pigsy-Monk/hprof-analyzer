@@ -3985,6 +3985,11 @@ fn graph_from_mat_cache(
     bool,
     Vec<u32>,
     Option<crate::id_map::IdMap>,
+    // Dense ids of thread objects that are one of their own stack-frame locals.
+    // `graph_extras` derives them from pass 1; the pipeline hands them to the
+    // emitters through `MatOutboundRescanCtx`, and this path — which never
+    // builds that context — has to carry them out by hand.
+    Vec<u32>,
 )> {
     // The pass-1-derived tables: same code `Pass2::build` runs, so the class
     // histogram, GC roots, thread stacks and synthetic edges cannot drift.
@@ -4063,6 +4068,7 @@ fn graph_from_mat_cache(
         false,
         fwd_tgt_flat,
         Some(id_map),
+        ge.synthetic_self_edges,
     ))
 }
 
@@ -4269,8 +4275,9 @@ fn run(
     if mat_reused {
         eprintln!(
             "mat caches: reusing the graph cache next to the dump \
-             (HPROF_MAT_USE_CACHE=1 opted in; this path is UNVERIFIED — its \
-             .index output is not yet byte-identical to the pipeline's)"
+             (HPROF_MAT_USE_CACHE=1 opted in; the .index files are byte-identical \
+             to the pipeline's, but the --report markdown omits the sections pass \
+             2's heap scan produces)"
         );
     }
     let mut no_in_sets = std::collections::HashMap::new();
@@ -4294,6 +4301,10 @@ fn run(
         // it is handed over on its own; the pipeline path leaves this `None` and
         // `run()` reads the same table out of `inbound.id_map`.
         mat_cached_id_map,
+        // Synthetic `thread → itself` edges, derived from pass 1 by
+        // `graph_extras`. Empty on the pipeline path, which reads them off
+        // `MatOutboundRescanCtx` instead.
+        mat_cached_self_edges,
     ) = if let Some(c) = mat_cached.take() {
         graph_from_mat_cache(&source, p1, c, &opts)?
     } else {
@@ -4318,6 +4329,7 @@ fn run(
             r.8,
             Vec::new(),
             None,
+            Vec::new(),
         )
     };
     log(
@@ -5230,8 +5242,19 @@ fn run(
     } else {
         None
     };
-    if let (Some(z), Some(ctx)) = (mat_self_ref.as_mut(), mat_outbound_rescan_ctx.as_ref()) {
-        for &d in &ctx.synthetic_self_edges {
+    // `graph_extras` derives the synthetic `thread → itself` edges from pass 1.
+    // The pipeline reads them off `MatOutboundRescanCtx`; the from-cache path
+    // builds no context, so it gets them handed back by `graph_from_mat_cache`.
+    // Both emitters below re-inject them out of band (they are deliberately not
+    // in the forward CSR), and the inbound body they lengthen is also what the
+    // main `.index`'s `cacheEntry` offsets index into — so dropping them here
+    // shifted every class's instance block as well.
+    if let Some(z) = mat_self_ref.as_mut() {
+        let self_edges: &[u32] = match mat_outbound_rescan_ctx.as_ref() {
+            Some(ctx) => &ctx.synthetic_self_edges,
+            None => &mat_cached_self_edges,
+        };
+        for &d in self_edges {
             z.set(d as usize);
         }
     }
@@ -5296,6 +5319,22 @@ fn run(
             } else {
                 0
             };
+            // The emit loop below reads object `d`'s edges as
+            // `fwd_off[d - 1]..fwd_off[d]`, i.e. it wants an array whose entry
+            // `i` is the END of object `i`'s row. `rescan_outbound` leaves the
+            // table in exactly that shape: it uses each entry as a write cursor
+            // and increments it once per edge scattered, turning pass 2's
+            // `off[i] = start_i` into `off[i] = start_{i+1}`. The from-cache path
+            // skips the rescan, so the table is still the raw prefix sum and
+            // every row would be read one object behind — the 205 KB-short
+            // `outbound.index`. Shift it to the post-rescan convention here.
+            // Entry `n` is never a cursor, so it stays the total edge count.
+            if mat_reused && !fwd_off.is_empty() {
+                let n = fwd_off.len() - 1;
+                for i in 0..n {
+                    fwd_off[i] = fwd_off[i + 1];
+                }
+            }
             // From-cache path: the forward targets were decoded off `graph.bin`
             // while the graph was being loaded, so there is nothing to
             // scatter-fill — `rescan_outbound` and the 44 GB re-read it needs
