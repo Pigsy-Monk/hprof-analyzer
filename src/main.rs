@@ -592,6 +592,15 @@ enum HeapCmd {
         /// Emit JSON.
         #[arg(long)]
         json: bool,
+        /// Also show what the object's references point at, up to this many
+        /// levels deep (default 0 — references stay as addresses).
+        ///
+        /// One level is usually what you want: a field holding a `City` then
+        /// shows the `City`'s own fields instead of just its address. Expansion
+        /// is bounded (200 extra objects), so a single inspect cannot walk the
+        /// heap; `@fields` is simply absent past that point.
+        #[arg(long, value_name = "N", default_value_t = 0)]
+        depth: u32,
         /// Build the object-offset table (`offsets.bin`) first if this cache
         /// lacks it. Costs one pass-1 scan of the dump (~pass1's memory, which
         /// on a multi-GB dump means a multi-GB RSS spike) — only needed for
@@ -1633,6 +1642,7 @@ fn run_heap_cmd(cmd: HeapCmd) -> anyhow::Result<()> {
             index,
             address,
             json,
+            depth,
             build_offsets,
         } => {
             let sess = load(&dump, CacheMode::Full)?;
@@ -1680,7 +1690,7 @@ fn run_heap_cmd(cmd: HeapCmd) -> anyhow::Result<()> {
             // offset. One seek, a few dozen bytes — NOT a rescan (which is what
             // makes OQL `toString(s)` cost ~50 minutes and stall the server).
             let (fields, address, note) =
-                inspect_fields(&dump, &sess, &class_idx, idx, build_offsets)?;
+                inspect_fields(&dump, &sess, &class_idx, idx, build_offsets, depth)?;
 
             if json {
                 let mut obj = serde_json::json!({
@@ -6064,12 +6074,45 @@ const COMPRESSED_NOTE: &str = "the dump is compressed (gzip/zip), so record offs
 /// Returns `(fields, address, note)`. `fields` is `None` — with `note` saying
 /// why — whenever the values cannot be read, so the caller reports the reason
 /// instead of quietly printing an empty object.
+/// How far `heap inspect` may follow references, and how many extra objects
+/// that may pull in.
+///
+/// References are *not* expanded by default: one object's graph is unbounded,
+/// and a recursive dump of it would be both enormous and slow. `--depth N`
+/// opts in, bounded by `budget` so a single inspect cannot walk the heap.
+#[derive(Clone, Copy)]
+struct Expand<'a> {
+    /// Levels of references still allowed to expand.
+    depth: u32,
+    /// Objects left that expansion may pull in, shared across the whole tree.
+    budget: &'a std::cell::Cell<usize>,
+}
+
+impl<'a> Expand<'a> {
+    /// Take one slot from the budget; `None` when depth or budget is exhausted.
+    fn take(self) -> Option<Expand<'a>> {
+        let left = self.budget.get();
+        if self.depth == 0 || left == 0 {
+            return None;
+        }
+        self.budget.set(left - 1);
+        Some(Expand {
+            depth: self.depth - 1,
+            budget: self.budget,
+        })
+    }
+}
+
+/// How many objects `--depth` may pull in beyond the one asked for.
+const EXPAND_BUDGET: usize = 200;
+
 fn inspect_fields(
     dump: &str,
     sess: &hprof_analyzer::cache::CachedSession,
     class_idx: &[u32],
     idx: usize,
     build_offsets: bool,
+    depth: u32,
 ) -> anyhow::Result<(Option<serde_json::Value>, Option<String>, Option<String>)> {
     use hprof_analyzer::objread;
     let kind = sess.pass1.kind.get(idx).copied().unwrap_or(0);
@@ -6112,10 +6155,15 @@ fn inspect_fields(
         return Ok((None, None, Some(COMPRESSED_NOTE.into())));
     }
 
+    let budget = std::cell::Cell::new(EXPAND_BUDGET);
+    let expand = Expand {
+        depth,
+        budget: &budget,
+    };
     if kind == 0 {
-        inspect_instance(dump, path, sess, class_idx, offset, &offsets)
+        inspect_instance(dump, path, sess, class_idx, offset, &offsets, expand)
     } else {
-        inspect_array(dump, path, sess, class_idx, offset, &offsets)
+        inspect_array(dump, path, sess, class_idx, offset, &offsets, expand)
     }
 }
 
@@ -6131,6 +6179,7 @@ fn inspect_instance(
     class_idx: &[u32],
     offset: u64,
     offsets: &[u64],
+    expand: Expand<'_>,
 ) -> anyhow::Result<(Option<serde_json::Value>, Option<String>, Option<String>)> {
     use hprof_analyzer::objread;
     let Some((addr, _class_addr, fields)) = objread::read_instance_at(
@@ -6164,7 +6213,7 @@ fn inspect_instance(
         let v = match &f.value {
             objread::FieldValue::Prim(v) => v.clone(),
             objread::FieldValue::Null => serde_json::Value::Null,
-            objread::FieldValue::Ref(a) => ref_json(*a, sess, class_idx, dump, offsets),
+            objread::FieldValue::Ref(a) => ref_json(*a, sess, class_idx, dump, offsets, expand),
         };
         map.insert(key, v);
     }
@@ -6190,6 +6239,7 @@ fn inspect_array(
     class_idx: &[u32],
     offset: u64,
     offsets: &[u64],
+    expand: Expand<'_>,
 ) -> anyhow::Result<(Option<serde_json::Value>, Option<String>, Option<String>)> {
     use hprof_analyzer::objread;
     let Some(arr) = objread::read_array_at(
@@ -6237,7 +6287,9 @@ fn inspect_array(
                 .map(|v| match v {
                     objread::FieldValue::Prim(v) => v.clone(),
                     objread::FieldValue::Null => serde_json::Value::Null,
-                    objread::FieldValue::Ref(a) => ref_json(*a, sess, class_idx, dump, offsets),
+                    objread::FieldValue::Ref(a) => {
+                        ref_json(*a, sess, class_idx, dump, offsets, expand)
+                    }
                 })
                 .collect(),
         ),
@@ -6269,6 +6321,7 @@ fn ref_json(
     class_idx: &[u32],
     dump: &str,
     offsets: &[u64],
+    expand: Expand<'_>,
 ) -> serde_json::Value {
     let mut o = serde_json::Map::new();
     o.insert("@ref".into(), serde_json::json!(format!("0x{addr:x}")));
@@ -6286,7 +6339,43 @@ fn ref_json(
             o.insert("@text_length".into(), serde_json::json!(full_len));
         }
     }
+    // `--depth`: follow the reference into the target's own record, so a field
+    // that holds an object reads as that object instead of as an address. The
+    // shared budget bounds how far one inspect can walk.
+    if let Some(child) = expand.take() {
+        if let Some(rendered) = expand_ref(addr, sess, class_idx, dump, offsets, child) {
+            o.insert("@fields".into(), rendered);
+        }
+    }
     serde_json::Value::Object(o)
+}
+
+/// Render the object a reference points at, for `--depth`. `None` when the
+/// target has no readable record — a class object, or an address the cache does
+/// not know — so the caller keeps the plain address instead of inventing one.
+fn expand_ref(
+    addr: u64,
+    sess: &hprof_analyzer::cache::CachedSession,
+    class_idx: &[u32],
+    dump: &str,
+    offsets: &[u64],
+    expand: Expand<'_>,
+) -> Option<serde_json::Value> {
+    let i = sess.index_of_addr(addr)?;
+    if sess.pass1.kind.get(i).copied().unwrap_or(0) == 3 {
+        return None;
+    }
+    let offset = *offsets.get(i)?;
+    if offset == 0 {
+        return None;
+    }
+    let path = std::path::Path::new(dump);
+    let rendered = if sess.pass1.kind.get(i).copied().unwrap_or(0) == 0 {
+        inspect_instance(dump, path, sess, class_idx, offset, offsets, expand)
+    } else {
+        inspect_array(dump, path, sess, class_idx, offset, offsets, expand)
+    };
+    rendered.ok().and_then(|(v, _, _)| v)
 }
 
 /// Decode the `java.lang.String` at `addr` into `(text, full_len, truncated)`.

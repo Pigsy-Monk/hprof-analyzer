@@ -43,11 +43,12 @@ fn cache_dir(dump: &Path) -> Option<PathBuf> {
     entries.pop()
 }
 
-fn inspect_json(dump: &Path, idx: u64) -> serde_json::Value {
+fn inspect_json_with(dump: &Path, idx: u64, extra: &[&str]) -> serde_json::Value {
     let out = Command::new(BIN)
         .args(["heap", "inspect"])
         .arg(dump)
         .args(["--index", &idx.to_string(), "--json"])
+        .args(extra)
         .output()
         .expect("spawn heap inspect");
     assert!(
@@ -56,6 +57,10 @@ fn inspect_json(dump: &Path, idx: u64) -> serde_json::Value {
         String::from_utf8_lossy(&out.stderr)
     );
     serde_json::from_slice(&out.stdout).expect("inspect --json output must be JSON")
+}
+
+fn inspect_json(dump: &Path, idx: u64) -> serde_json::Value {
+    inspect_json_with(dump, idx, &[])
 }
 
 /// Field values are decoded from the dump and match the object's real contents.
@@ -222,4 +227,44 @@ fn inspect_class_object_reports_no_record() {
         "class object must report why it has no fields, got {:?}",
         cls["fields_note"]
     );
+}
+
+/// `--depth N` follows references, so a field holding an object reads as that
+/// object rather than as an address — and the default leaves the output exactly
+/// as it was, which is what every existing caller relies on.
+#[test]
+fn inspect_depth_follows_references() {
+    let Some((_dir, dump)) = staged_copy("depth") else {
+        return;
+    };
+    let load = Command::new(BIN)
+        .args(["heap", "load"])
+        .arg(&dump)
+        .output()
+        .unwrap();
+    assert!(load.status.success(), "heap load failed");
+
+    // Default: a reference stays an address — no `@fields`, and the whole
+    // document is unchanged by the flag existing.
+    let plain = inspect_json(&dump, 100);
+    assert!(
+        plain["fields"]["key"].get("@fields").is_none(),
+        "references must not expand unless asked"
+    );
+    assert_eq!(
+        inspect_json_with(&dump, 100, &["--depth", "0"]),
+        plain,
+        "--depth 0 must be byte-identical to omitting it"
+    );
+
+    // One level: `key` is a String, so the String's own fields appear.
+    let one = inspect_json_with(&dump, 100, &["--depth", "1"]);
+    assert_eq!(one["fields"]["key"]["@fields"]["@text"], "ymt");
+    assert_eq!(one["fields"]["key"]["@fields"]["hash"], 119776);
+
+    // Two levels reach the byte[] behind the String: "ymt" as bytes.
+    let two = inspect_json_with(&dump, 100, &["--depth", "2"]);
+    let bytes = &two["fields"]["key"]["@fields"]["value"]["@fields"];
+    assert_eq!(bytes["@element_type"], "byte");
+    assert_eq!(bytes["elements"][0], 121); // 'y'
 }
