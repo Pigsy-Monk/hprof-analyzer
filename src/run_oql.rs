@@ -45,6 +45,79 @@ pub(crate) type RetainedEdgeStructs = (
     Option<(Vec<u32>, Vec<u32>)>,
 );
 
+/// Build the query-gated edge structures from a forward CSR.
+///
+/// `node_matches(s)` says whether dense index `s` is a node the query's FROM
+/// target selects; only those nodes keep rows (forward) or are kept as targets
+/// (inbound), which is what bounds the memory these stores cost.
+///
+/// Factored out of [`run_oql_escalated`] so a **cache-backed** session
+/// (`ReplCache::edges`, read back from `graph.bin`) builds its edges with the
+/// exact same code. That identity is the point: it is what makes a warm
+/// session's `@inbounds`/`@outbounds`/`path()` answers indistinguishable from an
+/// escalated run's, rather than a second implementation that merely looks close.
+pub(crate) fn build_retained_edges(
+    n: usize,
+    fwd_off: &[u32],
+    fwd_tgt: &crate::chunkvec::ChunkU32,
+    want_forward: bool,
+    want_inbound: bool,
+    node_matches: impl Fn(usize) -> bool,
+) -> RetainedEdgeStructs {
+    let retained_edges = if want_forward {
+        let mut builder = crate::query::retained_edges::RetainedEdgesBuilder::new();
+        let mut scratch: Vec<u32> = Vec::new();
+        for s in 0..n {
+            if !node_matches(s) {
+                continue;
+            }
+            let (lo, hi) = (fwd_off[s] as usize, fwd_off[s + 1] as usize);
+            fwd_tgt.copy_range(lo, hi, &mut scratch);
+            scratch.sort_unstable();
+            builder.push_row(s as u32, &scratch);
+        }
+        Some(builder.finish())
+    } else {
+        None
+    };
+
+    let retained_inbound = if want_inbound {
+        let mut in_off = vec![0u32; n + 1];
+        let mut row: Vec<u32> = Vec::new();
+        for s in 0..n {
+            let (lo, hi) = (fwd_off[s] as usize, fwd_off[s + 1] as usize);
+            fwd_tgt.copy_range(lo, hi, &mut row);
+            for &t in &row {
+                if node_matches(t as usize) {
+                    in_off[t as usize + 1] += 1;
+                }
+            }
+        }
+        for i in 0..n {
+            in_off[i + 1] += in_off[i];
+        }
+        let total = in_off[n] as usize;
+        let mut in_tgt = vec![0u32; total];
+        let mut cursor = in_off.clone();
+        for s in 0..n {
+            let (lo, hi) = (fwd_off[s] as usize, fwd_off[s + 1] as usize);
+            fwd_tgt.copy_range(lo, hi, &mut row);
+            for &t in &row {
+                if node_matches(t as usize) {
+                    let slot = &mut cursor[t as usize];
+                    in_tgt[*slot as usize] = s as u32;
+                    *slot += 1;
+                }
+            }
+        }
+        Some((in_off, in_tgt))
+    } else {
+        None
+    };
+
+    (retained_edges, retained_inbound)
+}
+
 /// Auto-escalated `query`-subcommand path for cross-phase OQL features
 /// (@retainedHeapSize, dominators()/AS RETAINED SET, @inbounds/@outbounds/path,
 /// @GCRoots/@GCRootInfo/@info, N-hop RefPath). Mirrors the `run()` analysis
@@ -179,62 +252,14 @@ pub(crate) fn run_oql_escalated(
                 .any(|(pat, _inst)| query::execute::class_name_matches(cn, pat))
         };
 
-        let n = g.n;
-        let fwd_off = &g.fwd_offsets;
-        let fwd_tgt = &g.fwd_targets;
-
-        let retained_edges = if want_forward {
-            let mut builder = crate::query::retained_edges::RetainedEdgesBuilder::new();
-            let mut scratch: Vec<u32> = Vec::new();
-            for s in 0..n {
-                if !node_matches(s) {
-                    continue;
-                }
-                let (lo, hi) = (fwd_off[s] as usize, fwd_off[s + 1] as usize);
-                fwd_tgt.copy_range(lo, hi, &mut scratch);
-                scratch.sort_unstable();
-                builder.push_row(s as u32, &scratch);
-            }
-            Some(builder.finish())
-        } else {
-            None
-        };
-
-        let retained_inbound = if want_inbound {
-            let mut in_off = vec![0u32; n + 1];
-            let mut row: Vec<u32> = Vec::new();
-            for s in 0..n {
-                let (lo, hi) = (fwd_off[s] as usize, fwd_off[s + 1] as usize);
-                fwd_tgt.copy_range(lo, hi, &mut row);
-                for &t in &row {
-                    if node_matches(t as usize) {
-                        in_off[t as usize + 1] += 1;
-                    }
-                }
-            }
-            for i in 0..n {
-                in_off[i + 1] += in_off[i];
-            }
-            let total = in_off[n] as usize;
-            let mut in_tgt = vec![0u32; total];
-            let mut cursor = in_off.clone();
-            for s in 0..n {
-                let (lo, hi) = (fwd_off[s] as usize, fwd_off[s + 1] as usize);
-                fwd_tgt.copy_range(lo, hi, &mut row);
-                for &t in &row {
-                    if node_matches(t as usize) {
-                        let slot = &mut cursor[t as usize];
-                        in_tgt[*slot as usize] = s as u32;
-                        *slot += 1;
-                    }
-                }
-            }
-            Some((in_off, in_tgt))
-        } else {
-            None
-        };
-
-        (retained_edges, retained_inbound)
+        build_retained_edges(
+            g.n,
+            &g.fwd_offsets,
+            &g.fwd_targets,
+            want_forward,
+            want_inbound,
+            node_matches,
+        )
     } else {
         (None, None)
     };
@@ -379,18 +404,9 @@ pub(crate) fn run_oql_escalated(
     let mut flat_results = flat_results;
     if let Some(dfn) = &reach_dfn {
         for (slot, r) in flat_results.iter_mut().enumerate() {
-            let row_expanding = flat.get(slot).is_some_and(|(_, p)| {
-                p.late_ops.iter().any(|op| {
-                    matches!(
-                        op,
-                        query::plan::StageOp::RetainedSet { .. }
-                            | query::plan::StageOp::DominatorChildren { .. }
-                            | query::plan::StageOp::DominatorOf
-                            | query::plan::StageOp::EdgeLookup { .. }
-                            | query::plan::StageOp::BoundedPath { .. }
-                    )
-                })
-            });
+            let row_expanding = flat
+                .get(slot)
+                .is_some_and(|(_, p)| p.late_ops.iter().any(query::run::is_row_expanding_op));
             if row_expanding {
                 continue;
             }

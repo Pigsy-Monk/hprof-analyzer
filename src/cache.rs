@@ -368,12 +368,35 @@ impl CacheDir {
             id_size: snap.id_size,
         };
         let n = shallow.len();
+        // Edges, so a warm session can answer `@inbounds` / `@outbounds` /
+        // `path()` without re-reading the dump. Best-effort and per-half: a
+        // `heap load` (CacheMode::Full) has no `graph.bin` at all, and a cache
+        // written before the inbound half was real has a forward half only, so
+        // neither absence is an error — `ReplCacheEdges` reports which halves
+        // arrived and the query path falls back when one is missing.
+        let mut edges = crate::query::run::ReplCacheEdges::default();
+        if let Ok(Some((fwd_off, fwd_tgt))) = self.read_forward_edges() {
+            // Validate before accepting: a truncated or mismatched pair would
+            // make the consumer index out of bounds (`fwd_off[s + 1]`,
+            // `fwd_tgt.get(..)`). This is a best-effort read, so a bad pair means
+            // "no edges", never a panic.
+            let total = fwd_off.last().copied().unwrap_or(0) as usize;
+            if fwd_off.len() == n + 1 && total <= fwd_tgt.len() {
+                edges.fwd_tgt = ChunkU32::from_vec(fwd_tgt);
+                edges.fwd_off = fwd_off;
+            }
+        }
+        if let Ok(Some((inb_block_off, inb_data))) = self.read_inbound_blocks() {
+            edges.inb_block_off = inb_block_off;
+            edges.inb_data = inb_data;
+        }
         Ok(Some(handover.into_cache(
             source,
             n,
             shallow,
             class_idx,
             class_names,
+            edges,
         )))
     }
 

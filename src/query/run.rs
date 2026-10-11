@@ -761,6 +761,85 @@ pub fn id_map_to_addrs(m: &IdMap) -> Vec<u64> {
     (0..m.len()).map(|i| m.addr_at(i)).collect()
 }
 
+/// The edge structures a warm session serves `@inbounds` / `@outbounds` /
+/// `path()` from. Built from a [`ReplCache`]'s cached forward CSR by
+/// [`resident_edge_ctx`], using the same builder the escalated path uses.
+pub struct ResidentEdgeCtx<'a> {
+    pub retained_edges: Option<&'a crate::query::retained_edges::RetainedEdges>,
+    pub in_off: &'a [u32],
+    pub in_tgt: &'a [u32],
+}
+
+/// Build the query-gated edge structures for a warm session from its cached
+/// forward CSR, or `None` when the cache has no forward edges or no query in
+/// `flat` uses them.
+///
+/// Delegates to `run_oql::build_retained_edges` — the *same* function the
+/// escalated path calls — so a warm answer and a rescanned answer are produced
+/// by identical code rather than by two implementations that merely agree today.
+pub fn resident_edge_ctx(
+    cache: &ReplCache,
+    flat: &[(Query, QueryPlan)],
+) -> Option<crate::run_oql::RetainedEdgeStructs> {
+    if !cache.edges.has_forward() {
+        return None;
+    }
+    let asts: Vec<Query> = flat.iter().map(|(q, _)| q.clone()).collect();
+    let flags = crate::query::runflags::plan_run(
+        &asts,
+        &crate::run_oql::NoClassIndex,
+        crate::opts::DEFAULT_QUERY_PATH_DEPTH,
+    )
+    .ok()?;
+    let want_forward = flags.retain_forward || flags.outbounds_by_rescan;
+    let want_inbound = flags.retain_inbound;
+    if !want_forward && !want_inbound {
+        return None;
+    }
+    let edge_froms: Vec<(String, bool)> = flat
+        .iter()
+        .filter(|(q, _)| crate::run_oql::query_uses_edges(q))
+        .map(|(q, _)| (q.from.class_name().to_string(), q.from.instanceof()))
+        .collect();
+    let class_idx_ref: &[u32] = &cache.class_idx;
+    let node_matches = |s: usize| -> bool {
+        let Some(&ci) = class_idx_ref.get(s) else {
+            return false;
+        };
+        let Some(cn) = cache.class_names.get(ci as usize) else {
+            return false;
+        };
+        edge_froms
+            .iter()
+            .any(|(pat, _inst)| crate::query::execute::class_name_matches(cn, pat))
+    };
+    Some(crate::run_oql::build_retained_edges(
+        cache.n,
+        &cache.edges.fwd_off,
+        &cache.edges.fwd_tgt,
+        want_forward,
+        want_inbound,
+        node_matches,
+    ))
+}
+
+/// True when this entry's late work is *only* edge lookups (`@inbounds` /
+/// `@outbounds` / `path()`) — i.e. it needs no retained sizes, dominators,
+/// refwalk or GC roots, so a session carrying only the edge structures can
+/// answer it.
+pub(crate) fn entry_is_edge_only(plan: &QueryPlan) -> bool {
+    use crate::query::plan::StageOp;
+    !plan.late_ops.is_empty()
+        && plan
+            .late_ops
+            .iter()
+            .all(|op| matches!(op, StageOp::EdgeLookup { .. } | StageOp::BoundedPath { .. }))
+        && !plan.needs.retained
+        && !plan.needs.dominator_children
+        && !plan.needs.ref_walk
+        && !plan.needs.gc_roots
+}
+
 pub(crate) fn resume_with_string_values(
     mut state: crate::query::execute::QueryExecState,
     flat: &[(Query, QueryPlan)],
@@ -772,6 +851,10 @@ pub(crate) fn resume_with_string_values(
     // correctly for carry-mode (toString) entries. Pass empty slice/None when not needed.
     addr_of: &[u64],
     shallow_opt: Option<&[u32]>,
+    // Optional: the cached edge structures. When `Some`, entries whose late work
+    // is edge-only are answered here instead of falling to the actionable
+    // "needs the full pipeline" error. `None` (the scan path) is unchanged.
+    edges: Option<&ResidentEdgeCtx<'_>>,
 ) -> Vec<crate::query::model::QueryResult> {
     use crate::query::plan::StageOp;
     use crate::query::stage_runner::{self, EMPTY_REFWALK_TAILS, EMPTY_STRING_VALUES};
@@ -826,9 +909,9 @@ pub(crate) fn resume_with_string_values(
         field_names: rw_names,
         refwalk_tails: rw_tails,
         refwalk_truncated: rw_trunc,
-        in_off: &[],
-        in_tgt: &[],
-        retained_edges: None,
+        in_off: edges.map_or(&[], |e| e.in_off),
+        in_tgt: edges.map_or(&[], |e| e.in_tgt),
+        retained_edges: edges.and_then(|e| e.retained_edges),
         string_values: sv_ref,
         string_values_truncated: false,
         // Query-only path never collects GC roots (`@GCRoots`/`@GCRootInfo`/
@@ -887,7 +970,12 @@ pub(crate) fn resume_with_string_values(
                 });
         let is_refwalk = needs_only_refwalk;
         let is_array_index = needs_only_array_index;
-        if is_string_only || is_refwalk || is_array_index {
+        // Edge-only entries are served here when the session carries the edge
+        // structures (a warm cache with `graph.bin`, or one whose `build()` moved
+        // the live CSR in). Without them they keep falling to
+        // `resume_without_late_ctx`'s actionable error, exactly as before.
+        let is_edge = edges.is_some() && entry_is_edge_only(&entry.plan);
+        if is_string_only || is_refwalk || is_array_index || is_edge {
             let q = &flat[entry.slot].0;
             let r = stage_runner::run_entry_pub(&entry, q, &ctx);
             slotted.push((entry.slot, r));
@@ -919,6 +1007,17 @@ pub(crate) fn resume_with_string_values(
     // src (aggregate/scalar/error/refwalk) keeps all its rows.
     if let Some(dfn) = dfn {
         for (slot, r) in slotted.iter_mut() {
+            // Row-EXPANDING late ops (edges, `path()`) emit rows that are NOT the
+            // original matched objects (they are referrers / reached nodes), so the
+            // source sidecar no longer aligns 1:1 and "was the SOURCE object
+            // reachable?" is not the right question. Leave those slots unpruned,
+            // mirroring `run_oql_escalated`.
+            let row_expanding = flat
+                .get(*slot)
+                .is_some_and(|(_, p)| p.late_ops.iter().any(is_row_expanding_op));
+            if row_expanding {
+                continue;
+            }
             if let Some(src) = row_src_by_slot.get(slot) {
                 filter_result_by_src(r, src, dfn);
             }
@@ -1062,6 +1161,19 @@ fn open_blob_reader(cache: &ReplCache) -> std::io::Result<BlobReader> {
     BlobReader::open(path, cache.id_size)
 }
 
+/// Late ops that emit rows which are not the query's own matched objects.
+pub(crate) fn is_row_expanding_op(op: &crate::query::plan::StageOp) -> bool {
+    use crate::query::plan::StageOp;
+    matches!(
+        op,
+        StageOp::RetainedSet { .. }
+            | StageOp::DominatorChildren { .. }
+            | StageOp::DominatorOf
+            | StageOp::EdgeLookup { .. }
+            | StageOp::BoundedPath { .. }
+    )
+}
+
 /// Run the full pass1+pass2 pipeline against `path` for the given planned
 /// queries and return their results. Used by the REPL (and available to any
 /// one-shot caller). Does not build or render the full report.
@@ -1142,10 +1254,16 @@ pub fn run_resident_only(
     // map; row-mode would emit all-Null rows at scan time since blobs are empty.
     let mut entries: Vec<(usize, SingleScanExecutor<'_, LiveResolver<'_>>)> = Vec::new();
     for (slot, (q, plan)) in flat.iter().enumerate() {
-        let ex = if plan.needs.string_values
-            || (plan.kind == crate::query::plan::StageKind::GroupBy
-                && plan.finalize_at == crate::query::plan::Phase::P3)
-        {
+        // Carry mode for ANY cross-phase query — the same rule `pass2` arms its
+        // executors with (`plan.finalize_at != P1`). A row executor evaluates a
+        // late column at scan time, where an edge has no answer yet, so the
+        // entry would come back as rows of `Null` and never reach the late
+        // window at all. The narrower `string_values || retained` test this used
+        // to be was enough only because nothing cross-phase but those two could
+        // get here — and edges, which `is_resident_only()` does not know about,
+        // can. `needs.string_values` is kept explicitly alongside it: it is what
+        // this path used before and it must not start arming row mode.
+        let ex = if plan.needs.string_values || plan.finalize_at != crate::query::plan::Phase::P1 {
             use crate::query::carry::Carry;
             SingleScanExecutor::new_carry(
                 q,
@@ -1255,7 +1373,25 @@ pub fn run_resident_only(
     } else {
         std::collections::HashMap::new()
     };
+    // Edge structures, when the cache carries them. Built with the same builder
+    // the escalated path uses, so `@inbounds`/`@outbounds`/`path()` answered from
+    // a warm session are the same rows a rescan would produce. `None` when the
+    // cache has no forward CSR or no query in this batch uses edges — then the
+    // edge entries keep erroring with the actionable "needs the full pipeline".
+    //
+    // Built BEFORE `addr_vec` on purpose: an edge row is a *referrer*, and the
+    // late window renders it through `LateCtx.id_map` (`dominator_rows` →
+    // `to_addr_opt`). Without the real address table those rows come back as
+    // `Null` while the escalated path prints `?@0x...` — same rows, different
+    // values, which is exactly the kind of near-miss this must not ship.
+    let edge_structs = resident_edge_ctx(cache, &flat);
+    let edge_ctx = edge_structs.as_ref().map(|(re, inb)| ResidentEdgeCtx {
+        retained_edges: re.as_ref(),
+        in_off: inb.as_ref().map_or(&[], |(o, _)| o),
+        in_tgt: inb.as_ref().map_or(&[], |(_, t)| t),
+    });
     let addr_vec = if needs_sv
+        || edge_structs.is_some()
         || flat
             .iter()
             .any(|(_, p)| p.finalize_at != crate::query::plan::Phase::P1)
@@ -1264,8 +1400,16 @@ pub fn run_resident_only(
     } else {
         Vec::new()
     };
-    let flat_results =
-        resume_with_string_values(state, &flat, sv, None, dfn, &addr_vec, Some(&cache.shallow));
+    let flat_results = resume_with_string_values(
+        state,
+        &flat,
+        sv,
+        None,
+        dfn,
+        &addr_vec,
+        Some(&cache.shallow),
+        edge_ctx.as_ref(),
+    );
     let mut flat_results = flat_results;
     // jsonify(...) columns carry an ObjRef placeholder out of the scan; expand
     // them here, while the ReplCache (dump path + offsets.bin + pass-1 tables)
@@ -1555,6 +1699,7 @@ pub fn run_single_dump(
             rpo.as_ref().map(|r| r.dfn.as_slice()),
             &addr_vec,
             None,
+            None,
         );
         let mut flat_results = flat_results;
         // The scan path consumed its `Pass1` into `Pass2::build`, so it has no
@@ -1708,6 +1853,7 @@ pub fn run_single_dump(
         outer_refwalk_csr,
         outer_rpo.as_ref().map(|r| r.dfn.as_slice()),
         &outer_addr_vec,
+        None,
         None,
     );
 
@@ -2227,6 +2373,77 @@ pub struct ReplCache {
     /// per object (~8 B/object; ~4.9 GB on a 600M-object dump), so callers
     /// attach it only from a cache that actually has `offsets.bin`.
     pub offsets: Option<Vec<u64>>,
+    /// Reference edges, so `@inbounds` / `@outbounds` / `path()` can be answered
+    /// without re-reading the dump. Empty when the source had none to give.
+    pub edges: ReplCacheEdges,
+}
+
+/// The reference-edge structures a warm [`ReplCache`] can carry.
+///
+/// Two independent halves, each from a different source, which is why they are
+/// queried separately rather than through one `has_edges()`:
+///
+/// * `fwd_off` / `fwd_tgt` — the forward CSR (out-edges). Comes from
+///   `graph.bin` on a cache-backed warm start, or is moved straight out of the
+///   live graph by [`ReplCache::build`], which never transposes the CSR and so
+///   still owns it when it is done.
+/// * `inb_block_off` / `inb_data` — the inbound CSR in the engine's own block
+///   format, i.e. exactly what `compute_dominators` consumes. Only a
+///   cache-backed session has this: the analysis pipeline hands it to
+///   `compute_dominators` and then drops it to get the memory back.
+///
+/// Both halves stay empty when the source could not supply them — no
+/// `graph.bin` (a `heap load` without `--with-graph`), or a cache written
+/// before the inbound half was written at all. That is the observable
+/// difference the fall-back-to-rescan path keys off.
+#[derive(Default)]
+pub struct ReplCacheEdges {
+    /// Forward CSR row pointers, len `n + 1` (`fwd_off[i]..fwd_off[i + 1]`
+    /// slices `fwd_tgt` for object `i`'s out-edges).
+    pub fwd_off: Vec<u32>,
+    /// Forward edge targets. Held as the chunked store for the same reason
+    /// `GraphForCache` does: on a large dump this is billions of entries, so
+    /// flattening it costs gigabytes, and `ReplCache::build` can *move* the
+    /// live store instead of copying it.
+    pub fwd_tgt: crate::chunkvec::ChunkU32,
+    /// Block-sampled byte offsets into `inb_data`; one entry per INB_BLOCK nodes.
+    pub inb_block_off: Vec<u64>,
+    /// Vbyte-encoded inbound parent lists (`pass2::INB_BLOCK` format).
+    pub inb_data: Vec<u8>,
+}
+
+impl ReplCacheEdges {
+    /// True when the forward CSR is present (out-edges, `path()`).
+    pub fn has_forward(&self) -> bool {
+        self.fwd_off.len() > 1
+    }
+
+    /// True when the inbound block CSR is present (`compute_dominators`).
+    pub fn has_inbound(&self) -> bool {
+        !self.inb_block_off.is_empty() && !self.inb_data.is_empty()
+    }
+
+    /// True when neither half could be supplied.
+    pub fn is_empty(&self) -> bool {
+        !self.has_forward() && !self.has_inbound()
+    }
+
+    /// Forward edge count (`fwd_off`'s last entry), 0 when absent.
+    pub fn forward_edges(&self) -> usize {
+        self.fwd_off.last().copied().unwrap_or(0) as usize
+    }
+
+    /// One-line description of which halves arrived, for warm-start logging.
+    pub fn summary(&self) -> String {
+        if self.is_empty() {
+            return "none".to_string();
+        }
+        format!(
+            "forward={} edges, inbound={}",
+            self.forward_edges(),
+            if self.has_inbound() { "yes" } else { "no" }
+        )
+    }
 }
 
 /// The slice of a `Pass1` that a [`ReplCache`] actually reads — plus the cache's
@@ -2253,6 +2470,15 @@ impl OqlCacheHandover {
     ///
     /// Scope is `reachable_only: false` with `dfn: None` — bit-for-bit the cache
     /// the first query builds today, so query semantics are unchanged.
+    ///
+    /// `edges` is supplied by the caller because the pipeline does **not** have
+    /// them to give at this point: the forward CSR was consumed by
+    /// `build_from_fwd` (or dropped outright on the rescan path) and the inbound
+    /// blocks it produced were dropped right after `compute_dominators`. Both
+    /// are deliberately released there to keep the peak down, so re-acquiring
+    /// them here would cost exactly the memory this warm cache exists to save.
+    /// A cache-backed session therefore gets its edges from `graph.bin`
+    /// (`CacheDir::read_query_cache`); see `ReplCacheEdges`.
     pub fn into_cache(
         self,
         source: crate::source::HprofSource,
@@ -2260,6 +2486,7 @@ impl OqlCacheHandover {
         shallow: Vec<u32>,
         class_idx: Vec<u32>,
         class_names: Vec<String>,
+        edges: ReplCacheEdges,
     ) -> ReplCache {
         ReplCache {
             p1: crate::pass1::Pass1 {
@@ -2284,6 +2511,7 @@ impl OqlCacheHandover {
             // 8 B/object and the pipeline does not need them). Callers that have
             // a cache directory attach them afterwards via `attach_offsets`.
             offsets: None,
+            edges,
         }
     }
 }
@@ -2318,7 +2546,7 @@ impl ReplCache {
         let flat: Vec<(Query, QueryPlan)> = Vec::new();
         let mut empty = std::collections::HashMap::new();
         let mut empty_exists = std::collections::HashMap::new();
-        let (g, _, shallow_c, class_idx_c, ..) = crate::pass2::Pass2::build(
+        let (mut g, _, shallow_c, class_idx_c, ..) = crate::pass2::Pass2::build(
             &source_cache,
             p1_for_pass2,
             crate::cvec::Codec::Deflate9,
@@ -2347,6 +2575,17 @@ impl ReplCache {
             None
         };
         let id_size = p1_owned.id_size as usize;
+        // This constructor never transposes the CSR (it builds no inbound CSR and
+        // no dominators), so the live forward CSR is still here and can be *moved*
+        // into the cache rather than copied — no extra peak, only a longer
+        // lifetime. The inbound half is left empty: building it would mean a
+        // transpose this path has no other reason to pay for, and `@inbounds`
+        // can be served by transposing the forward half on demand.
+        let edges = ReplCacheEdges {
+            fwd_off: std::mem::take(&mut g.fwd_offsets),
+            fwd_tgt: std::mem::take(&mut g.fwd_targets),
+            ..Default::default()
+        };
         Ok(ReplCache {
             p1: p1_owned,
             n,
@@ -2362,6 +2601,7 @@ impl ReplCache {
             // 8 B/object and the pipeline does not need them). Callers attach
             // them from the dump's cache directory via `attach_offsets`.
             offsets: None,
+            edges,
         })
     }
 

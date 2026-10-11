@@ -558,6 +558,13 @@ fn analyze_to_report_inner(
     // Server path: assemble the warm OQL cache from the handover plus the arrays
     // the pipeline already restored into `g`. `g` is dead after this point, so
     // the two big arrays move rather than copy.
+    //
+    // No edges: by here the forward CSR has been consumed by `build_from_fwd`
+    // (or dropped on the rescan path) and the inbound blocks it produced were
+    // released right after `compute_dominators`. Both releases are what keeps
+    // this path's peak down, so re-acquiring them here would cost the memory the
+    // warm cache exists to save. A cache-backed session gets its edges from
+    // `graph.bin` instead — see `CacheDir::read_query_cache`.
     let oql_cache = oql_handover.map(|h| {
         h.into_cache(
             source.clone(),
@@ -568,6 +575,7 @@ fn analyze_to_report_inner(
                 .iter()
                 .map(|n| crate::report::format::pretty_class_name(n))
                 .collect(),
+            crate::query::run::ReplCacheEdges::default(),
         )
     });
 

@@ -143,7 +143,26 @@ pub fn run_query_json_policy(
             && retained.is_some()
             && crate::query::repl::cache_shaped(&q, &plan);
 
-        if used_fast_path {
+        // Edge-only queries (`@inbounds` / `@outbounds` / `path()`) are served
+        // from the warm cache whenever it carries the reference edges — either
+        // moved in by `ReplCache::build` or read back from `graph.bin` by the
+        // warm start (`CacheDir::read_query_cache`). Before this they always
+        // took the escalated hatch, i.e. re-read the whole dump *while the
+        // analysis's resident state was still held* — the exact additive-peak
+        // OOM this policy exists to prevent. A cache without edges (a
+        // `heap load` that never wrote `graph.bin`) leaves this false and the
+        // query falls through to the rescan/refusal path unchanged.
+        let needs_only_edges = crate::query::run::entry_is_edge_only(&plan);
+        let edges_servable = needs_only_edges
+            && crate::query::repl::cache_shaped(&q, &plan)
+            && cache
+                .as_ref()
+                .is_some_and(|c| c.edges.has_forward() && c.reachable_only == reachable_only);
+
+        if edges_servable {
+            let c = cache.as_ref().expect("checked by edges_servable");
+            crate::query::run::run_resident_only(c, &[(q, plan)], reachable_only)
+        } else if used_fast_path {
             let ret = retained.unwrap();
             if cache.is_none() {
                 match ReplCache::build(&crate::source::HprofSource::from(path), reachable_only) {

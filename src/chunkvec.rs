@@ -29,8 +29,8 @@ impl ChunkU32 {
         self.chunks.is_empty()
     }
 
-    /// Build a ChunkU32 from a flat Vec (useful in tests).
-    #[cfg(test)]
+    /// Build a ChunkU32 from a flat Vec. Used by tests, and by the disk cache
+    /// when it rehydrates the forward CSR read back from `graph.bin`.
     pub fn from_vec(v: Vec<u32>) -> Self {
         let mut c = Self::zeroed(v.len());
         for (i, &x) in v.iter().enumerate() {

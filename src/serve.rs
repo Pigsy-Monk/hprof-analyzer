@@ -153,11 +153,12 @@ impl ServeState {
             let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
             *g = AnalysisState::Done(Arc::new(report));
         }
+        let edges_summary = warm.edges.summary();
         self.oql
             .set_full_analysis_with_retained(retained_shared, Some(warm));
         eprintln!(
-            "hprof-analyzer server: warm start from disk cache ({})",
-            self.path
+            "hprof-analyzer server: warm start from disk cache ({}) — edges: {}",
+            self.path, edges_summary
         );
         true
     }
