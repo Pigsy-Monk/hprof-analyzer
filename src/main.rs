@@ -574,14 +574,21 @@ enum HeapCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Inspect a single object by dense index (@objectId).
+    /// Inspect a single object, by dense index or by heap address.
     Inspect {
         /// Path to the .hprof dump.
         #[arg(value_hint = ValueHint::FilePath)]
         dump: String,
         /// Dense object index (0-based): from @objectId in query results or 'index' in browse output. NOT from obj_index_1based in get_report.
         #[arg(long = "index", value_name = "N")]
-        index: u64,
+        index: Option<u64>,
+        /// Heap address of the object, e.g. `0x56614a4e0` (`0x` optional).
+        ///
+        /// For when an address is all you have — from MAT, a log line, or
+        /// another tool. The cache resolves it to the dense index, so the
+        /// result is identical to passing `--index` for the same object.
+        #[arg(long = "address", value_name = "ADDR")]
+        address: Option<String>,
         /// Emit JSON.
         #[arg(long)]
         json: bool,
@@ -1624,6 +1631,7 @@ fn run_heap_cmd(cmd: HeapCmd) -> anyhow::Result<()> {
         HeapCmd::Inspect {
             dump,
             index,
+            address,
             json,
             build_offsets,
         } => {
@@ -1640,7 +1648,23 @@ fn run_heap_cmd(cmd: HeapCmd) -> anyhow::Result<()> {
                 .cache
                 .read_class_idx()?
                 .ok_or_else(|| anyhow::anyhow!("class_idx missing"))?;
-            let idx = index as usize;
+            let idx = match (index, address.as_deref()) {
+                (Some(i), None) => i as usize,
+                (None, Some(a)) => {
+                    let addr = parse_object_address(a)?;
+                    sess.index_of_addr(addr).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "no heap object at address {a} — is this the dump the address came from?"
+                        )
+                    })?
+                }
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("give either --index or --address, not both")
+                }
+                (None, None) => {
+                    anyhow::bail!("give --index N (dense index) or --address 0x… (heap address)")
+                }
+            };
             if idx >= shallow.len() {
                 anyhow::bail!("object_index {idx} out of range (0..{})", shallow.len());
             }
@@ -6012,6 +6036,18 @@ fn dump_pass1_json(path: &str) -> io::Result<()> {
 
     println!("}}");
     Ok(())
+}
+
+/// Parse an object address as written by MAT, a log line, or `@objectAddress`:
+/// `0x`-prefixed or bare hex. Rejects anything else rather than guessing.
+fn parse_object_address(s: &str) -> anyhow::Result<u64> {
+    let t = s.trim();
+    let hex = t
+        .strip_prefix("0x")
+        .or_else(|| t.strip_prefix("0X"))
+        .unwrap_or(t);
+    u64::from_str_radix(hex, 16)
+        .map_err(|e| anyhow::anyhow!("'{s}' is not a hex object address: {e}"))
 }
 
 /// Why `heap inspect` could not read values, in each case. Returned as the
