@@ -908,6 +908,31 @@ impl<'a, R: ClassResolver> SingleScanExecutor<'a, R> {
         self.plan
     }
 
+    /// True once this executor has taken every row its physical `scan_limit`
+    /// allows AND has already recorded that further matches existed
+    /// (`truncated`). From that point on the executor ignores every further
+    /// object — it returns at the very same cap check *before* pushing a row or
+    /// mutating any state — so a scan driver may stop the scan early, or stop
+    /// forwarding objects, with byte-identical results.
+    ///
+    /// Requiring `truncated` (not merely `matched >= n`) is what keeps results
+    /// bit-identical. `truncated` is only set when an (n+1)-th match is actually
+    /// observed, and it is part of the reported result; a heap holding exactly
+    /// `n` matches never satisfies this, so the scan still runs to the end and
+    /// `truncated` stays `false` — exactly as before the early-stop existed.
+    ///
+    /// Executors that never cap (no `scan_limit`: carry / aggregate / GROUP BY /
+    /// ORDER BY / FROM-subquery) return `false`, so a run containing any of them
+    /// can never stop early.
+    pub fn scan_satisfied(&self) -> bool {
+        match self.plan.scan_limit {
+            // `matched` saturates at `limit` (the cap returns before incrementing
+            // past it), so this is really `matched == n`.
+            Some(n) => self.matched >= n && self.truncated,
+            None => false,
+        }
+    }
+
     /// The query AST this executor runs (borrowed). Used by the driver to gather
     /// RefWalk hop field names when arming edge capture.
     pub fn query(&self) -> &Query {

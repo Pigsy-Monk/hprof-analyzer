@@ -257,6 +257,12 @@ pub struct ScanDriver<'q, R: ClassResolver> {
     /// runs; false everywhere else so the sidecar is never allocated and behavior
     /// stays byte/RSS-identical.
     capture_src: bool,
+    /// True iff EVERY executor carries a physical `scan_limit`, so [`Self::is_done`]
+    /// can ever become true. Precomputed in [`Self::new`] so the per-object
+    /// `is_done` check collapses to one boolean load on the overwhelmingly common
+    /// runs that have no LIMIT (and therefore cannot stop early) — those stay
+    /// byte/RSS/cycle-identical.
+    early_stop_armed: bool,
 }
 
 /// Sidecar edge-capture state for RefWalk queries (see `refwalk.rs`).
@@ -311,13 +317,32 @@ impl<'q, R: ClassResolver> ScanDriver<'q, R> {
         }
         let refwalk = Self::arm_refwalk(&execs);
         let string_capture = Self::arm_string_capture(&execs);
+        // Armed only when every executor can stop early. A run mixing a LIMIT
+        // query with a no-LIMIT one must scan the whole heap for the latter, so
+        // the driver may not stop — `all` is false and nothing is skipped.
+        let early_stop_armed =
+            !execs.is_empty() && execs.iter().all(|e| e.plan().scan_limit.is_some());
         Self {
             execs,
             slots,
             refwalk,
             string_capture,
             capture_src: false,
+            early_stop_armed,
         }
+    }
+
+    /// True iff every executor has finished its scan — each has met its
+    /// `scan_limit` and already recorded that more matches existed (see
+    /// [`crate::query::execute::SingleScanExecutor::scan_satisfied`]). A caller
+    /// driving the scan by hand may stop as soon as this returns `true`: every
+    /// executor already ignores the remaining objects, so the result is
+    /// byte-identical to a full scan.
+    ///
+    /// Always `false` when the driver is empty, when no executor carries a
+    /// `scan_limit`, or when any one of them does not — those runs are untouched.
+    pub fn is_done(&self) -> bool {
+        self.early_stop_armed && self.execs.iter().all(|e| e.scan_satisfied())
     }
 
     /// Enable per-row source-index capture (for `--reachable-only` pruning).
@@ -674,6 +699,14 @@ impl<'q, R: ClassResolver> ScanDriver<'q, R> {
 
 impl<'q, R: ClassResolver> ObjectVisitor for ScanDriver<'q, R> {
     fn visit_instance(&mut self, src_idx: usize, class_id: u64, blob: &[u8]) {
+        // Every executor has met its `scan_limit` and already seen its (n+1)-th
+        // match: each would return at its cap before touching this object, so
+        // forwarding it is a no-op. Skip the class gate + WHERE evaluation (the
+        // expensive part) for the remaining objects. Results are unchanged —
+        // including `truncated`, which was set when the cap was first exceeded.
+        if self.is_done() {
+            return;
+        }
         self.capture_refwalk(src_idx, class_id, blob);
         self.capture_string_values(src_idx, class_id, blob);
         for ex in &mut self.execs {
@@ -681,6 +714,9 @@ impl<'q, R: ClassResolver> ObjectVisitor for ScanDriver<'q, R> {
         }
     }
     fn visit_array(&mut self, src_idx: usize, class_name: &str, length: u32) {
+        if self.is_done() {
+            return;
+        }
         self.capture_refwalk_array_length(src_idx, length);
         self.capture_refwalk_array_addr(src_idx);
         for ex in &mut self.execs {
@@ -973,6 +1009,13 @@ pub fn run_resident_only(
         }
         None => {
             for i in 0..cache.n {
+                // Every executor has met its `scan_limit` (and seen its (n+1)-th
+                // match, so `truncated` is final): the remaining indices can only
+                // be ignored, so stop the scan. Rows — and `truncated` — are
+                // identical to a full sweep; this only skips the wasted visits.
+                if driver.is_done() {
+                    break;
+                }
                 if cache.p1.kind[i] == 0 {
                     let class_addr = cache.p1.class_addr_table[cache.class_ids[i] as usize];
                     driver.visit_instance(i, class_addr, &[]);
@@ -1072,6 +1115,13 @@ pub fn run_resident_with_retained(
         }
         None => {
             for i in 0..cache.n {
+                // Every executor has met its `scan_limit` (and seen its (n+1)-th
+                // match, so `truncated` is final): the remaining indices can only
+                // be ignored, so stop the scan. Rows — and `truncated` — are
+                // identical to a full sweep; this only skips the wasted visits.
+                if driver.is_done() {
+                    break;
+                }
                 if cache.p1.kind[i] == 0 {
                     let class_addr = cache.p1.class_addr_table[cache.class_ids[i] as usize];
                     driver.visit_instance(i, class_addr, &[]);
@@ -2480,6 +2530,48 @@ mod tests {
         }
     }
 
+    /// The resident scan now stops as soon as `plan.scan_limit` is met; the
+    /// disk scan never does (it is driven by pass2). The two must agree
+    /// exactly — same rows AND the same `truncated` flag — which is what the
+    /// early stop's `truncated` precondition buys.
+    #[test]
+    fn resident_early_stop_matches_the_scan_path() {
+        let path = "tests/fixtures/dump_4_philosophers.hprof";
+        let cache = ReplCache::build(&crate::source::HprofSource::from(path), true).expect("cache");
+
+        for oql in [
+            // Dense FROM ⇒ the early stop fires almost immediately.
+            "SELECT @objectId FROM java.lang.Object LIMIT 1",
+            "SELECT @objectId FROM java.lang.Object LIMIT 3",
+            // LIMIT 0 takes no rows but still trips `truncated` on the 1st match.
+            "SELECT @objectId FROM java.lang.Object LIMIT 0",
+            // Limit larger than the heap ⇒ never satisfied, full sweep.
+            "SELECT @objectId FROM java.lang.Object LIMIT 1000000",
+            // No matches ⇒ never satisfied, full sweep.
+            "SELECT @objectId FROM com.acme.Nonexistent LIMIT 1",
+            // OFFSET folds into the physical bound (limit + offset).
+            "SELECT @objectId FROM java.lang.Object LIMIT 3 OFFSET 2",
+        ] {
+            let (q, plan) = parse_plan_opt(oql);
+            assert!(plan.is_resident_only(), "{oql} must be resident-only");
+
+            let cache_out = run_resident_only(&cache, &[(q.clone(), plan.clone())], true)
+                .unwrap_or_else(|e| panic!("cache run for {oql}: {e}"));
+            let scan_out = run_single_dump(path, &[(q, plan)], true)
+                .unwrap_or_else(|e| panic!("scan run for {oql}: {e}"));
+
+            assert_eq!(
+                cache_out[0].row_count, scan_out[0].row_count,
+                "row_count for {oql}"
+            );
+            assert_eq!(
+                cache_out[0].truncated, scan_out[0].truncated,
+                "truncated for {oql}"
+            );
+            assert_eq!(cache_out[0].rows, scan_out[0].rows, "rows for {oql}");
+        }
+    }
+
     #[test]
     fn resident_only_matches_scan_path_more() {
         let path = "tests/fixtures/dump_4_philosophers.hprof";
@@ -2742,6 +2834,144 @@ mod tests {
     fn empty_driver_is_empty() {
         let driver: ScanDriver<'_, FakeResolver> = ScanDriver::new(Vec::new());
         assert!(driver.is_empty());
+    }
+
+    /// Parse+plan+optimize (so `scan_limit` is pushed down) a single OQL string.
+    fn pq_opt(oql: &str) -> (crate::query::ast::Query, QueryPlan) {
+        let q = parse(oql).expect("parse");
+        let plan = pq(&q);
+        let plan = crate::query::optimize::optimize(
+            plan,
+            &q,
+            &crate::query::optimize::SchemaStats::default(),
+        );
+        (q, plan)
+    }
+
+    fn foo_resolver() -> FakeResolver {
+        FakeResolver {
+            names: [(10u64, "com.acme.Foo".to_string())].into_iter().collect(),
+        }
+    }
+
+    /// `is_done` must stay false until the executor has BOTH taken its last
+    /// allowed row AND observed one more match (which is what sets `truncated`).
+    /// Stopping any earlier would drop the `truncated` signal from the result.
+    #[test]
+    fn scan_driver_is_done_only_after_scan_limit_is_met_and_truncated() {
+        let resolver = foo_resolver();
+        let (q, p) = pq_opt("SELECT @objectId FROM com.acme.Foo s LIMIT 2");
+        assert_eq!(p.scan_limit, Some(2), "optimizer must push the limit down");
+        let entries = vec![(0usize, SingleScanExecutor::new(&q, &p, &resolver))];
+        let mut driver = ScanDriver::new(entries);
+
+        assert!(!driver.is_done(), "nothing visited yet");
+        driver.visit_instance(1, 10, &[]); // match 1 of 2
+        assert!(!driver.is_done(), "1 of 2 matches taken");
+        driver.visit_instance(2, 10, &[]); // match 2 of 2: cap reached
+        assert!(
+            !driver.is_done(),
+            "cap reached but no (n+1)-th match yet, so `truncated` is still open"
+        );
+        driver.visit_instance(3, 10, &[]); // (n+1)-th match → truncated set
+        assert!(driver.is_done(), "cap exceeded → scan may stop");
+    }
+
+    /// A heap holding exactly `n` matches never satisfies the early-stop test,
+    /// so `truncated` correctly stays false and the sweep runs to the end.
+    #[test]
+    fn scan_driver_is_done_stays_false_when_matches_are_exactly_the_limit() {
+        let resolver = foo_resolver();
+        let (q, p) = pq_opt("SELECT @objectId FROM com.acme.Foo s LIMIT 3");
+        assert_eq!(p.scan_limit, Some(3));
+        let entries = vec![(0usize, SingleScanExecutor::new(&q, &p, &resolver))];
+        let mut driver = ScanDriver::new(entries);
+
+        for i in 0..3 {
+            driver.visit_instance(i, 10, &[]);
+            assert!(
+                !driver.is_done(),
+                "exactly-limit matches must not stop the scan"
+            );
+        }
+        let state = driver.finish_state();
+        let (finished, _pending) = state.into_parts();
+        assert_eq!(finished[0].1.row_count, 3);
+        assert!(
+            !finished[0].1.truncated,
+            "exactly `limit` matches is not a truncation"
+        );
+    }
+
+    /// No LIMIT (or one executor without a limit) ⇒ `is_done` is always false,
+    /// so those runs are untouched by the early stop.
+    #[test]
+    fn scan_driver_is_done_false_without_scan_limit() {
+        let resolver = foo_resolver();
+        let (q, p) = pq_opt("SELECT @objectId FROM com.acme.Foo s");
+        assert_eq!(p.scan_limit, None, "no LIMIT ⇒ no pushdown");
+        let entries = vec![(0usize, SingleScanExecutor::new(&q, &p, &resolver))];
+        let mut driver = ScanDriver::new(entries);
+        for i in 0..10 {
+            driver.visit_instance(i, 10, &[]);
+            assert!(!driver.is_done(), "no scan_limit ⇒ never done");
+        }
+
+        // A run mixing a LIMIT query with a no-LIMIT one must scan the whole
+        // heap for the latter, so the driver may not stop.
+        let (q_lim, p_lim) = pq_opt("SELECT @objectId FROM com.acme.Foo s LIMIT 1");
+        let (q_all, p_all) = pq_opt("SELECT @objectId FROM com.acme.Foo s");
+        let entries = vec![
+            (0usize, SingleScanExecutor::new(&q_lim, &p_lim, &resolver)),
+            (1usize, SingleScanExecutor::new(&q_all, &p_all, &resolver)),
+        ];
+        let mut driver = ScanDriver::new(entries);
+        for i in 0..10 {
+            driver.visit_instance(i, 10, &[]);
+            assert!(
+                !driver.is_done(),
+                "one executor has no scan_limit ⇒ the sweep must not stop"
+            );
+        }
+    }
+
+    /// The payoff: stopping as soon as `is_done()` visits strictly fewer objects
+    /// and produces a byte-identical result — same rows, same `truncated`.
+    #[test]
+    fn early_stop_matches_a_full_sweep_bit_for_bit() {
+        let resolver = foo_resolver();
+        let objects: Vec<usize> = (0..20).collect(); // all class 10 ⇒ 20 matches
+
+        let run = |early: bool| {
+            let (q, p) = pq_opt("SELECT @objectId FROM com.acme.Foo s LIMIT 3");
+            assert_eq!(p.scan_limit, Some(3));
+            let entries = vec![(0usize, SingleScanExecutor::new(&q, &p, &resolver))];
+            let mut driver = ScanDriver::new(entries);
+            let mut visited = 0usize;
+            for &i in &objects {
+                if early && driver.is_done() {
+                    break;
+                }
+                driver.visit_instance(i, 10, &[]);
+                visited += 1;
+            }
+            let (finished, _pending) = driver.finish_state().into_parts();
+            let r = &finished[0].1;
+            (visited, r.row_count, r.truncated, r.rows.clone())
+        };
+
+        let (full_visited, full_count, full_trunc, full_rows) = run(false);
+        let (early_visited, early_count, early_trunc, early_rows) = run(true);
+
+        assert_eq!(full_visited, 20, "the full sweep visits every object");
+        assert!(
+            early_visited < full_visited,
+            "early stop must visit strictly fewer objects (got {early_visited})"
+        );
+        assert_eq!(early_count, full_count, "row_count must match");
+        assert_eq!(early_trunc, full_trunc, "`truncated` must match");
+        assert_eq!(early_rows, full_rows, "rows must match");
+        assert!(full_trunc, "20 matches against LIMIT 3 is a truncation");
     }
 
     #[test]
