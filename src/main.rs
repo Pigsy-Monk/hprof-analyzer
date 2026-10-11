@@ -3855,7 +3855,6 @@ fn emit_truncated_header_report(
 /// Phase order and the interleaved allocation/free/compress steps are tuned
 /// for the peak-RSS budget; the inline comments flag the load-bearing points.
 // ── MAT cache reuse ─────────────────────────────────────────────────────────
-
 /// The graph-level state `mat caches` can take from the disk cache instead of
 /// re-deriving it.
 ///
@@ -6145,31 +6144,19 @@ fn run(
         m.emit_long_index("o2ret", &o2ret_vals)?;
     }
 
-    // MAT: emit i2sv2 (per-class retained-size cache) and .threads.
-    if let Some(ref m) = mat {
-        let mm = mat_map.as_ref().expect("mat_map built with mat");
-        let inv = mat_inv.as_ref().expect("mat_inv built when mat present");
-
-        // i2sv2 (`RetainedSizeCache`) is deliberately NOT emitted. MAT's entry is
-        // `-getMinRetainedSize({class object} ∪ its instances)` — the *approximated*
-        // retained size of that set, stored negated — and MAT trusts the cache
-        // whenever the entry is present. Our aggregate was the plain sum of each
-        // instance's retained size, which differs from MAT's for 408 of the small
-        // dump's 2036 classes and made the Class Histogram's `Retained Heap`
-        // column too large (and its rows mis-ordered). MAT recomputes the cache
-        // itself when the file is absent, so leaving it out restores parity.
-
-        // .threads: thread stacks (addresses from mm).
-        m.emit_threads(&g.thread_stacks, mm, &g.thread_local_frame_samples)?;
-
-        // MAT's `UnreachableObjectsHistogram` aggregates: per class row, how many
-        // unreachable objects it holds and their summed size. MAT's per-object
-        // rule (`GarbageCleaner.createHistogramOfUnreachableObjects`): an array
-        // contributes its array size, a class object the used heap size of the
-        // class it represents, anything else its `heapSizePerInstance` — which is
-        // exactly our `shallow`. Class objects are recorded separately, as the
-        // row of the class each one represents, because only `emit_dot_index`
-        // knows those classes' used heap sizes.
+    // MAT: the `UnreachableObjectsHistogram` aggregates: per class row, how many
+    // unreachable objects it holds and their summed size. MAT's per-object rule
+    // (`GarbageCleaner.createHistogramOfUnreachableObjects`): an array
+    // contributes its array size, a class object the used heap size of the class
+    // it represents, anything else its `heapSizePerInstance` — which is exactly
+    // our `shallow`. Class objects are recorded separately, as the row of the
+    // class each one represents, because only `emit_dot_index` knows those
+    // classes' used heap sizes.
+    //
+    // Computed HERE rather than with the emit that consumes it: this scan reads
+    // `g.idom`, and `build_model` — which runs before that emit so the report
+    // does not have to wait for the remaining index files — consumes it.
+    let mat_unreach: Option<mat::MatUnreachableHist> = if mat.is_some() {
         let num_rows = g.class_names.len();
         let mut unreach = mat::MatUnreachableHist {
             count: vec![0i32; num_rows],
@@ -6190,31 +6177,10 @@ fn run(
                 None => unreach.shallow[row] += g.shallow[i] as i64,
             }
         }
-
-        // .index: master Java serialization stream.
-        if let Some(ref meta) = mat_class_meta {
-            let empty_roots = mat::MatRoots::default();
-            let empty_sizes = std::collections::HashMap::new();
-            m.emit_dot_index(
-                meta,
-                &g.class_names,
-                &g.class_loader_id,
-                &g.class_obj_class_idx,
-                inv,
-                mm,
-                g.n,
-                &g.shallow,
-                &g.class_idx,
-                mat_roots.as_ref().unwrap_or(&empty_roots),
-                mat_instance_sizes.as_ref().unwrap_or(&empty_sizes),
-                mat_root_instance_size,
-                mat_classloader_mat.unwrap_or(0),
-                &class_inb,
-                &unreach,
-                &mat_unreach_class_addr,
-            )?;
-        }
-    }
+        Some(unreach)
+    } else {
+        None
+    };
 
     // Restore + aggregate + free the alloc stack serials in a bounded window
     // right after compute_retained (needs g.shallow + g.retained, both live
@@ -6324,6 +6290,53 @@ fn run(
 
     log(verbose, "total", t_total.elapsed().as_secs_f64());
     t_dark!("write+total done");
+
+    // MAT: emit i2sv2 (deliberately not emitted — see below) and `.threads`,
+    // then the master `.index`. These are the last two files precisely so the
+    // report above does not have to wait for them; everything they read that
+    // `build_model` consumed (`g.idom`) was already folded into `mat_unreach`.
+    if let Some(ref m) = mat {
+        let mm = mat_map.as_ref().expect("mat_map built with mat");
+        let inv = mat_inv.as_ref().expect("mat_inv built when mat present");
+
+        // i2sv2 (`RetainedSizeCache`) is deliberately NOT emitted. MAT's entry is
+        // `-getMinRetainedSize({class object} ∪ its instances)` — the *approximated*
+        // retained size of that set, stored negated — and MAT trusts the cache
+        // whenever the entry is present. Our aggregate was the plain sum of each
+        // instance's retained size, which differs from MAT's for 408 of the small
+        // dump's 2036 classes and made the Class Histogram's `Retained Heap`
+        // column too large (and its rows mis-ordered). MAT recomputes the cache
+        // itself when the file is absent, so leaving it out restores parity.
+
+        // .threads: thread stacks (addresses from mm).
+        m.emit_threads(&g.thread_stacks, mm, &g.thread_local_frame_samples)?;
+
+        // .index: master Java serialization stream.
+        if let Some(ref meta) = mat_class_meta {
+            let empty_roots = mat::MatRoots::default();
+            let empty_sizes = std::collections::HashMap::new();
+            m.emit_dot_index(
+                meta,
+                &g.class_names,
+                &g.class_loader_id,
+                &g.class_obj_class_idx,
+                inv,
+                mm,
+                g.n,
+                &g.shallow,
+                &g.class_idx,
+                mat_roots.as_ref().unwrap_or(&empty_roots),
+                mat_instance_sizes.as_ref().unwrap_or(&empty_sizes),
+                mat_root_instance_size,
+                mat_classloader_mat.unwrap_or(0),
+                &class_inb,
+                mat_unreach
+                    .as_ref()
+                    .expect("unreachable histogram built with mat"),
+                &mat_unreach_class_addr,
+            )?;
+        }
+    }
     Ok(())
 }
 
