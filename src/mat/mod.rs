@@ -1013,14 +1013,19 @@ impl MatEmitter {
         // The parser-id is detected from the installed MAT at MatEmitter::new;
         // mismatched IDs cause MAT to reject the cache and re-parse from scratch.
         {
-            let write_utf_block = |ser: &mut Ser, s: &[u8]| {
-                let mut blk = Vec::with_capacity(2 + s.len());
-                blk.extend_from_slice(&(s.len() as u16).to_be_bytes());
-                blk.extend_from_slice(s);
-                ser.block_data(&blk);
-            };
-            write_utf_block(&mut ser, b"MAT_01");
-            write_utf_block(&mut ser, self.parser_id.as_bytes());
+            // Both strings live in ONE TC_BLOCKDATA record: MAT writes them with
+            // two consecutive `ObjectOutputStream.writeUTF` calls, and writeUTF
+            // appends to the stream's block-data buffer, which is drained as a
+            // single record when the next `writeObject` follows. Two separate
+            // records are still readable by MAT's `readUTF` (it refills from the
+            // next block), but they are not what MAT emits — they shift every
+            // later byte by 2 and break byte-parity with MAT's own `.index`.
+            let mut blk = Vec::with_capacity(2 + 6 + 2 + self.parser_id.len());
+            blk.extend_from_slice(&(6u16).to_be_bytes());
+            blk.extend_from_slice(b"MAT_01");
+            blk.extend_from_slice(&(self.parser_id.len() as u16).to_be_bytes());
+            blk.extend_from_slice(self.parser_id.as_bytes());
+            ser.block_data(&blk);
         }
 
         // --- 1. XSnapshotInfo ---
@@ -1686,11 +1691,24 @@ impl MatEmitter {
                                         // Direct subclasses, as back-references
                                         // to the ClassImpls written earlier
                                         // (children-first order above).
+                                        //
+                                        // MAT leaves this field `null` for a
+                                        // class with no subclasses and only
+                                        // materialises a list when there is at
+                                        // least one — an empty list is not the
+                                        // same object on the wire (it costs a
+                                        // full `ArrayList` record per class,
+                                        // ~44 KB on a 2 285-class dump) and is
+                                        // not what MAT's own `.index` carries.
                                         let kids: Vec<u64> = subs_by_mat
                                             .get(&mat_id)
                                             .map(|v| v.iter().map(|&(_, a)| a).collect())
                                             .unwrap_or_default();
                                         Box::new(move |s: &mut Ser| {
+                                            if kids.is_empty() {
+                                                s.null();
+                                                return;
+                                            }
                                             let elems: Vec<Box<dyn FnOnce(&mut Ser)>> = kids
                                                 .iter()
                                                 .map(|&kaddr| {
