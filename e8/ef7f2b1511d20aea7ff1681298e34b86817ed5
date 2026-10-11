@@ -1,0 +1,48 @@
+src/run_oql.rs
+  s_b58db68df6a1d1::t_89ffa41d3f6ff3 292
+  s_b58db68df6a1d1::t_cbb8a82af8a763 48-72,84-89,92,96,105,119,134,148
+tests/edge_cache_parity.rs
+  s_9f05957e89db53::t_d5731dd7048c55 83-90
+  s_9f05957e89db53::t_93fe030129e1cc 25
+  s_9f05957e89db53::t_7a0f7edf0a8055 107-125,128
+src/cache.rs
+  s_b58db68df6a1d1::t_d1aec399c73e3a 43-65
+  s_b58db68df6a1d1::t_3d7dc1cbee5308 496,498-513
+  s_b58db68df6a1d1::t_62135daa5fd595 560
+  s_b58db68df6a1d1::t_c26250d7db1f77 786-847
+  s_b58db68df6a1d1::t_8e5fc24a19f7a7 261-265,270,272
+  s_b58db68df6a1d1::t_de72eedd2bfaf8 22-26,32
+  s_b58db68df6a1d1::t_8449b1f8a4e616 537
+  s_b58db68df6a1d1::t_ff94a18fc6fae6 722-730
+  s_b58db68df6a1d1::t_02dfa48fc3e443 919-1077
+  s_b58db68df6a1d1::t_21c2bf80df871f 407-423,425,431-450
+  s_b58db68df6a1d1::t_18e349b91c5c61 514-516,523-531,534,538-559
+src/query/run.rs
+  s_b58db68df6a1d1::t_5d887bdaa52917 2448-2453,2455-2488,2490-2496,2498-2500,2506-2507,2516,2518,2526,2531-2536
+  s_9f05957e89db53::t_ed86dff6e215bb 816-835,2537
+  s_b58db68df6a1d1::t_50f5de3806b9f7 2673-2674,2677
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.45-trip",
+  "base_commit_sha": "e8ef7f2b1511d20aea7ff1681298e34b86817ed5",
+  "prompts": {},
+  "sessions": {
+    "s_9f05957e89db53": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca1fb9b0-3b4d-470f-8fe7-9484e6312ac5",
+        "model": "deepseek-v4-1-flash-260910"
+      },
+      "human_author": "zwsong <zwsong@trip.com>"
+    },
+    "s_b58db68df6a1d1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8d23f351-c2f7-4fd7-b2b5-d33cf048e5ca",
+        "model": "deepseek-v4-1-flash-260910"
+      },
+      "human_author": "zwsong <zwsong@trip.com>"
+    }
+  }
+}
