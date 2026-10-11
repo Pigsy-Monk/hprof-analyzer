@@ -1,0 +1,40 @@
+src/serve.rs
+  s_b58db68df6a1d1::t_1bed6af06068c2 156,160-161
+src/run_oql.rs
+  s_b58db68df6a1d1::t_1bed6af06068c2 48-120,255-262,407-409
+tests/edge_cache_parity.rs
+  s_b58db68df6a1d1::t_637c18affa4219 1-131
+src/cache.rs
+  s_b58db68df6a1d1::t_1bed6af06068c2 371-392,399
+src/query/server.rs
+  s_b58db68df6a1d1::t_1bed6af06068c2 146-165
+src/lib.rs
+  s_b58db68df6a1d1::t_1bed6af06068c2 561-567,578
+tests/edge_resident_parity.rs
+  s_b58db68df6a1d1::t_637c18affa4219 1-92
+tests/server_edge_no_rescan.rs
+  s_b58db68df6a1d1::t_637c18affa4219 1-125
+src/main.rs
+  s_b58db68df6a1d1::t_1bed6af06068c2 332-333,629-631,2346-2352,2363
+src/query/run.rs
+  s_b58db68df6a1d1::t_1bed6af06068c2 764-842,854-857,912-914,973-978,1010-1020,1164-1176,1257-1266,1376-1392,1394,1403-1411,1702,1857,2376-2446,2473-2481,2489,2514,2549,2578-2588,2604
+  s_b58db68df6a1d1::t_79aa321451d980 1412
+src/chunkvec.rs
+  s_b58db68df6a1d1::t_1bed6af06068c2 32-33
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.45-trip",
+  "base_commit_sha": "066d121f1f040161a6cb535ffa9cbe2eb01ce73a",
+  "prompts": {},
+  "sessions": {
+    "s_b58db68df6a1d1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8d23f351-c2f7-4fd7-b2b5-d33cf048e5ca",
+        "model": "deepseek-v4-1-flash-260910"
+      },
+      "human_author": "zwsong <zwsong@trip.com>"
+    }
+  }
+}
