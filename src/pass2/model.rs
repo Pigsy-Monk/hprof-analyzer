@@ -495,6 +495,115 @@ pub struct Graph {
     pub class_ref_field_names: Vec<Vec<String>>,
 }
 
+/// The fields the `mat caches` from-cache path can fill in (see
+/// [`Graph::from_cached`]). Everything else a `Graph` carries is either
+/// report-only, produced by the heap scan, or filled in by a later stage.
+pub struct CachedGraphParts {
+    pub n: usize,
+    pub format: String,
+    pub file_size: u64,
+    pub source_name: String,
+    pub file_path: String,
+    pub id_size: u8,
+    pub ref_size: u8,
+    pub header_timestamp_ms: u64,
+    pub gc_root_indices: Vec<u32>,
+    pub gc_root_types: Vec<u8>,
+    pub shallow: Vec<u32>,
+    pub class_idx: Vec<u32>,
+    pub class_names: Vec<String>,
+    pub class_loader_id: Vec<u64>,
+    pub loader_labels: HashMap<u64, String>,
+    pub thread_stacks: Vec<ThreadStack>,
+    pub thread_local_counts: HashMap<u32, u64>,
+    pub thread_local_samples: HashMap<u32, Vec<u32>>,
+    pub thread_local_frame_samples: HashMap<u32, Vec<(u32, u32)>>,
+    pub class_obj_class_idx: HashMap<u32, u32>,
+    pub jlc_idx: u32,
+    pub fwd_offsets: Vec<u32>,
+    pub fwd_targets: crate::chunkvec::ChunkU32,
+    pub synthetic_root_count: usize,
+    pub system_classloader_shallow: Option<u32>,
+    pub idom: Vec<u32>,
+    pub alloc_stack_serial: Vec<u32>,
+}
+
+impl Graph {
+    /// Assemble a `Graph` for the MAT index emitters from a disk cache plus the
+    /// pass-1-derived tables, without running pass 2's heap scans.
+    ///
+    /// Only the fields the emit phase reads are populated. The report-only
+    /// aggregates that pass 2's scans produce (duplicate strings, collections,
+    /// field stats, alloc frames, thread names, incoming-ref counts) are left at
+    /// their defaults — `mat caches` never had them either way, and a report
+    /// built from this graph simply omits those sections. `idom` and
+    /// `fwd_offsets`/`fwd_targets` come from the cache; `retained`,
+    /// `has_same_class_ancestor` and `unreachable_retained` are filled in by the
+    /// retained/unreachable stages that still run.
+    pub fn from_cached(p: CachedGraphParts) -> Graph {
+        Graph {
+            n: p.n,
+            format: p.format,
+            file_size: p.file_size,
+            source_name: p.source_name,
+            file_path: p.file_path,
+            id_size: p.id_size,
+            ref_size: p.ref_size,
+            header_timestamp_ms: p.header_timestamp_ms,
+            gc_root_indices: p.gc_root_indices,
+            gc_root_types: p.gc_root_types,
+            shallow: p.shallow,
+            class_idx: p.class_idx,
+            class_names: p.class_names,
+            class_loader_id: p.class_loader_id,
+            loader_labels: p.loader_labels,
+            thread_stacks: p.thread_stacks,
+            thread_props: HashMap::new(),
+            thread_local_counts: p.thread_local_counts,
+            thread_local_samples: p.thread_local_samples,
+            thread_local_frame_samples: p.thread_local_frame_samples,
+            system_properties: Vec::new(),
+            jvm_version: None,
+            class_obj_class_idx: p.class_obj_class_idx,
+            jlc_idx: p.jlc_idx,
+            fwd_offsets: p.fwd_offsets,
+            fwd_targets: p.fwd_targets,
+            synthetic_root_count: p.synthetic_root_count,
+            system_classloader_shallow: p.system_classloader_shallow,
+            idom: p.idom,
+            retained: Vec::new(),
+            has_same_class_ancestor: crate::bitset::Bitset::default(),
+            alloc_stack_serial: p.alloc_stack_serial,
+            alloc_frames_by_serial: None,
+            record_census: RecordCensus::default(),
+            dup_strings: None,
+            dup_prim_arrays: None,
+            boxed_number_holders: Vec::new(),
+            arrays_by_size: crate::report::ArraysBySize::default(),
+            incoming_refs_per_class: Vec::new(),
+            collections: crate::report::CollectionsAnalysis::default(),
+            references: crate::report::ReferencesAnalysis::default(),
+            reference_referent_idx: [Vec::new(), Vec::new(), Vec::new()],
+            reference_null_referent_count: [0; 3],
+            collection_attribution_raw: None,
+            collection_attribution_truncated: false,
+            fields_by_size_raw: None,
+            coll_values_raw: None,
+            node_kv: None,
+            fwd_field_name_idx: None,
+            field_name_pool: None,
+            direct_byte_buffer_capacity_sum: 0,
+            thread_local_null_key_count: 0,
+            tl_entry_records: Vec::new(),
+            unreachable_retained: None,
+            obj_graph_edges: None,
+            type_ref_pairs: None,
+            type_ref_pair_fields: None,
+            class_ref_field_names: Vec::new(),
+        }
+    }
+}
+
 // ── Object-graph click-through capture ──────────────────────────────────────
 
 /// Sparse per-object edge snapshot used by `build_obj_graph_flat` to populate
@@ -1059,6 +1168,30 @@ pub struct MatOutboundRescanCtx {
 }
 
 impl InboundBuilder {
+    /// A builder with no id map and nothing to build.
+    ///
+    /// Used by the `mat caches` from-cache path (`src/main.rs`): the disk cache
+    /// already holds the inbound CSR, so nothing here is ever built. It exists
+    /// so that path can hand the rest of `run()` the same shape the pipeline
+    /// does. `compress_id_map`, `take_for_outbound_rescan` and both `build_*`
+    /// must NOT be called on it.
+    pub fn empty(source: crate::source::HprofSource, id_size: u8, n: usize) -> Self {
+        Self {
+            source,
+            id_size,
+            n,
+            id_map: None,
+            id_map_c: None,
+            id_map_codec: crate::cvec::Codec::None,
+            class_addr_to_hist: HashMap::new(),
+            field_plans_dense: Vec::new(),
+            in_cursors: Vec::new(),
+            total_inb: 0,
+            synthetic_edges: Vec::new(),
+            synthetic_self_edges: Vec::new(),
+        }
+    }
+
     /// Extract the data needed for a later outbound-only HPROF rescan.
     /// Must be called after `compress_id_map`. id_map_c blob is cloned
     /// (~0.5 GB for large dumps). class_addr_to_hist and field_plans_dense are

@@ -3854,6 +3854,198 @@ fn emit_truncated_header_report(
 /// Run the full `analyze` pipeline end-to-end and write the report.
 /// Phase order and the interleaved allocation/free/compress steps are tuned
 /// for the peak-RSS budget; the inline comments flag the load-bearing points.
+// ── MAT cache reuse ─────────────────────────────────────────────────────────
+
+/// The graph-level state `mat caches` can take from the disk cache instead of
+/// re-deriving it.
+///
+/// `mat caches` used to re-run the entire pipeline — 2h09m on a 44 GB dump —
+/// even when a `heap load --with-graph` cache sat next to the dump, because
+/// `run()` never looked at `CacheDir`. The cache already holds the forward CSR,
+/// the inbound CSR, `idom` and the dominator-children CSR: exactly what the
+/// 43-minute pass-2 scan, the 8-minute inbound build and the 17-minute dominator
+/// produce. Taking them from disk leaves pass 1 (3.5 min) plus the emit phase.
+struct MatCached {
+    /// Forward CSR row pointers, `n + 1` entries.
+    fwd_off: Vec<u32>,
+    /// Forward edge targets, `fwd_off[n]` entries, in the cache's delta+zstd form
+    /// already decoded.
+    fwd_tgt: Vec<u32>,
+    inb_block_off: Vec<u64>,
+    inb_data: Vec<u8>,
+    /// Immediate dominator per object, dense-id space.
+    idom: Vec<u32>,
+    /// Dominator-children CSR, `n + 2` rows (the last is the virtual root).
+    dc_off: Vec<u32>,
+    dc_tgt: Vec<u32>,
+}
+
+/// Load the graph-level cache entries `mat caches` needs.
+///
+/// Returns `Ok(None)` — never an error — whenever the cache is absent,
+/// incomplete, or does not describe this heap, so the caller falls back to the
+/// full pipeline. A missing cache is the normal first-run case, not a failure.
+fn load_mat_cache(input: &str, p1: &pass1::Pass1) -> io::Result<Option<MatCached>> {
+    let cache = cache::CacheDir::for_dump(std::path::Path::new(input))?;
+    if !cache.is_valid(cache::CacheMode::Graph) {
+        return Ok(None);
+    }
+    let n = p1.id_map.len();
+    // The forward CSR has to be the one pass 2 would have built for THIS heap.
+    // The cache key covers the dump's first 64 bytes, its size and its mtime, so
+    // a shape mismatch here means a stale cache written by an older build (or a
+    // half-written file) — refuse it rather than emit a wrong index.
+    let Some(fwd_off) = cache.read_forward_offsets()? else {
+        return Ok(None);
+    };
+    if fwd_off.len() != n + 1 {
+        eprintln!(
+            "hprof-cache: graph cache covers {} objects but this dump has {n}; \
+             running the full pipeline",
+            fwd_off.len().saturating_sub(1)
+        );
+        return Ok(None);
+    }
+    let total_edges = fwd_off[n] as usize;
+    let Some(fwd_tgt) = cache.read_forward_targets(total_edges)? else {
+        eprintln!("hprof-cache: graph cache has no usable fwd_tgt; running the full pipeline");
+        return Ok(None);
+    };
+    let Some((inb_block_off, inb_data)) = cache.read_inbound_blocks()? else {
+        eprintln!("hprof-cache: graph cache has no inbound CSR; running the full pipeline");
+        return Ok(None);
+    };
+    let Some(idom) = cache.read_idom()? else {
+        return Ok(None);
+    };
+    if idom.len() != n {
+        return Ok(None);
+    }
+    let Some((dc_off, dc_tgt)) = cache.read_dominator_children()? else {
+        return Ok(None);
+    };
+    // `build_dom_children_csr` emits one row per object plus the virtual root.
+    if dc_off.len() != n + 2 || dc_tgt.len() != dc_off[n + 1] as usize {
+        return Ok(None);
+    }
+    Ok(Some(MatCached {
+        fwd_off,
+        fwd_tgt,
+        inb_block_off,
+        inb_data,
+        idom,
+        dc_off,
+        dc_tgt,
+    }))
+}
+
+/// Build the `Graph` (plus the cold blobs and empty query state) that the rest
+/// of `run()` expects, from the disk cache instead of from pass 2's scans.
+///
+/// Mirrors what `Pass2::build` returns, minus everything only the heap scan
+/// produces: the report-only aggregates (duplicate strings, collections, field
+/// stats, alloc frames, thread names, incoming-ref counts) stay empty, and the
+/// `InboundBuilder` carries pass 1's id map and nothing else — the inbound CSR
+/// is already in the cache and is never built here.
+#[allow(clippy::type_complexity)]
+fn graph_from_mat_cache(
+    source: &crate::source::HprofSource,
+    p1: pass1::Pass1,
+    c: MatCached,
+    opts: &AnalyzeOptions,
+) -> io::Result<(
+    pass2::Graph,
+    pass2::InboundBuilder,
+    cvec::CompressedU32,
+    cvec::CompressedU32,
+    Option<cvec::CompressedU32>,
+    query::execute::QueryExecState,
+    Option<query::refwalk::RefWalkCsr>,
+    std::collections::HashMap<u32, String>,
+    bool,
+    Vec<u32>,
+    Option<crate::id_map::IdMap>,
+)> {
+    // The pass-1-derived tables: same code `Pass2::build` runs, so the class
+    // histogram, GC roots, thread stacks and synthetic edges cannot drift.
+    let ct = pass2::Pass2::class_tables(&p1);
+    let ge = pass2::Pass2::graph_extras(&p1, &ct.class_loader_id, ct.ref_size, opts);
+
+    // The same cold codec `Pass2::build` uses for these two arrays.
+    #[cfg(feature = "native")]
+    let cold = cvec::Codec::Zstd1;
+    #[cfg(not(feature = "native"))]
+    let cold = cvec::Codec::Deflate1;
+    let class_idx_c = cvec::CompressedU32::compress(&ct.class_idx, cold)?;
+    let shallow_c = cvec::CompressedU32::compress(&ct.shallow, cold)?;
+    let alloc_serial_c = Some(cvec::CompressedU32::compress(&p1.alloc_stack_serial, cold)?);
+
+    let n = p1.id_map.len();
+    let source_name = source.display_name().to_string();
+    let file_path = source.file_path().to_string();
+    let pass1::Pass1 {
+        format,
+        file_size,
+        header_timestamp_ms,
+        id_size,
+        alloc_stack_serial: _,
+        id_map,
+        ..
+    } = p1;
+    let inbound = pass2::InboundBuilder::empty(source.clone(), id_size, n);
+    // `rpo_dfs` and `unreachable_retained` take the CSR as a chunked store, so
+    // the flat targets the cache handed us are copied into one here. The flat
+    // copy is returned to the caller (the outbound emit needs it) and the
+    // chunked one is dropped right after those two stages.
+    let fwd_tgt_flat = c.fwd_tgt;
+    let mut fwd_targets = crate::chunkvec::ChunkU32::zeroed(fwd_tgt_flat.len());
+    for (i, &v) in fwd_tgt_flat.iter().enumerate() {
+        fwd_targets.set(i, v);
+    }
+    let g = pass2::Graph::from_cached(pass2::CachedGraphParts {
+        n,
+        format,
+        file_size,
+        source_name,
+        file_path,
+        id_size,
+        ref_size: ct.ref_size as u8,
+        header_timestamp_ms,
+        gc_root_indices: ge.gc_root_indices,
+        gc_root_types: ge.gc_root_types,
+        shallow: ct.shallow,
+        class_idx: ct.class_idx,
+        class_names: ct.class_names,
+        class_loader_id: ct.class_loader_id,
+        loader_labels: ge.loader_labels,
+        thread_stacks: ge.thread_stacks,
+        thread_local_counts: ge.thread_local_counts,
+        thread_local_samples: ge.thread_local_samples,
+        thread_local_frame_samples: ge.thread_local_frame_samples,
+        class_obj_class_idx: ct.class_obj_class_idx,
+        jlc_idx: ct.jlc_idx,
+        fwd_offsets: c.fwd_off,
+        fwd_targets,
+        synthetic_root_count: ge.synthetic_root_count,
+        system_classloader_shallow: ge.system_classloader_shallow,
+        idom: c.idom,
+        alloc_stack_serial: Vec::new(),
+    });
+    Ok((
+        g,
+        inbound,
+        shallow_c,
+        class_idx_c,
+        alloc_serial_c,
+        query::execute::QueryExecState::new(),
+        None,
+        std::collections::HashMap::new(),
+        false,
+        fwd_tgt_flat,
+        Some(id_map),
+    ))
+}
+
 fn run(
     input: &str,
     output: Option<&str>,
@@ -4003,6 +4195,47 @@ fn run(
     } else {
         None
     };
+    // ── MAT from-cache fast path ─────────────────────────────────────────
+    // `mat caches` used to re-run the whole pipeline even when a
+    // `heap load --with-graph` cache sat next to the dump. Try the cache first;
+    // `load_mat_cache` returns None (never an error) when there is nothing
+    // usable, and the full pipeline below then runs exactly as before.
+    // `HPROF_MAT_NO_CACHE=1` forces that fallback, which is what the A/B parity
+    // check compares against.
+    let mut mat_cached: Option<MatCached> =
+        if mat.is_some() && std::env::var_os("HPROF_MAT_NO_CACHE").is_none() {
+            match load_mat_cache(input, &p1) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("hprof-cache: {e}; running the full pipeline");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+    // Sticky for the rest of the function: `mat_cached` is moved into the graph
+    // builder below, but every later guard still needs to know which path ran.
+    let mat_reused = mat_cached.is_some();
+    // The inbound CSR and the dominator-children CSR are consumed far below
+    // (after the dominator stage), so move them out of the cache bundle here
+    // rather than carrying them inside it.
+    let (cached_inb_block_off, cached_inb_data, cached_dc_off, cached_dc_tgt) =
+        match mat_cached.as_mut() {
+            Some(c) => (
+                std::mem::take(&mut c.inb_block_off),
+                std::mem::take(&mut c.inb_data),
+                std::mem::take(&mut c.dc_off),
+                std::mem::take(&mut c.dc_tgt),
+            ),
+            None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+        };
+    if mat_reused {
+        eprintln!(
+            "mat caches: reusing the graph cache next to the dump \
+             (HPROF_MAT_NO_CACHE=1 disables)"
+        );
+    }
     let mut no_in_sets = std::collections::HashMap::new();
     let mut no_exists_bools = std::collections::HashMap::new();
     let (
@@ -4015,15 +4248,41 @@ fn run(
         refwalk_csr,
         string_values,
         string_values_truncated,
-    ) = pass2::Pass2::build(
-        &source,
-        p1,
-        compress,
-        &opts,
-        &flat_queries,
-        &mut no_in_sets,
-        &mut no_exists_bools,
-    )?;
+        // Forward-edge targets, flat. Populated only on the from-cache path,
+        // which already has them decoded; the pipeline path allocates and
+        // scatter-fills its own copy at the outbound emit.
+        mut mat_cached_fwd_tgt,
+        // Pass 1's dense address table. On the from-cache path the id map never
+        // goes into the `InboundBuilder` (there is no inbound scan to feed), so
+        // it is handed over on its own; the pipeline path leaves this `None` and
+        // `run()` reads the same table out of `inbound.id_map`.
+        mat_cached_id_map,
+    ) = if let Some(c) = mat_cached.take() {
+        graph_from_mat_cache(&source, p1, c, &opts)?
+    } else {
+        let r = pass2::Pass2::build(
+            &source,
+            p1,
+            compress,
+            &opts,
+            &flat_queries,
+            &mut no_in_sets,
+            &mut no_exists_bools,
+        )?;
+        (
+            r.0,
+            r.1,
+            r.2,
+            r.3,
+            r.4,
+            r.5,
+            r.6,
+            r.7,
+            r.8,
+            Vec::new(),
+            None,
+        )
+    };
     log(
         verbose,
         &format!("pass2 n={}", g.n),
@@ -4061,9 +4320,11 @@ fn run(
         Option<std::collections::HashMap<u32, u32>>,
         Option<cvec::CompressedU64>,
     ) = if mat.is_some() {
-        let id_map = inbound
-            .id_map
+        // The from-cache path keeps pass 1's id map on the side; the pipeline
+        // path's copy lives in the `InboundBuilder` until `compress_id_map`.
+        let id_map = mat_cached_id_map
             .as_ref()
+            .or(inbound.id_map.as_ref())
             .expect("id_map must be live before compress_id_map for MAT idx emit");
         let addrs: Vec<u64> = (0..g.n).map(|i| id_map.addr_at(i)).collect();
         let coc_snap = g.class_obj_class_idx.clone();
@@ -4072,7 +4333,13 @@ fn run(
     } else {
         (None, None)
     };
-    inbound.compress_id_map(compress)?;
+    // From-cache path: the id map is the one `InboundBuilder::id_map_only` took
+    // from pass 1, and the addresses are read straight off it at the `idx`
+    // snapshot below — there is nothing to compress away and no inbound scan
+    // waiting to use it.
+    if !mat_reused {
+        inbound.compress_id_map(compress)?;
+    }
     // shallow/class_idx were already compressed inside pass2 (before the
     // fwd_targets alloc) to keep their ~4GB dense forms off the binding peak;
     // shallow_c/class_idx_c hold the blobs, g.shallow/g.class_idx are empty.
@@ -4117,6 +4384,12 @@ fn run(
         crate::trace::trim();
     }
     t_dark!("unreachable_retained done");
+    // From-cache path: `rpo_dfs` and `unreachable_retained` are the last readers
+    // of the chunked forward targets (the emit phase uses the flat copy the
+    // cache handed us), so free the ~9 GB chunked duplicate now.
+    if mat_reused {
+        g.fwd_targets = crate::chunkvec::ChunkU32::default();
+    }
 
     // Compress parent_pre (~2 GB dense) between RPO and inbound to reduce
     // the peak during the transpose loop. parent_pre is not needed until
@@ -4300,11 +4573,16 @@ fn run(
     // field plans) BEFORE InboundBuilder is consumed. class_addr_to_hist and
     // field_plans_dense are moved out (cheap; small data). id_map_c is cloned
     // (~0.5 GB blob). Must be called after compress_id_map.
-    let mat_outbound_rescan_ctx: Option<crate::pass2::MatOutboundRescanCtx> = if mat.is_some() {
-        Some(inbound.take_for_outbound_rescan())
-    } else {
-        None
-    };
+    //
+    // From-cache path: there is no rescan — the forward CSR comes straight from
+    // `graph.bin` — so the context is never built (and must not be: the
+    // `InboundBuilder` here carries only pass 1's id map).
+    let mat_outbound_rescan_ctx: Option<crate::pass2::MatOutboundRescanCtx> =
+        if mat.is_some() && !mat_reused {
+            Some(inbound.take_for_outbound_rescan())
+        } else {
+            None
+        };
 
     // Capture the type-reference graph (class-pair edge counts) inline from the
     // live fwd-CSR before it is consumed by inbound construction. This replaces
@@ -4337,19 +4615,31 @@ fn run(
 
     // When --field-stats is requested, save the fwd CSR before inbound consumes it.
     // It is restored after retained computation so build_field_stats can use it.
-    let field_stats_fwd_main: Option<(Vec<u32>, crate::chunkvec::ChunkU32)> = if opts.field_stats {
-        let total_edges = g.fwd_offsets.last().copied().unwrap_or(0) as usize;
-        let fwd_off_copy = g.fwd_offsets.clone();
-        let mut fwd_tgt_copy = crate::chunkvec::ChunkU32::zeroed(total_edges);
-        for i in 0..total_edges {
-            fwd_tgt_copy.set(i, g.fwd_targets.get(i));
-        }
-        Some((fwd_off_copy, fwd_tgt_copy))
-    } else {
-        None
-    };
+    // Never on the from-cache path: that path has already freed the chunked
+    // forward targets (`mat caches` runs at `--detail default`, where field
+    // stats are off anyway).
+    let field_stats_fwd_main: Option<(Vec<u32>, crate::chunkvec::ChunkU32)> =
+        if opts.field_stats && !mat_reused {
+            let total_edges = g.fwd_offsets.last().copied().unwrap_or(0) as usize;
+            let fwd_off_copy = g.fwd_offsets.clone();
+            let mut fwd_tgt_copy = crate::chunkvec::ChunkU32::zeroed(total_edges);
+            for i in 0..total_edges {
+                fwd_tgt_copy.set(i, g.fwd_targets.get(i));
+            }
+            Some((fwd_off_copy, fwd_tgt_copy))
+        } else {
+            None
+        };
 
-    let (inb_block_off, inb_data) = if mat.is_some() {
+    // From-cache path: the inbound CSR is already on disk, so neither the
+    // transpose nor the HPROF rescan that rebuilds it runs. The forward CSR is
+    // no longer needed either — the emit phase reads `fwd_off` back out of
+    // `mat_fwd_snap`.
+    let (inb_block_off, inb_data) = if mat_reused {
+        drop(std::mem::take(&mut g.fwd_offsets));
+        t_dark!("fwd CSR dropped (mat from-cache path)");
+        (cached_inb_block_off, cached_inb_data)
+    } else if mat.is_some() {
         // Drop fwd_targets BEFORE calling build_mat_scan so that inb_flat
         // allocation (6 GB) does not coexist with fwd_targets (8 GB).
         // build_mat_scan rescans the HPROF file to reconstruct inbound without
@@ -4469,8 +4759,15 @@ fn run(
         std::fs::write(d.join("meta.txt"), format!("{}", g.n))?;
         eprintln!("[ckpt] saved dominator inputs to {}", d.display());
     }
-    g.idom =
-        dominator::compute_dominators(g.n, rpo, &g.gc_root_indices, &inb_block_off, &inb_data)?;
+    // From-cache path: `idom` came off disk, so the dominator solver does not
+    // run. `rpo` is still consumed below (its `vertex`/`dfn` feed the inbound
+    // emit), so drop it here the same way `compute_dominators` would have.
+    if mat_reused {
+        drop(rpo);
+    } else {
+        g.idom =
+            dominator::compute_dominators(g.n, rpo, &g.gc_root_indices, &inb_block_off, &inb_data)?;
+    }
     if dbg_graph {
         let n = g.n;
         let vroot = n as u32;
@@ -4954,9 +5251,7 @@ fn run(
         std::collections::HashMap::new();
     if let Some(ref m) = mat {
         let mm = mat_map.as_ref().expect("mat_map built with mat");
-        if let (Some((fwd_off_c, _class_idx_c)), Some(rescan_ctx)) =
-            (mat_fwd_snap.as_ref(), mat_outbound_rescan_ctx.as_ref())
-        {
+        if let Some((fwd_off_c, _class_idx_c)) = mat_fwd_snap.as_ref() {
             // Restore fwd_off (prefix-sum offsets), drop compressed blob.
             let mut fwd_off = fwd_off_c.restore()?;
             let total_edges = if !fwd_off.is_empty() {
@@ -4964,8 +5259,15 @@ fn run(
             } else {
                 0
             };
-            // Pre-allocate fwd_tgt and scatter-fill via HPROF rescan.
-            let mut fwd_tgt: Vec<u32> = vec![0u32; total_edges];
+            // From-cache path: the forward targets were decoded off `graph.bin`
+            // while the graph was being loaded, so there is nothing to
+            // scatter-fill — `rescan_outbound` and the 44 GB re-read it needs
+            // are both skipped. Otherwise pre-allocate and fill via the rescan.
+            let mut fwd_tgt: Vec<u32> = if mat_reused {
+                std::mem::take(&mut mat_cached_fwd_tgt)
+            } else {
+                vec![0u32; total_edges]
+            };
             crate::trace::probe("main: before outbound rescan (fwd_off+fwd_tgt allocated)");
             let zero_ref = mat_zero_ref.as_mut().expect("mat_zero_ref built with mat");
             // ── Fast path (opt-in): take the forward CSR from the on-disk cache
@@ -4984,21 +5286,42 @@ fn run(
             //
             // Default OFF: without `HPROF_MAT_FWD_FROM_CACHE` this is a single
             // env lookup and the rescan path below runs byte-for-byte as before.
-            let cached_fwd = if std::env::var_os("HPROF_MAT_FWD_FROM_CACHE").is_some() {
-                match cache::CacheDir::for_dump(std::path::Path::new(input)) {
-                    Ok(c) if c.is_valid(cache::CacheMode::Graph) => {
-                        crate::trace::probe("main: fwd-from-cache: reading graph.bin");
-                        c.read_forward_edges().ok().flatten()
+            let mut took_cache = mat_reused;
+            if mat_reused {
+                // `zero_ref` from pass 1's own id map — no compressed blob, and
+                // no dependency on `MatOutboundRescanCtx` (which the from-cache
+                // path never builds).
+                if let (Some(meta), Some(id_map)) =
+                    (mat_class_meta.as_ref(), mat_cached_id_map.as_ref())
+                {
+                    for (&addr, &(super_id, loader_id, _)) in meta.class_info.iter() {
+                        if super_id == 0 || loader_id == 0 {
+                            if let Some(i) = id_map.index_of(addr) {
+                                zero_ref.set(i);
+                            }
+                        }
                     }
-                    _ => None,
                 }
-            } else {
-                None
-            };
-            let mut took_cache = false;
+                crate::trace::probe("main: fwd-from-cache: using cached fwd_tgt (no rescan)");
+            }
+            let cached_fwd =
+                if !mat_reused && std::env::var_os("HPROF_MAT_FWD_FROM_CACHE").is_some() {
+                    match cache::CacheDir::for_dump(std::path::Path::new(input)) {
+                        Ok(c) if c.is_valid(cache::CacheMode::Graph) => {
+                            crate::trace::probe("main: fwd-from-cache: reading graph.bin");
+                            c.read_forward_edges().ok().flatten()
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
             if let Some((c_off, c_tgt)) = cached_fwd {
                 // The offset table must be the same CSR we already hold, or the
                 // cache belongs to a different graph and must not be trusted.
+                let rescan_ctx = mat_outbound_rescan_ctx
+                    .as_ref()
+                    .expect("rescan context built when mat present and not from cache");
                 if c_off == fwd_off && c_tgt.len() == total_edges {
                     if let (Some(meta), Some((blob, len))) =
                         (mat_class_meta.as_ref(), rescan_ctx.id_map_c.as_ref())
@@ -5024,6 +5347,9 @@ fn run(
                 }
             }
             if !took_cache {
+                let rescan_ctx = mat_outbound_rescan_ctx
+                    .as_ref()
+                    .expect("rescan context built when mat present and not from cache");
                 crate::pass2::rescan_outbound(rescan_ctx, &mut fwd_off, &mut fwd_tgt, zero_ref)?;
             }
             crate::trace::probe("main: after outbound rescan");
@@ -5452,7 +5778,13 @@ fn run(
     // must not coexist with the 4GB dense shallow+class_idx -> that stacking
     // was the ~22GB global peak. It reads only idom.
     crate::trace::probe("main: before build_dom_children_csr");
-    let (dc_off, dc_tgt) = retained::build_dom_children_csr(g.n, &g.idom);
+    // From-cache path: `arrays.bin` already holds the dominator-children CSR, so
+    // the ~8 GB build transient is skipped entirely.
+    let (dc_off, dc_tgt) = if mat_reused {
+        (cached_dc_off, cached_dc_tgt)
+    } else {
+        retained::build_dom_children_csr(g.n, &g.idom)
+    };
     crate::trace::probe("main: after build_dom_children_csr");
     t_dark!("dom_children_csr done");
 

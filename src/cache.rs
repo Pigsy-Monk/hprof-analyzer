@@ -415,6 +415,59 @@ impl CacheDir {
         })
     }
 
+    /// Read `fwd_off` (the forward CSR's offset table) on its own.
+    pub fn read_forward_offsets(&self) -> io::Result<Option<Vec<u32>>> {
+        read_u32_array(&self.path.join("graph.bin"), "fwd_off")
+    }
+
+    /// Stream `fwd_tgt` from `graph.bin` into a flat `Vec<u32>`.
+    ///
+    /// [`CacheDir::read_forward_edges`] materialises that array three times over
+    /// — the compressed frame, the `Vec<i32>` deltas, then the `Vec<u32>`
+    /// targets — which on the 44 GB dump (2.3 billion edges) is ~27 GB of
+    /// transients for one array. This walks the zstd frame through a 64 KiB
+    /// buffer and undeltas straight into the output, so the only large
+    /// allocation is the result itself.
+    ///
+    /// Returns `Ok(None)` when `graph.bin` has no `fwd_tgt` or the frame does not
+    /// hold exactly `total_edges` values (a stale or foreign cache).
+    pub fn read_forward_targets(&self, total_edges: usize) -> io::Result<Option<Vec<u32>>> {
+        let path = self.path.join("graph.bin");
+        let Some((f, len)) = seek_to_entry(&path, "fwd_tgt")? else {
+            return Ok(None);
+        };
+        let mut dec = zstd::stream::read::Decoder::new(f.take(len as u64))?;
+        let mut buf = vec![0u8; STAGE_BYTES];
+        // The entry is an i32 delta stream (see `IndexedWriter::add_delta_u32`);
+        // a 4-byte value can straddle a read boundary, so carry the partial one.
+        let mut carry = [0u8; 4];
+        let mut have = 0usize;
+        let mut acc: i64 = 0;
+        let mut out: Vec<u32> = Vec::with_capacity(total_edges);
+        loop {
+            let n = dec.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            let mut i = 0usize;
+            while i < n {
+                let take = (4 - have).min(n - i);
+                carry[have..have + take].copy_from_slice(&buf[i..i + take]);
+                have += take;
+                i += take;
+                if have == 4 {
+                    acc = acc.wrapping_add(i32::from_le_bytes(carry) as i64);
+                    out.push(acc as u32);
+                    have = 0;
+                }
+            }
+        }
+        if have != 0 || out.len() != total_edges {
+            return Ok(None);
+        }
+        Ok(Some(out))
+    }
+
     /// Returns `(inb_off, inb_tgt)` or `None` if graph not cached.
     pub fn read_inbound_csr(&self) -> io::Result<Option<(Vec<u32>, Vec<u32>)>> {
         let off = read_u32_array(&self.path.join("graph.bin"), "inb_off")?;
