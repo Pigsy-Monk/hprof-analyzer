@@ -441,7 +441,13 @@ impl Pass2 {
             id_size as usize,
             &p1.id_map,
             &shallow,
-        );
+        )
+        // Attach the per-object class table so a projected REFERENCE field can
+        // name the class of the object it points at (`class_of_index`); without
+        // it such a cell carries `"?"` as its class. Both slices are alive here
+        // (the resolver is dropped at the end of the query phase, before
+        // `p1.class_ids` is freed).
+        .with_class_table(&p1.class_ids, &p1.class_addr_table, &p1.kind);
         // Arm one executor per valid SingleScan query. Plan-time field
         // validation runs here (earliest point a live schema exists): a query
         // referencing a field absent from its FROM class's super-chain is

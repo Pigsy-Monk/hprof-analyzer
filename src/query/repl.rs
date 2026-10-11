@@ -5290,6 +5290,59 @@ pub(crate) fn cache_shaped(
     head_ok && branches_ok
 }
 
+/// True when the FROM is a single addressed object (`FROM OBJECTS <addr>`) and
+/// everything ELSE about the query is resident-servable: the plan needs no
+/// per-object blob, no subquery, and no UNION tail.
+///
+/// Purely STRUCTURAL — it says nothing about whether the ADDRESSED OBJECT can be
+/// served resident, which needs the cache ([`object_from_resident_ok`]). Split
+/// out so a caller can decide whether building the cache is worth it *before*
+/// holding one: this is the cache-free "might be resident" half.
+///
+/// `cache_shaped` rejects `FROM OBJECTS` outright because it demands a concrete
+/// CLASS from, but an addressed object is a single dense index — the narrowest
+/// source the resident path can serve — so it is worth a separate path.
+pub(crate) fn object_from_shaped(
+    q: &crate::query::ast::Query,
+    plan: &crate::query::plan::QueryPlan,
+) -> bool {
+    matches!(q.from, crate::query::ast::FromSource::Object(_))
+        && plan.is_resident_only()
+        && plan.from_subplan.is_none()
+        && plan.in_subplans.is_empty()
+        && plan.union_branches.is_empty()
+        && q.union_branches.is_empty()
+}
+
+/// The cache-dependent half of [`object_from_shaped`]: the addressed object must
+/// be an INSTANCE_DUMP record (`kind == 0`).
+///
+/// The resident scan drives `visit_instance` over kind-0 objects only — it never
+/// calls `visit_array` — so an ARRAY target (kind 1/2) or a class object
+/// (kind 3) would yield zero rows resident where the scan yields one. Those must
+/// keep taking the scan path; that is exactly why `cache_shaped` excludes
+/// `FROM OBJECTS` today.
+///
+/// A MISSING address is different: it names no live object, so BOTH paths yield
+/// zero rows (the executor's `target_index` stays `None` and nothing matches) —
+/// the resident path is exact, and vastly cheaper than re-reading the dump.
+pub(crate) fn object_from_resident_ok(
+    c: &crate::query::run::ReplCache,
+    q: &crate::query::ast::Query,
+    plan: &crate::query::plan::QueryPlan,
+) -> bool {
+    if !object_from_shaped(q, plan) {
+        return false;
+    }
+    let crate::query::ast::FromSource::Object(addr) = q.from else {
+        return false;
+    };
+    match c.p1.id_map.index_of(addr) {
+        Some(i) => c.p1.kind.get(i).copied() == Some(0),
+        None => true,
+    }
+}
+
 /// Parse, plan, and execute a single OQL line against the dump at `path`,
 /// returning the (single) query result. Parse/plan failures are surfaced as
 /// `io::Error` so the caller prints `error: <msg>` and stays alive.
@@ -5333,7 +5386,14 @@ fn run_one(
     // from the warm ReplCache (no heap re-scan). `cache_eligible` borrows `&q`
     // and `&plan` here, before either is moved into a run call below.
     let eligible = cache_eligible(&q, &plan);
-    let mut results = if eligible {
+    // `FROM OBJECTS <addr>` is not class-shaped, so `cache_eligible` rejects it —
+    // yet it is a SINGLE dense index, which the resident path serves exactly. The
+    // cache-free half decides whether building the cache is worth it; the
+    // cache-dependent half (is the addressed object an instance?) decides whether
+    // it can actually be used. An array/class-object target falls back to the
+    // scan path, which is why the exclusion existed.
+    let object_from = object_from_shaped(&q, &plan);
+    let mut results = if eligible || object_from {
         // Lazily build the cache in the session's current mode on first use. If a
         // cache already exists but was built for the OTHER reachability mode
         // (user toggled !all/!reachable), don't rebuild mid-session (v1: avoid
@@ -5348,11 +5408,18 @@ fn run_one(
                 "(warm cache built — resident-only queries now skip the heap scan)"
             )?;
         }
-        match cache {
-            Some(c) if c.reachable_only == reachable_only => {
-                crate::query::run::run_resident_only(c, &[(q, plan)], reachable_only)?
+        let resident = match &*cache {
+            Some(c) => {
+                c.reachable_only == reachable_only
+                    && (eligible || object_from_resident_ok(c, &q, &plan))
             }
-            _ => crate::query::run::run_single_dump(path, &[(q, plan)], reachable_only)?,
+            None => false,
+        };
+        if resident {
+            let c = cache.as_ref().expect("cache built above");
+            crate::query::run::run_resident_only(c, &[(q, plan)], reachable_only)?
+        } else {
+            crate::query::run::run_single_dump(path, &[(q, plan)], reachable_only)?
         }
     } else {
         crate::query::run::run_single_dump(path, &[(q, plan)], reachable_only)?

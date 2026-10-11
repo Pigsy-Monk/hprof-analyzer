@@ -197,18 +197,41 @@ pub fn run_query_json_policy(
         }
     } else {
         let eligible = crate::query::repl::cache_eligible(&q, &plan);
-        if eligible {
+        // `FROM OBJECTS <addr>` is not class-shaped, so `cache_eligible` rejects
+        // it — but a single addressed object is exactly one dense index, which the
+        // resident path serves. The cache-free half gates whether to build the
+        // cache; the cache-dependent half (is the target an instance?) gates
+        // whether it can be used. See `repl::object_from_shaped`.
+        let object_from = crate::query::repl::object_from_shaped(&q, &plan);
+        if eligible || object_from {
             if cache.is_none() {
                 match ReplCache::build(&crate::source::HprofSource::from(path), reachable_only) {
                     Ok(c) => *cache = Some(c),
                     Err(e) => return internal_error(e),
                 }
             }
-            match cache {
-                Some(c) if c.reachable_only == reachable_only => {
-                    crate::query::run::run_resident_only(c, &[(q, plan)], reachable_only)
+            let resident = match &*cache {
+                Some(c) => {
+                    c.reachable_only == reachable_only
+                        && (eligible || crate::query::repl::object_from_resident_ok(c, &q, &plan))
                 }
-                _ => crate::query::run::run_single_dump(path, &[(q, plan)], reachable_only),
+                None => false,
+            };
+            if resident {
+                let c = cache.as_ref().expect("cache built above");
+                crate::query::run::run_resident_only(c, &[(q, plan)], reachable_only)
+            } else if no_rescan {
+                // An addressed object the resident cache cannot deliver (an array
+                // or a class object) still needs the scan, so it is refused here
+                // exactly like any other non-resident query.
+                return refuse_rescan(
+                    not_eligible_reason(&q, &plan),
+                    "Under --no-rescan only queries the resident cache can answer are \
+                     served; restart without it to allow a per-request scan, or use \
+                     `heap query`.",
+                );
+            } else {
+                crate::query::run::run_single_dump(path, &[(q, plan)], reachable_only)
             }
         } else if no_rescan {
             return refuse_rescan(
@@ -452,6 +475,10 @@ fn not_eligible_reason(
             .to_string()
     } else if plan.from_subplan.is_some() || !plan.in_subplans.is_empty() {
         "a subquery".to_string()
+    } else if matches!(q.from, crate::query::ast::FromSource::Object(_)) {
+        "an addressed object the resident cache cannot deliver (an array or a class \
+         object; the resident scan visits instances only)"
+            .to_string()
     } else if q.from.class_spec().is_none() {
         "a FROM that is not a single concrete class (a class-name regex, INSTANCEOF, \
          or OBJECTS)"

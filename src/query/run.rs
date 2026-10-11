@@ -28,6 +28,18 @@ pub struct LiveResolver<'a> {
     id_map: &'a IdMap,
     shallow: &'a [u32],
     field_cache: RefCell<HashMap<(u64, String), Option<(u32, HprofType)>>>,
+    /// Optional per-object class tables: `class_ids[i]` is the dense class index
+    /// of object `i`, which indexes `class_addr_table` to the class-object
+    /// address. Attached by [`LiveResolver::with_class_table`] so a projected
+    /// REFERENCE field can name the class of the object it points at
+    /// (`ClassResolver::class_of_index`). `None` when the construction site does
+    /// not have them — then a projected reference carries `"?"` as its class.
+    class_ids: Option<&'a [u32]>,
+    class_addr_table: Option<&'a [u64]>,
+    /// Per-object kind (0 = instance, 1 = object array, 2 = primitive array,
+    /// 3 = class object). Gates `class_of_index`: only kind 0 carries a plain
+    /// class index in `class_ids`.
+    kind: Option<&'a [u8]>,
 }
 
 impl<'a> LiveResolver<'a> {
@@ -52,7 +64,33 @@ impl<'a> LiveResolver<'a> {
             id_map,
             shallow,
             field_cache: RefCell::new(HashMap::new()),
+            class_ids: None,
+            class_addr_table: None,
+            kind: None,
         }
+    }
+
+    /// Attach the per-object class tables, enabling
+    /// [`ClassResolver::class_of_index`] so a projected reference field can name
+    /// the class of the object it points at. Chainable after [`new`](Self::new);
+    /// leaving it off is safe — a projected reference then carries `"?"`.
+    ///
+    /// All three slices must be in dense-object-index order and outlive the
+    /// resolver, i.e. come from the same snapshot the resolver already borrows.
+    /// `kind` is REQUIRED, not optional: `class_ids` is only a plain class index
+    /// for `kind == 0` (pass 1 packs a kind tag into bits 30-31 for arrays — see
+    /// `Pass1`'s `tmp_class_ids` pushes), so without it the lookup would resolve
+    /// an array to an unrelated class.
+    pub fn with_class_table(
+        mut self,
+        class_ids: &'a [u32],
+        class_addr_table: &'a [u64],
+        kind: &'a [u8],
+    ) -> Self {
+        self.class_ids = Some(class_ids);
+        self.class_addr_table = Some(class_addr_table);
+        self.kind = Some(kind);
+        self
     }
 
     /// Walk the super-chain from `class_id`, returning the SLASH-form name of the
@@ -152,6 +190,23 @@ impl<'a> ClassResolver for LiveResolver<'a> {
     /// could accept, so the two can never disagree.
     fn all_class_ids(&self) -> Vec<u64> {
         self.class_map.keys().copied().collect()
+    }
+
+    /// The dotted class name of the object at dense index `idx`, resolved
+    /// through the attached class table: `idx → dense class index → class-object
+    /// address → dotted name`. `None` when no class table was attached, the index
+    /// is out of range, or the class has no resolvable name.
+    fn class_of_index(&self, idx: usize) -> Option<&str> {
+        // Only an INSTANCE (kind 0) stores a plain dense class index in
+        // `class_ids`. Arrays pack a kind tag into bits 30-31, so indexing
+        // `class_addr_table` with them would name an unrelated class — refuse
+        // instead of guessing (the caller then reports `"?"`).
+        if self.kind?.get(idx).copied() != Some(0) {
+            return None;
+        }
+        let cid = *self.class_ids?.get(idx)?;
+        let addr = self.class_addr_table?.get(cid as usize)?;
+        self.names.get(addr).map(String::as_str)
     }
 }
 
@@ -868,7 +923,10 @@ pub fn run_resident_only(
         cache.id_size,
         &cache.p1.id_map,
         &cache.shallow,
-    );
+    )
+    // Attach the per-object class table so a projected reference field can name
+    // the class of the object it points at (see `class_of_index`).
+    .with_class_table(&cache.class_ids, &cache.p1.class_addr_table, &cache.p1.kind);
     // Build executors: row-mode for most queries, carry-mode for toString(s)
     // queries. The toString path expects indices in `pending` (cross-phase) so
     // `resume_with_string_values` can look up each dense index in the string_values
@@ -968,7 +1026,10 @@ pub fn run_resident_with_retained(
         cache.id_size,
         &cache.p1.id_map,
         &cache.shallow,
-    );
+    )
+    // Attach the per-object class table so a projected reference field can name
+    // the class of the object it points at (see `class_of_index`).
+    .with_class_table(&cache.class_ids, &cache.p1.class_addr_table, &cache.p1.kind);
     let mut entries: Vec<(usize, SingleScanExecutor<'_, LiveResolver<'_>>)> = Vec::new();
     for (slot, (q, plan)) in flat.iter().enumerate() {
         let ex = if plan.needs.string_values

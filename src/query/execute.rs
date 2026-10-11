@@ -221,6 +221,17 @@ pub trait ClassResolver {
     fn all_class_ids(&self) -> Vec<u64> {
         Vec::new()
     }
+    /// The dotted class name of the object at dense index `idx`, when this
+    /// resolver can map object indices to classes. Backs the class name on a
+    /// projected reference field ([`SingleScanExecutor::decode_ref_field`]).
+    ///
+    /// The default is `None` — a resolver with no per-object class table cannot
+    /// answer, and the caller falls back to `"?"` rather than guessing. Only
+    /// `LiveResolver` implements it, and only when its optional class table has
+    /// been attached (see `LiveResolver::with_class_table`).
+    fn class_of_index(&self, _idx: usize) -> Option<&str> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -1392,7 +1403,43 @@ impl<'a, R: ClassResolver> SingleScanExecutor<'a, R> {
             HprofType::Double => read_be(blob, o, 8)
                 .map(|v| QueryValue::Float(f64::from_bits(v)))
                 .unwrap_or(QueryValue::Null),
-            HprofType::Object => QueryValue::Null,
+            // A reference-valued field projects the REFERENCED OBJECT, matching
+            // MAT OQL — verified against MAT 1.17 on a live dump:
+            //   `SELECT s.key, s.value FROM java.util.HashMap$Node s`
+            //     -> `java.lang.String [id=0x…]`, `java.lang.Object [id=0x…]`
+            //   `SELECT s.value FROM java.lang.String s`
+            //     -> `byte[] [id=0x…]`
+            // i.e. a reference column, never null. Previously this arm returned
+            // Null unconditionally, so every `SELECT s.<refField>` lost its value.
+            HprofType::Object => self.decode_ref_field(blob, o),
+        }
+    }
+    /// Project a reference-valued field as an [`QueryValue::ObjRef`] naming the
+    /// object it points at.
+    ///
+    /// `Null` is still correct — and returned — in exactly two cases: a NULL
+    /// reference (the field's value is 0, so there is genuinely no referent), and
+    /// an address the heap does not know (a stale/garbage ref names no object).
+    /// Everything else yields an `ObjRef` carrying the referent's dense index,
+    /// its class name when the resolver can map indices to classes
+    /// ([`ClassResolver::class_of_index`]), and its heap address.
+    fn decode_ref_field(&self, blob: &[u8], o: usize) -> QueryValue {
+        let width = self.resolver.ref_width();
+        let Some(addr) = read_be(blob, o, width) else {
+            // Blob too short to hold the reference (e.g. the empty blob the
+            // resident cache passes for a query that does not need field data).
+            return QueryValue::Null;
+        };
+        if addr == 0 {
+            return QueryValue::Null; // a null reference really is null
+        }
+        match self.resolver.index_of_addr(addr) {
+            Some(idx) => QueryValue::ObjRef {
+                index: idx as u64,
+                class: self.resolver.class_of_index(idx).unwrap_or("?").to_string(),
+                addr: Some(addr),
+            },
+            None => QueryValue::Null, // unresolvable address: no object to name
         }
     }
     fn where_passes(&self, src_idx: usize, class_id: u64, blob: &[u8]) -> bool {

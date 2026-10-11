@@ -683,10 +683,23 @@ Some field navigations silently return `NULL` rather than raising an error, beca
 
 | Case | Example | Workaround |
 |------|---------|------------|
-| **Object-ref field navigation** | `x.parent` where `parent` is typed `Object` | Field names are known but types are not; the engine cannot auto-rewrite to a ref-walk at plan time. Use `@objectAddress` and a separate query to look up the referent. |
+| **Object-ref field *navigation*** | `x.parent.name` where `parent` is typed `Object` | Field names are known but types are not, so the engine cannot auto-rewrite the chain into a ref-walk at plan time. Project the reference itself (`SELECT x.parent`) and follow up, or use `@objectAddress`. |
 | **Two-hop collection introspection** | `x.size` on `java.util.HashSet` | `HashSet` delegates to a backing `HashMap`; a single-hop field read returns `NULL`. Use `FROM INSTANCEOF java.util.AbstractCollection` to reach classes that store size directly. |
 
 Both limitations require extending the field-type schema (`FieldSchema` currently provides names only, not types). They are tracked for a future pass.
+
+#### Projecting a reference field
+
+`SELECT <alias>.<refField>` returns the **referenced object**, not `NULL` — matching
+MAT OQL (verified against MAT 1.17: `SELECT s.value FROM java.lang.String s` yields
+`byte[] [id=0x…]`). The cell is an `obj_ref` carrying the referent's dense index and
+heap address. `NULL` is still returned for a genuinely null reference (the field's
+value is 0) and for an address that names no live object.
+
+One cosmetic gap: when the referent is an **array**, its class name reads `?`. An
+instance referent names its class normally. (Arrays pack a kind tag into the
+per-object class index, so the name is not resolvable that way; the index and
+address in the cell are still correct, so a follow-up query on either works.)
 
 ### `--query-file` parse error format
 
