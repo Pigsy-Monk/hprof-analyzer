@@ -386,6 +386,14 @@ impl<'q, R: ClassResolver> ScanDriver<'q, R> {
         Some(out)
     }
 
+    /// True when at least one executor's FROM gate would accept an object of
+    /// class `class_id` — i.e. the object is a candidate for some query, so
+    /// fetching its field blob is worth the `seek`. Conservative: an executor
+    /// whose gate accepts but whose plan never reads the blob simply ignores it.
+    pub fn wants_blob(&self, class_id: u64) -> bool {
+        self.execs.iter().any(|e| e.class_gate_accepts(class_id))
+    }
+
     /// Build the string-capture sidecar if any exec has `needs.string_values`.
     /// Returns `None` when no toString(s) query is present.
     fn arm_string_capture(
@@ -919,6 +927,141 @@ pub(crate) fn resume_with_string_values(
     slotted.into_iter().map(|(_, r)| r).collect()
 }
 
+/// The field reader, re-declared into this module tree.
+///
+/// `src/objread.rs` is a module of the *library* crate (`lib.rs` has
+/// `pub mod objread;`). The `hprof-analyzer` **binary** builds its own module
+/// tree — `main.rs` declares `mod cache;`, `mod pass1;`, `mod types;` and so on,
+/// but not `mod objread;` — and reaches the reader through
+/// `hprof_analyzer::objread` instead. A path that resolves inside the library
+/// does not resolve in the binary and vice versa, and this file is compiled into
+/// both. Declaring the same source file here gives both trees a
+/// `crate::query::run::objread` to call — the same duplication `cache.rs`,
+/// `pass1.rs` and `types.rs` already live with (and `query/jsonify.rs` does for
+/// exactly this reason). It is the identical file, so there is nothing to keep
+/// in sync.
+#[cfg(feature = "native")]
+#[path = "../objread.rs"]
+#[allow(dead_code)] // this copy uses a subset of the reader's surface
+#[allow(clippy::duplicate_mod)] // deliberate: see the note above
+mod objread;
+
+/// HPROF `INSTANCE_DUMP` sub-record tag.
+const INSTANCE_DUMP_TAG: u8 = 0x21;
+
+/// Seek-based reader for per-object `INSTANCE_DUMP` field blobs.
+///
+/// The analysis pipeline records, per dense object index, the byte offset of
+/// that object's record in the *decompressed* HPROF stream (`ReplCache::offsets`
+/// / the cache's `offsets.bin`). With that offset and a seekable dump, one
+/// object's field blob costs a single `seek` plus a few dozen bytes — the same
+/// trick `heap inspect` uses. This holds **one** open handle across the whole
+/// scan and seeks per object, so a query touching N objects costs N seeks, not
+/// N `File::open`s.
+///
+/// Deliberately narrow: it returns the raw blob the executor's `decode_field`
+/// consumes. `crate::objread` (reused above for `is_seekable`) decodes fields
+/// itself and so cannot serve the executor's offset-based reads.
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
+struct BlobReader {
+    f: std::fs::File,
+    id_size: usize,
+    buf: Vec<u8>,
+}
+
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
+impl BlobReader {
+    fn open(path: &std::path::Path, id_size: usize) -> std::io::Result<Self> {
+        Ok(Self {
+            f: std::fs::File::open(path)?,
+            id_size,
+            buf: Vec::new(),
+        })
+    }
+
+    /// Read the field blob of the `INSTANCE_DUMP` record at `offset` (the
+    /// record's tag byte). `None` when the offset is unknown (`None`), is the
+    /// pipeline's `0` sentinel for class objects, or does not point at an
+    /// `INSTANCE_DUMP` — the caller then hands the executor an empty blob, which
+    /// is exactly the pre-existing behavior.
+    ///
+    /// Record framing mirrors `objread::read_instance_at`:
+    /// `tag(1) addr(id) stack(u4) class(id) len(u4) blob(len)`.
+    fn read(&mut self, offset: Option<u64>) -> std::io::Result<Option<&[u8]>> {
+        let Some(offset) = offset.filter(|&o| o != 0) else {
+            return Ok(None);
+        };
+        use std::io::{Read, Seek, SeekFrom};
+        self.f.seek(SeekFrom::Start(offset))?;
+        let mut tag = [0u8; 1];
+        self.f.read_exact(&mut tag)?;
+        if tag[0] != INSTANCE_DUMP_TAG {
+            return Ok(None);
+        }
+        let ids = self.id_size;
+        let mut head = vec![0u8; ids + 4 + ids + 4];
+        self.f.read_exact(&mut head)?;
+        let mut len: u64 = 0;
+        for &b in &head[ids + 4 + ids..] {
+            len = (len << 8) | b as u64;
+        }
+        let len = len as usize;
+        if len > (1 << 30) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("implausible INSTANCE_DUMP data_len {len} at offset {offset}"),
+            ));
+        }
+        self.buf.resize(len, 0);
+        self.f.read_exact(&mut self.buf)?;
+        Ok(Some(&self.buf))
+    }
+}
+
+/// Arm the seek-based field-blob reader for `cache`, or explain why it cannot be
+/// armed. An `Err` here is a LOUD refusal: a field-reading query must never be
+/// answered from empty blobs, which would silently project Null field values.
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
+fn open_blob_reader(cache: &ReplCache) -> std::io::Result<BlobReader> {
+    let Some(path) = cache.dump_path() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "this query reads per-object field values, which needs a seekable \
+             dump on disk; the resident cache was built from an in-memory buffer",
+        ));
+    };
+    let Some(offsets) = cache.offsets.as_deref() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "this query reads per-object field values, which needs the cache's \
+             offsets.bin (the per-object HPROF record offsets); this cache has \
+             none, so answering it would mean re-reading the whole dump",
+        ));
+    };
+    if offsets.len() != cache.n {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "offsets.bin has {} entries but the cache has {} objects",
+                offsets.len(),
+                cache.n
+            ),
+        ));
+    }
+    #[cfg(feature = "native")]
+    {
+        if !objread::is_seekable(path)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "this query reads per-object field values, which needs a seekable \
+                 (uncompressed) dump; offsets index the decompressed stream, so a \
+                 gzip/zip dump cannot be reached without decompressing all of it",
+            ));
+        }
+    }
+    BlobReader::open(path, cache.id_size)
+}
+
 /// Run the full pass1+pass2 pipeline against `path` for the given planned
 /// queries and return their results. Used by the REPL (and available to any
 /// one-shot caller). Does not build or render the full report.
@@ -963,6 +1106,36 @@ pub fn run_resident_only(
     // Attach the per-object class table so a projected reference field can name
     // the class of the object it points at (see `class_of_index`).
     .with_class_table(&cache.class_ids, &cache.p1.class_addr_table, &cache.p1.kind);
+
+    // Field validation, mirroring the scan path: `Pass2::build` calls
+    // `plan::validate_fields` before it arms an executor, so a query naming a
+    // field its FROM class does not have is a hard "unknown field" error. The
+    // resident path has to apply the same check, or it would answer
+    // `SELECT s.bogus FROM java.lang.Thread s` with a row of Nulls where the
+    // scan path errors — a WRONG answer rather than a missing one. Only queries
+    // that actually reference a field can fail, so this costs nothing on the
+    // resident-only queries that never touched a blob.
+    if flat
+        .iter()
+        .any(|(_, p)| p.needs.instance_scalar || p.needs.instance_string)
+    {
+        for (q, _) in &flat {
+            if let Err(e) = crate::query::plan::validate_fields(q, &resolver) {
+                return Ok(vec![QueryResult {
+                    name: String::new(),
+                    oql: String::new(),
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    row_count: 0,
+                    truncated: false,
+                    error: Some(e.0),
+                    note: None,
+                    viz: None,
+                    elapsed_ms: None,
+                }]);
+            }
+        }
+    }
     // Build executors: row-mode for most queries, carry-mode for toString(s)
     // queries. The toString path expects indices in `pending` (cross-phase) so
     // `resume_with_string_values` can look up each dense index in the string_values
@@ -987,24 +1160,70 @@ pub fn run_resident_only(
     }
     let mut driver = ScanDriver::new(entries).with_src_capture(reachable_only);
 
-    // Drive over cached dense indices with an EMPTY blob. ONLY true instances
-    // (kind 0) go through visit_instance — this mirrors the scan path exactly,
-    // which sends only INSTANCE_DUMP records to visit_instance. Class objects
-    // (kind 3) and arrays (kind 1/2) are skipped: array-FROM queries are routed
-    // to the scan path by the caller, and the scan never delivers class objects
-    // to visit_instance either.
+    // Field values: when any query reads a per-object field (`SELECT s.field`,
+    // `WHERE s.field <op> …`) the executor's `decode_field` needs the object's
+    // INSTANCE_DUMP blob. The resident cache does not store blobs, but when it
+    // carries `offsets` (see `ReplCache::offsets`) and the dump is a seekable
+    // uncompressed file, each *candidate* object's blob is one `seek` + a few
+    // dozen bytes of read — no dump re-scan. Without offsets the caller must not
+    // route such a query here; `blob_reader` stays `None` and the loop below
+    // refuses loudly rather than answering Null.
+    let want_blob = flat
+        .iter()
+        .any(|(_, p)| p.needs.instance_scalar || p.needs.instance_string);
+    // A non-native build (the WASM crate) has no filesystem to seek in, so it
+    // keeps the previous empty-blob behavior; `blob_cache_eligible` callers are
+    // all native and gate on `offsets.is_some()`, which only `attach_offsets`
+    // (native) ever sets.
+    #[cfg(feature = "native")]
+    let mut blob_reader = if want_blob {
+        Some(open_blob_reader(cache)?)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "native"))]
+    let mut blob_reader = {
+        let _ = want_blob;
+        None::<BlobReader>
+    };
+
+    // Drive over cached dense indices. ONLY true instances (kind 0) go through
+    // visit_instance — this mirrors the scan path exactly, which sends only
+    // INSTANCE_DUMP records to visit_instance. Class objects (kind 3) and arrays
+    // (kind 1/2) are skipped: array-FROM queries are routed to the scan path by
+    // the caller, and the scan never delivers class objects to visit_instance
+    // either.
     //
     // When every query pinned `@objectId` to a literal, visit ONLY those indices
     // (see `ScanDriver::pushdown_indices`) — the whole-heap loop collapses to a
     // handful of steps. The conjunct is still evaluated per visited object, so
     // the row set is identical to the full scan.
+    //
+    // The blob handed to `visit_instance` is empty unless a blob reader is armed
+    // AND some executor's FROM gate accepts this object's class — the same gate
+    // `visit_instance` applies first thing, so an object we skip the `seek` for
+    // is one no query could have read a field of. With `blob_reader == None`
+    // this is byte-identical to the previous empty-blob loop.
+    macro_rules! visit_dense {
+        ($i:expr) => {{
+            let i: usize = $i;
+            if cache.p1.kind[i] == 0 {
+                let class_addr = cache.p1.class_addr_table[cache.class_ids[i] as usize];
+                let blob: &[u8] = match blob_reader.as_mut() {
+                    Some(r) if driver.wants_blob(class_addr) => r
+                        .read(cache.offsets.as_ref().and_then(|o| o.get(i).copied()))
+                        .unwrap_or(None)
+                        .unwrap_or(&[]),
+                    _ => &[],
+                };
+                driver.visit_instance(i, class_addr, blob);
+            }
+        }};
+    }
     match driver.pushdown_indices(cache.n) {
         Some(idxs) => {
             for i in idxs {
-                if cache.p1.kind[i] == 0 {
-                    let class_addr = cache.p1.class_addr_table[cache.class_ids[i] as usize];
-                    driver.visit_instance(i, class_addr, &[]);
-                }
+                visit_dense!(i);
             }
         }
         None => {
@@ -1016,13 +1235,11 @@ pub fn run_resident_only(
                 if driver.is_done() {
                     break;
                 }
-                if cache.p1.kind[i] == 0 {
-                    let class_addr = cache.p1.class_addr_table[cache.class_ids[i] as usize];
-                    driver.visit_instance(i, class_addr, &[]);
-                }
+                visit_dense!(i);
             }
         }
     }
+    drop(blob_reader);
 
     let state = driver.finish_state();
     let dfn: Option<&[u32]> = if reachable_only {
@@ -1998,6 +2215,18 @@ pub struct ReplCache {
     pub class_idx: Vec<u32>,
     /// Class-histogram row names (indexed by class_idx values).
     pub class_names: Vec<String>,
+    /// Dense-object-index → byte offset of that object's record in the
+    /// **decompressed** HPROF stream — the cache's `offsets.bin`, in the same
+    /// order as every other per-object table here. `None` when this cache has
+    /// no `offsets.bin` (an older cache, or the pipeline handover, which
+    /// captures none).
+    ///
+    /// With this table a field-reading query (`SELECT s.field`) decodes one
+    /// object's fields with a single `seek` into a seekable dump instead of
+    /// re-reading the whole file — see [`run_resident_only`]. Cost is one `u64`
+    /// per object (~8 B/object; ~4.9 GB on a 600M-object dump), so callers
+    /// attach it only from a cache that actually has `offsets.bin`.
+    pub offsets: Option<Vec<u64>>,
 }
 
 /// The slice of a `Pass1` that a [`ReplCache`] actually reads — plus the cache's
@@ -2051,6 +2280,10 @@ impl OqlCacheHandover {
             source,
             class_idx,
             class_names,
+            // The pipeline handover captures no HPROF record offsets (they cost
+            // 8 B/object and the pipeline does not need them). Callers that have
+            // a cache directory attach them afterwards via `attach_offsets`.
+            offsets: None,
         }
     }
 }
@@ -2125,7 +2358,63 @@ impl ReplCache {
             id_size,
             reachable_only,
             source: source.clone(),
+            // Not captured by `Pass1::run(&source, false)` above (offsets cost
+            // 8 B/object and the pipeline does not need them). Callers attach
+            // them from the dump's cache directory via `attach_offsets`.
+            offsets: None,
         })
+    }
+
+    /// Attach the per-object HPROF record offsets (`offsets.bin`) from `dir` —
+    /// the dump's cache directory — so field-reading queries can `seek` into the
+    /// dump instead of re-scanning it (see [`run_resident_only`]).
+    ///
+    /// Idempotent and best-effort. `offsets` is set only when ALL of these hold,
+    /// so `offsets.is_some()` is by itself the predicate "this cache can answer a
+    /// field-reading query":
+    ///   * the table decodes,
+    ///   * its length equals `n` (a stale cache must never yield wrong values),
+    ///   * the dump behind this cache is a seekable, uncompressed file (offsets
+    ///     index the *decompressed* stream, so a gzip/zip dump would need a full
+    ///     decompress to reach one — the very rescan this exists to avoid).
+    #[cfg(feature = "native")]
+    pub fn attach_offsets(&mut self, dir: &crate::cache::CacheDir) {
+        if self.offsets.is_some() {
+            return;
+        }
+        let Some(path) = self.dump_path() else {
+            return;
+        };
+        if !objread::is_seekable(path).unwrap_or(false) {
+            return;
+        }
+        if let Ok(Some(v)) = dir.read_hprof_offsets() {
+            if v.len() == self.n {
+                self.offsets = Some(v);
+            }
+        }
+    }
+
+    /// [`attach_offsets`](Self::attach_offsets) keyed by the dump path: resolves
+    /// the dump's cache directory first. Best-effort, like `attach_offsets`.
+    #[cfg(feature = "native")]
+    pub fn attach_offsets_from_dump(&mut self, dump: &std::path::Path) {
+        if self.offsets.is_some() {
+            return;
+        }
+        if let Ok(dir) = crate::cache::CacheDir::for_dump(dump) {
+            self.attach_offsets(&dir);
+        }
+    }
+
+    /// The dump path this cache was built from, when the source is a real file
+    /// (as opposed to an in-memory buffer, which cannot be seeked).
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
+    pub fn dump_path(&self) -> Option<&std::path::Path> {
+        match &self.source {
+            crate::source::HprofSource::Path(p) => Some(std::path::Path::new(p)),
+            crate::source::HprofSource::Bytes { .. } => None,
+        }
     }
 
     /// Scan the HPROF source and decode all String instance values.

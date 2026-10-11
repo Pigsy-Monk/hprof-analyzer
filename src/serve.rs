@@ -129,13 +129,20 @@ impl ServeState {
         let Some(dump_str) = dump.to_str() else {
             return false;
         };
-        let (Ok(Some(report)), Ok(Some(retained)), Ok(Some(warm))) = (
+        let (Ok(Some(report)), Ok(Some(retained)), Ok(Some(mut warm))) = (
             cache.read_report(),
             cache.read_retained(),
             cache.read_query_cache(HprofSource::from(dump_str)),
         ) else {
             return false;
         };
+        // `read_query_cache` cannot know about `offsets.bin` (the per-object
+        // HPROF record offsets): the assembly it performs predates that table.
+        // Attach it here, from the cache directory we already hold, so
+        // field-reading queries (`SELECT s.name FROM …`) can `seek` into the
+        // dump instead of re-reading it. Best-effort and self-guarding: it is a
+        // no-op when the table is absent/incomplete or the dump is compressed.
+        warm.attach_offsets(&cache);
 
         let retained_shared = Arc::new(retained);
         {

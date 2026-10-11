@@ -203,17 +203,36 @@ pub fn run_query_json_policy(
         // cache; the cache-dependent half (is the target an instance?) gates
         // whether it can be used. See `repl::object_from_shaped`.
         let object_from = crate::query::repl::object_from_shaped(&q, &plan);
-        if eligible || object_from {
+        // Field-reading queries (`SELECT s.name FROM …`, `WHERE s.field <op> …`)
+        // arm `needs.instance_scalar`/`instance_string`, which `cache_eligible`
+        // rejects. They ARE answerable from the resident cache when it carries
+        // the dump's `offsets` table: each candidate object's INSTANCE_DUMP blob
+        // is then one `seek` into the dump instead of a full re-scan (the same
+        // trick `heap inspect` uses). `blob_cache_eligible` is the cache-free
+        // half; the cache-dependent half is the offsets check below, so without
+        // `offsets.bin` these queries still refuse loudly under `--no-rescan`
+        // rather than quietly answering Null.
+        let blob = crate::query::repl::blob_cache_eligible(&q, &plan);
+        if eligible || object_from || blob {
             if cache.is_none() {
                 match ReplCache::build(&crate::source::HprofSource::from(path), reachable_only) {
-                    Ok(c) => *cache = Some(c),
+                    Ok(mut c) => {
+                        // Only pay for the offsets table (8 B/object) when this
+                        // query actually needs it.
+                        if blob {
+                            c.attach_offsets_from_dump(std::path::Path::new(path));
+                        }
+                        *cache = Some(c);
+                    }
                     Err(e) => return internal_error(e),
                 }
             }
             let resident = match &*cache {
                 Some(c) => {
                     c.reachable_only == reachable_only
-                        && (eligible || crate::query::repl::object_from_resident_ok(c, &q, &plan))
+                        && (eligible
+                            || crate::query::repl::object_from_resident_ok(c, &q, &plan)
+                            || (blob && c.offsets.is_some()))
                 }
                 None => false,
             };
@@ -225,7 +244,14 @@ pub fn run_query_json_policy(
                 // or a class object) still needs the scan, so it is refused here
                 // exactly like any other non-resident query.
                 return refuse_rescan(
-                    not_eligible_reason(&q, &plan),
+                    if blob {
+                        "per-object field values, and this cache carries no \
+                         offsets.bin (the per-object HPROF record offsets) to \
+                         locate the objects in the dump with"
+                            .to_string()
+                    } else {
+                        not_eligible_reason(&q, &plan)
+                    },
                     "Under --no-rescan only queries the resident cache can answer are \
                      served; restart without it to allow a per-request scan, or use \
                      `heap query`.",
@@ -1110,6 +1136,133 @@ mod tests {
         assert!(
             v["result"]["columns"].is_array(),
             "columns present, got: {v}"
+        );
+    }
+
+    /// Build the warm cache the way a server's warm start does: read it from the
+    /// dump's cache directory, then attach `offsets.bin` — which
+    /// `read_query_cache` itself cannot do (it predates that table, and
+    /// `cache.rs` is owned elsewhere). `None` when the fixture has no cache, in
+    /// which case the caller skips, like every other fixture-gated test.
+    fn warm_cache(dump: &str) -> Option<ReplCache> {
+        let dir = crate::cache::CacheDir::for_dump(std::path::Path::new(dump)).ok()?;
+        let mut c = dir
+            .read_query_cache(crate::source::HprofSource::from(dump))
+            .ok()
+            .flatten()?;
+        c.attach_offsets(&dir);
+        Some(c)
+    }
+
+    /// A field-reading query (`SELECT s.name FROM …`) arms
+    /// `needs.instance_scalar`, which `cache_eligible` rejects — so before the
+    /// offsets table was wired in, `--no-rescan` refused it outright. With the
+    /// cache's `offsets.bin` attached it is answered from the resident session by
+    /// seeking into the dump, and the rows are exactly the ones the real scan
+    /// produces (which is the whole contract: this may turn "cannot answer" into
+    /// "answered", never change an answer).
+    #[test]
+    fn no_rescan_answers_a_field_query_when_the_cache_has_offsets() {
+        const OQL: &str = "SELECT s.name, s.tid FROM java.lang.Thread s LIMIT 2";
+        let Some(cache) = warm_cache(FIXTURE) else {
+            return; // no fixture cache → nothing to warm-start from
+        };
+        if cache.offsets.is_none() {
+            // A cache that predates offset capture (or a gzip dump) keeps the
+            // old behavior; `no_rescan_refuses_a_field_query_without_offsets`
+            // covers that case directly.
+            return;
+        }
+
+        let mut resident = Some(cache);
+        let v = run_query_json_policy(FIXTURE, OQL, 5, false, &mut resident, None, None, true);
+        assert_eq!(v["ok"], serde_json::json!(true), "must be served, got: {v}");
+        assert!(
+            v["result"]["error"].is_null(),
+            "must not carry a field error, got: {v}"
+        );
+        let rows = v["result"]["rows"].as_array().expect("rows array");
+        assert_eq!(rows.len(), 2, "got: {v}");
+        for r in rows {
+            assert_eq!(
+                r[0]["kind"], "obj_ref",
+                "`name` is a reference field, got: {r}"
+            );
+            assert_eq!(r[1]["kind"], "int", "`tid` must decode, got: {r}");
+            assert!(r[1]["v"].is_number(), "`tid` must carry a number, got: {r}");
+        }
+
+        // Parity: the same query with no resident cache takes the scan path.
+        let mut none = None;
+        let scan = run_query_json_policy(FIXTURE, OQL, 5, false, &mut none, None, None, false);
+        assert_eq!(
+            scan["ok"],
+            serde_json::json!(true),
+            "scan path, got: {scan}"
+        );
+        assert_eq!(
+            scan["result"]["rows"], v["result"]["rows"],
+            "resident (seek) rows must equal scan rows"
+        );
+    }
+
+    /// A field the FROM class does not have is a hard error on the scan path
+    /// (`Pass2::build` validates against the live schema). The resident path must
+    /// report it the same way — answering with a row of Nulls would be a WRONG
+    /// answer, not a missing one. Regression guard for exactly that: the first
+    /// cut of the seek-based field path skipped the validation and returned
+    /// `priority: null` for `java.lang.Thread`, which has no such field.
+    #[test]
+    fn no_rescan_rejects_an_unknown_field_like_the_scan_path() {
+        const OQL: &str = "SELECT s.priority FROM java.lang.Thread s LIMIT 2";
+        let Some(cache) = warm_cache(FIXTURE) else {
+            return;
+        };
+        let mut resident = Some(cache);
+        let v = run_query_json_policy(FIXTURE, OQL, 5, false, &mut resident, None, None, true);
+        let err = v["result"]["error"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("unknown field `priority`"),
+            "resident path must report the unknown field, got: {v}"
+        );
+        assert_eq!(
+            v["result"]["rows"].as_array().map(Vec::len),
+            Some(0),
+            "and produce no rows, got: {v}"
+        );
+    }
+
+    /// Negative control for the test above: with no offsets table there is no way
+    /// to locate an object in the dump, so the query must go back to a loud
+    /// `rescan_refused` — never to silently-empty field values.
+    #[test]
+    fn no_rescan_refuses_a_field_query_without_offsets() {
+        let Some(mut cache) = warm_cache(FIXTURE) else {
+            return;
+        };
+        // Exactly what a cache with no `offsets.bin` looks like.
+        cache.offsets = None;
+        let mut resident = Some(cache);
+        let v = run_query_json_policy(
+            FIXTURE,
+            "SELECT s.name FROM java.lang.Thread s LIMIT 2",
+            5,
+            false,
+            &mut resident,
+            None,
+            None,
+            true,
+        );
+        assert_eq!(v["ok"], serde_json::json!(false), "must refuse, got: {v}");
+        assert_eq!(
+            v["error"]["kind"],
+            serde_json::json!("rescan_refused"),
+            "got: {v}"
+        );
+        let msg = v["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("offsets.bin") && msg.contains("--no-rescan"),
+            "message should name the missing table and the flag, got: {msg}"
         );
     }
 

@@ -950,6 +950,17 @@ impl<'a, R: ClassResolver> SingleScanExecutor<'a, R> {
     pub fn take_carry(self) -> Carry {
         self.carry.expect("take_carry on a non-carry executor")
     }
+    /// Would this executor's FROM gate accept an object of class `class_id`?
+    ///
+    /// Exposed so a scan that has to *fetch* something per object before calling
+    /// `visit_instance` (the resident cache's seek-based field-blob read) can
+    /// skip that fetch for objects this executor would reject anyway. Purely an
+    /// optimisation: `visit_instance` re-applies the same gate, so a `true` here
+    /// never changes which rows are produced.
+    pub fn class_gate_accepts(&self, class_id: u64) -> bool {
+        self.class_matches(class_id)
+    }
+
     fn class_matches(&self, class_id: u64) -> bool {
         // Fast path: a precomputed exact match set turns the gate into a
         // membership test — one `u64` compare for the common single-class FROM,

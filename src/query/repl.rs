@@ -5251,6 +5251,65 @@ pub(crate) fn cache_eligible(
         && cache_shaped(q, plan)
 }
 
+/// A query is served from the warm ReplCache **with per-object field blobs read
+/// by `seek`** when the only thing it needs beyond the resident tables is the
+/// instance field blob (`SELECT s.field`, `WHERE s.field <op> …`), and it is
+/// class-shaped and subquery-free.
+///
+/// Distinct from [`cache_eligible`], which requires `is_resident_only()` and
+/// therefore rejects exactly these queries (they arm `needs.instance_scalar` /
+/// `needs.instance_string`). The caller must ALSO check that the cache carries
+/// `ReplCache::offsets`: without them there is no way to locate an object in the
+/// dump, and such a query must stay on the refuse/scan path. `attach_offsets`
+/// only ever sets `offsets` when the table is complete AND the dump is
+/// seekable, so `cache.offsets.is_some()` is the whole cache-side test.
+pub(crate) fn blob_cache_eligible(
+    q: &crate::query::ast::Query,
+    plan: &crate::query::plan::QueryPlan,
+) -> bool {
+    blob_servable(plan)
+        && plan.union_branches.iter().all(blob_servable)
+        && cache_shaped(q, plan)
+        && from_names_one_class(q)
+        && q.union_branches.iter().all(from_names_one_class)
+}
+
+/// True when the FROM names exactly ONE class: no `INSTANCEOF`, no quoted regex,
+/// no `pkg.*` package glob.
+///
+/// The blob path costs one `seek` + read per *candidate* object, so its price is
+/// set by how many objects the FROM gate accepts. A single class bounds that —
+/// even `java.lang.String`'s tens of millions of instances cost far less than
+/// the 44 GB re-scan (which also re-runs the pipeline) this path replaces. A
+/// pattern that accepts essentially everything, e.g.
+/// `SELECT s.x FROM INSTANCEOF java.lang.Object s WHERE s.y = 1` with no LIMIT,
+/// would instead cost one random read per object in the heap — worse than the
+/// rescan it exists to avoid. Those stay on the refuse/scan path, exactly as
+/// before.
+fn from_names_one_class(q: &crate::query::ast::Query) -> bool {
+    match q.from.class_spec() {
+        Some(spec) => {
+            !spec.instanceof
+                && !spec.is_regex
+                && !spec.class_name.ends_with(".*")
+                && !spec.class_name.ends_with("/*")
+        }
+        None => false,
+    }
+}
+
+/// The per-plan half of [`blob_cache_eligible`]: the plan wants an instance
+/// field blob and nothing else the resident cache cannot supply.
+///
+/// Mirrors `QueryPlan::is_resident_only()` exactly, except that the two blob
+/// needs are *required* rather than forbidden.
+fn blob_servable(plan: &crate::query::plan::QueryPlan) -> bool {
+    let n = &plan.needs;
+    let cross_phase =
+        n.retained || n.dominator_children || n.ref_walk || n.string_values || n.gc_roots;
+    (n.instance_scalar || n.instance_string) && !cross_phase
+}
+
 /// The structural half of [`cache_eligible`]: a concrete, non-array class FROM
 /// with no subqueries, in the head and in every union branch (paired positionally
 /// against `q.union_branches`, which `optimize` preserves). Says **nothing** about
@@ -5393,16 +5452,27 @@ fn run_one(
     // it can actually be used. An array/class-object target falls back to the
     // scan path, which is why the exclusion existed.
     let object_from = object_from_shaped(&q, &plan);
-    let mut results = if eligible || object_from {
+    // Field-reading queries (`SELECT s.name FROM …`) arm `needs.instance_scalar`,
+    // which `cache_eligible` rejects — but they ARE servable from the warm cache
+    // when it carries the dump's `offsets` table (each candidate object's blob is
+    // then one `seek`). Same shape as the server's routing; see
+    // `blob_cache_eligible`.
+    let blob = blob_cache_eligible(&q, &plan);
+    let mut results = if eligible || object_from || blob {
         // Lazily build the cache in the session's current mode on first use. If a
         // cache already exists but was built for the OTHER reachability mode
         // (user toggled !all/!reachable), don't rebuild mid-session (v1: avoid
         // churn) — fall back to the scan path for this one query instead.
         if cache.is_none() {
-            *cache = Some(crate::query::run::ReplCache::build(
+            let mut c = crate::query::run::ReplCache::build(
                 &crate::source::HprofSource::from(path),
                 reachable_only,
-            )?);
+            )?;
+            // Only pay for the offsets table (8 B/object) when this query needs it.
+            if blob {
+                c.attach_offsets_from_dump(std::path::Path::new(path));
+            }
+            *cache = Some(c);
             writeln!(
                 out,
                 "(warm cache built — resident-only queries now skip the heap scan)"
@@ -5411,7 +5481,9 @@ fn run_one(
         let resident = match &*cache {
             Some(c) => {
                 c.reachable_only == reachable_only
-                    && (eligible || object_from_resident_ok(c, &q, &plan))
+                    && (eligible
+                        || object_from_resident_ok(c, &q, &plan)
+                        || (blob && c.offsets.is_some()))
             }
             None => false,
         };
