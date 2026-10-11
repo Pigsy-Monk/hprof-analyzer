@@ -2334,11 +2334,13 @@ fn refwalk_primitive_tail_returns_real_values_via_analyze_path() {
 }
 
 /// A RefWalk query whose tail is an OBJECT reference (`s.value`, where a
-/// `String`'s `value` is a backing `byte[]`/`char[]`) is a two-level deref that
-/// this slice does not resolve: it must project `Null` (documented limitation),
-/// NOT crash and NOT error. The run must still succeed and render the section.
+/// `String`'s `value` is a backing `byte[]`/`char[]`) is a two-level deref: it
+/// projects the referenced object as a ref (rendered `?@<addr>` — the class
+/// name is `?` because pass 1 packs an array kind tag into `class_ids`, so an
+/// array referent is deliberately not named). It must NOT crash and NOT error.
+/// The run must still succeed and render the section.
 #[test]
-fn refwalk_object_ref_tail_projects_null_without_crashing() {
+fn refwalk_object_ref_tail_projects_a_ref_without_crashing() {
     let Some(hprof) = philosophers() else { return };
     let out = Command::new(BIN)
         .arg(&hprof)
@@ -2361,11 +2363,16 @@ fn refwalk_object_ref_tail_projects_null_without_crashing() {
         !section.contains("**Error:**"),
         "object-ref-tail RefWalk rendered an error block (should be Null, not error):\n{section}"
     );
-    // The `value` column exists and its cells are `null` (object-ref tail is not
-    // resolved in this slice), but the query did not crash or error.
+    // The `value` column exists and its cells are refs (object-ref tail resolves
+    // to the referent), and the query did not crash or error.
     assert!(
         section.contains("| value |") || section.contains("value"),
         "object-ref-tail RefWalk column header missing:\n{section}"
+    );
+    let has_ref_cell = section.lines().any(|l| l.contains('@'));
+    assert!(
+        has_ref_cell,
+        "object-ref-tail RefWalk projected no ref cell (regressed to null?):\n{section}"
     );
 }
 
