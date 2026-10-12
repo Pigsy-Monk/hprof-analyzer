@@ -696,7 +696,12 @@ mod tests {
         let fwd_off = vec![0u32, 2, 3, 4, 4];
         let fwd_tgt = make_fwd_tgt(vec![1u32, 2, 3, 3]);
         let roots = vec![0u32];
-        let mut rpo = rpo_dfs(4, &roots, &fwd_off, &fwd_tgt);
+        let mut rpo = rpo_dfs(
+            4,
+            &roots,
+            &fwd_off,
+            crate::chunkvec::TgtView::Chunked(&fwd_tgt),
+        );
         rpo.vertex = rebuild_vertex(&rpo.dfn, rpo.parent_pre.len());
         // inbound: node1←[0], node2←[0], node3←[1,2]
         let preds = vec![vec![], vec![0u32], vec![0u32], vec![1u32, 2u32]];
@@ -714,7 +719,12 @@ mod tests {
         let fwd_off = vec![0u32, 1, 2, 2];
         let fwd_tgt = make_fwd_tgt(vec![1u32, 2u32]);
         let roots = vec![0u32];
-        let mut rpo = rpo_dfs(3, &roots, &fwd_off, &fwd_tgt);
+        let mut rpo = rpo_dfs(
+            3,
+            &roots,
+            &fwd_off,
+            crate::chunkvec::TgtView::Chunked(&fwd_tgt),
+        );
         rpo.vertex = rebuild_vertex(&rpo.dfn, rpo.parent_pre.len());
         let preds = vec![vec![], vec![0u32], vec![1u32]];
         let (inb_offsets, inb_data) = build_inb(3, &preds, &rpo.dfn);
@@ -737,7 +747,12 @@ mod tests {
         let roots = vec![0u32];
 
         let run = |preds: Vec<Vec<u32>>| {
-            let mut rpo = rpo_dfs(3, &roots, &fwd_off, &fwd_tgt);
+            let mut rpo = rpo_dfs(
+                3,
+                &roots,
+                &fwd_off,
+                crate::chunkvec::TgtView::Chunked(&fwd_tgt),
+            );
             rpo.vertex = rebuild_vertex(&rpo.dfn, rpo.parent_pre.len());
             let (o, d) = build_inb(3, &preds, &rpo.dfn);
             compute_dominators(3, rpo, &roots, &o, &d)
@@ -765,7 +780,12 @@ mod tests {
         let fwd_off = vec![0u32, 0, 0];
         let fwd_tgt = make_fwd_tgt(vec![]);
         let roots = vec![0u32, 1u32];
-        let mut rpo = rpo_dfs(2, &roots, &fwd_off, &fwd_tgt);
+        let mut rpo = rpo_dfs(
+            2,
+            &roots,
+            &fwd_off,
+            crate::chunkvec::TgtView::Chunked(&fwd_tgt),
+        );
         rpo.vertex = rebuild_vertex(&rpo.dfn, rpo.parent_pre.len());
         let preds = vec![vec![], vec![]];
         let (inb_offsets, inb_data) = build_inb(2, &preds, &rpo.dfn);
@@ -783,7 +803,12 @@ mod tests {
         let fwd_off = vec![0u32, 2, 4, 5, 5];
         let fwd_tgt = make_fwd_tgt(vec![1u32, 2, 2, 3, 3]);
         let roots = vec![0u32];
-        let mut rpo = rpo_dfs(4, &roots, &fwd_off, &fwd_tgt);
+        let mut rpo = rpo_dfs(
+            4,
+            &roots,
+            &fwd_off,
+            crate::chunkvec::TgtView::Chunked(&fwd_tgt),
+        );
         rpo.vertex = rebuild_vertex(&rpo.dfn, rpo.parent_pre.len());
         // inbound: 1←[0], 2←[0,1], 3←[1,2]
         let preds = vec![vec![], vec![0u32], vec![0u32, 1u32], vec![1u32, 2u32]];
@@ -815,7 +840,12 @@ mod tests {
         fwd_off[n] = fwd_tgt_raw.len() as u32;
         let fwd_tgt = make_fwd_tgt(fwd_tgt_raw.clone());
         let roots = vec![0u32];
-        let mut rpo = rpo_dfs(n, &roots, &fwd_off, &fwd_tgt);
+        let mut rpo = rpo_dfs(
+            n,
+            &roots,
+            &fwd_off,
+            crate::chunkvec::TgtView::Chunked(&fwd_tgt),
+        );
         rpo.vertex = rebuild_vertex(&rpo.dfn, rpo.parent_pre.len());
         // inbound: node i (i>=1) has predecessor i-1
         let mut preds = vec![Vec::new(); n];
@@ -826,7 +856,12 @@ mod tests {
 
         // Sanity: uncorrupted run is correct.
         let fwd_tgt2 = make_fwd_tgt(fwd_tgt_raw.clone());
-        let mut rpo2 = rpo_dfs(n, &roots, &fwd_off, &fwd_tgt2);
+        let mut rpo2 = rpo_dfs(
+            n,
+            &roots,
+            &fwd_off,
+            crate::chunkvec::TgtView::Chunked(&fwd_tgt2),
+        );
         rpo2.vertex = rebuild_vertex(&rpo2.dfn, rpo2.parent_pre.len());
         let idom_good = compute_dominators(n, rpo2, &roots, &good_off, &inb_data).unwrap();
         for i in 1..n {
@@ -837,7 +872,12 @@ mod tests {
         let mut bad_off = good_off.clone();
         bad_off[1] = bad_off[1].wrapping_add(1); // shift into the middle of a vbyte
         let fwd_tgt3 = make_fwd_tgt(fwd_tgt_raw);
-        let mut rpo3 = rpo_dfs(n, &roots, &fwd_off, &fwd_tgt3);
+        let mut rpo3 = rpo_dfs(
+            n,
+            &roots,
+            &fwd_off,
+            crate::chunkvec::TgtView::Chunked(&fwd_tgt3),
+        );
         rpo3.vertex = rebuild_vertex(&rpo3.dfn, rpo3.parent_pre.len());
         let idom_rec = compute_dominators(n, rpo3, &roots, &bad_off, &inb_data).unwrap();
         for i in 1..n {
@@ -860,7 +900,12 @@ mod tests {
         let fwd_off = vec![0u32, 1, 2, 2, 3];
         let fwd_tgt = make_fwd_tgt(vec![2u32, 3u32, 2u32]); // A→S, C→D, D→S
         let roots = vec![0u32, 1u32]; // A and C are GC roots
-        let mut rpo = rpo_dfs(4, &roots, &fwd_off, &fwd_tgt);
+        let mut rpo = rpo_dfs(
+            4,
+            &roots,
+            &fwd_off,
+            crate::chunkvec::TgtView::Chunked(&fwd_tgt),
+        );
         rpo.vertex = rebuild_vertex(&rpo.dfn, rpo.parent_pre.len());
         // inbound: S←[A, D], D←[C]
         let preds = vec![vec![], vec![], vec![0u32, 3u32], vec![1u32]];

@@ -54,7 +54,7 @@ pub fn rpo_dfs(
     n: usize,
     roots: &[u32],
     fwd_off: &[u32],
-    fwd_tgt: &crate::chunkvec::ChunkU32,
+    fwd_tgt: crate::chunkvec::TgtView<'_>,
 ) -> RpoResult {
     let vroot = n as u32;
 
@@ -167,7 +167,7 @@ pub fn rpo_dfs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chunkvec::ChunkU32;
+    use crate::chunkvec::{ChunkU32, TgtView};
 
     fn make_fwd_tgt(v: Vec<u32>) -> ChunkU32 {
         let mut c = ChunkU32::zeroed(v.len());
@@ -182,7 +182,7 @@ mod tests {
         // 0→{1,2}, 1→3, 2→3; roots=[0]
         let fwd_off = vec![0u32, 2, 3, 4, 4];
         let fwd_tgt = make_fwd_tgt(vec![1u32, 2, 3, 3]);
-        let r = rpo_dfs(4, &[0u32], &fwd_off, &fwd_tgt);
+        let r = rpo_dfs(4, &[0u32], &fwd_off, TgtView::Chunked(&fwd_tgt));
         // All 4 nodes reachable → each has a real pre-order number.
         for v in 0..4usize {
             assert_ne!(r.dfn[v], u32::MAX, "node {v} must be reachable");
@@ -200,7 +200,7 @@ mod tests {
         // 0→1; node 2 unreachable; roots=[0]
         let fwd_off = vec![0u32, 1, 1, 1];
         let fwd_tgt = make_fwd_tgt(vec![1u32]);
-        let r = rpo_dfs(3, &[0u32], &fwd_off, &fwd_tgt);
+        let r = rpo_dfs(3, &[0u32], &fwd_off, TgtView::Chunked(&fwd_tgt));
         // nodes 0,1 reachable; node 2 unreachable (no DFS number).
         assert_ne!(r.dfn[0], u32::MAX);
         assert_ne!(r.dfn[1], u32::MAX);

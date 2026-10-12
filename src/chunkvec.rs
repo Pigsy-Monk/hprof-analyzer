@@ -151,3 +151,54 @@ impl ChunkU32 {
         self.chunks.iter().filter(|c| !c.is_empty()).map(|c| &c[..])
     }
 }
+
+/// Read-only view over a forward-target array, for the readers that do not care
+/// how it is stored.
+///
+/// The two representations exist for different reasons: the pipeline builds a
+/// [`ChunkU32`] because it scatter-fills the array and then frees chunks as the
+/// read cursor passes them, while the from-cache path (`mat caches` with
+/// `HPROF_MAT_USE_CACHE=1`) already holds a flat `Vec<u32>` decoded off
+/// `graph.bin` — and that flat array is needed verbatim by the outbound emit
+/// later, so it cannot be dropped in favour of a chunked copy.
+///
+/// Building the chunked copy anyway cost a full second array: 9.3 GB of
+/// duplicate on the 44 GB dump, held across the `rpo_dfs` /
+/// `unreachable_retained` window, which is where the from-cache path's ~52 GiB
+/// peak came from. Both readers only ever call [`get`](Self::get) and
+/// [`range_slice`](Self::range_slice), so this enum lets each path hand them
+/// whichever form it already has.
+#[derive(Clone, Copy)]
+// The lib and the bin each compile their own copy of this module tree; the lib
+// only ever builds `Chunked` (the from-cache path lives in the binary), so
+// `Flat` would otherwise warn as unconstructed there.
+#[allow(dead_code)]
+pub enum TgtView<'a> {
+    /// A contiguous `Vec<u32>`/slice (from-cache path).
+    Flat(&'a [u32]),
+    /// A chunked store (pipeline path).
+    Chunked(&'a ChunkU32),
+}
+
+impl TgtView<'_> {
+    /// Value at `idx`. Panics on out-of-range, like indexing a slice.
+    #[inline(always)]
+    pub fn get(&self, idx: usize) -> u32 {
+        match self {
+            TgtView::Flat(s) => s[idx],
+            TgtView::Chunked(c) => c.get(idx),
+        }
+    }
+
+    /// Contiguous slice for `[start, end)` when one exists, else `None` (caller
+    /// falls back to per-element [`get`](Self::get)). A flat slice always
+    /// satisfies the request; a chunked store only when the range stays inside
+    /// one chunk.
+    #[inline(always)]
+    pub fn range_slice(&self, start: usize, end: usize) -> Option<&[u32]> {
+        match self {
+            TgtView::Flat(s) => s.get(start..end),
+            TgtView::Chunked(c) => c.range_slice(start, end),
+        }
+    }
+}

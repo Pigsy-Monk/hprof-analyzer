@@ -34,7 +34,7 @@
 //! resulting dominator tree in a single post-order, exactly like
 //! [`crate::retained`] does for the reachable graph.
 
-use crate::chunkvec::ChunkU32;
+use crate::chunkvec::TgtView;
 use crate::cvec::CompressedU32;
 use crate::report::UnreachableGarbageRoot;
 use std::collections::HashMap;
@@ -81,7 +81,7 @@ pub fn compute_unreachable_retained(
     n: usize,
     dfn: &[u32],
     fwd_off: &[u32],
-    fwd_tgt: &ChunkU32,
+    fwd_tgt: TgtView<'_>,
     shallow_c: &CompressedU32,
     class_idx_c: &CompressedU32,
     class_count: usize,
@@ -656,6 +656,7 @@ fn push_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chunkvec::ChunkU32;
 
     fn cvec(v: &[u32]) -> CompressedU32 {
         CompressedU32::compress(v, crate::cvec::Codec::None).unwrap()
@@ -677,7 +678,7 @@ mod tests {
             n,
             &dfn,
             &fwd_off,
-            &fwd_tgt,
+            TgtView::Chunked(&fwd_tgt),
             &shallow,
             &class_idx,
             4,
@@ -713,7 +714,7 @@ mod tests {
             n,
             &dfn,
             &fwd_off,
-            &fwd_tgt,
+            TgtView::Chunked(&fwd_tgt),
             &shallow,
             &class_idx,
             2,
@@ -739,7 +740,7 @@ mod tests {
             n,
             &dfn,
             &fwd_off,
-            &fwd_tgt,
+            TgtView::Chunked(&fwd_tgt),
             &shallow,
             &class_idx,
             1,

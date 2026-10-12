@@ -2175,7 +2175,12 @@ fn analyze_to_report_inner(
     inbound.compress_id_map(compress)?;
 
     progress::phase("ordering objects (reverse post-order)");
-    let rpo = rpo_dfs::rpo_dfs(g.n, &g.gc_root_indices, &g.fwd_offsets, &g.fwd_targets);
+    let rpo = rpo_dfs::rpo_dfs(
+        g.n,
+        &g.gc_root_indices,
+        &g.fwd_offsets,
+        crate::chunkvec::TgtView::Chunked(&g.fwd_targets),
+    );
     t_pipe!("rpo done");
 
     progress::phase("retained size (unreachable forest)");
@@ -2184,7 +2189,7 @@ fn analyze_to_report_inner(
             g.n,
             &rpo.dfn,
             &g.fwd_offsets,
-            &g.fwd_targets,
+            crate::chunkvec::TgtView::Chunked(&g.fwd_targets),
             &shallow_c,
             &class_idx_c,
             g.class_names.len(),
@@ -3672,7 +3677,12 @@ fn run_queries(input: &str, opts: AnalyzeOptions, json_out: bool) -> io::Result<
         // projected `@objectAddress` (a raw heap address) prunes by the EXACT
         // source dense index rather than a lossy re-read. Skipped under --all.
         let rpo = opts.reachable_only.then(|| {
-            crate::rpo_dfs::rpo_dfs(g.n, &g.gc_root_indices, &g.fwd_offsets, &g.fwd_targets)
+            crate::rpo_dfs::rpo_dfs(
+                g.n,
+                &g.gc_root_indices,
+                &g.fwd_offsets,
+                crate::chunkvec::TgtView::Chunked(&g.fwd_targets),
+            )
         });
         let flat_results = query::run::resume_with_string_values(
             query_state,
@@ -3881,15 +3891,12 @@ struct MatCached {
     fwd_off: Vec<u32>,
     /// Forward edge targets, `fwd_off[n]` entries, in the cache's delta+zstd form
     /// already decoded.
+    ///
+    /// This is the only large array read up front. It is needed by `rpo_dfs` /
+    /// `unreachable_retained` (both near the start of the run) *and* verbatim by
+    /// the outbound emit near the end, so it cannot be swapped for a chunked copy
+    /// or re-read — see `graph_from_mat_cache`.
     fwd_tgt: Vec<u32>,
-    inb_block_off: Vec<u64>,
-    inb_data: Vec<u8>,
-    /// Immediate dominator per object, dense-id space, plus the virtual root at
-    /// index `n` — `n + 1` entries, the shape `compute_dominators` returns.
-    idom: Vec<u32>,
-    /// Dominator-children CSR, `n + 2` rows (the last is the virtual root).
-    dc_off: Vec<u32>,
-    dc_tgt: Vec<u32>,
 }
 
 /// Load the graph-level cache entries `mat caches` needs.
@@ -3897,7 +3904,28 @@ struct MatCached {
 /// Returns `Ok(None)` — never an error — whenever the cache is absent,
 /// incomplete, or does not describe this heap, so the caller falls back to the
 /// full pipeline. A missing cache is the normal first-run case, not a failure.
-fn load_mat_cache(input: &str, p1: &pass1::Pass1) -> io::Result<Option<MatCached>> {
+///
+/// Only `fwd_off` and `fwd_tgt` come back materialised; the rest of the graph
+/// cache is validated here and then re-read at its point of use through the
+/// returned [`cache::CacheDir`] (see the body for why).
+fn load_mat_cache(
+    input: &str,
+    p1: &pass1::Pass1,
+) -> io::Result<Option<(MatCached, cache::CacheDir)>> {
+    // Fine-grained RSS attribution for the from-cache path. `--trace-rss` /
+    // `HPROF_TRACE_RSS` already print the coarse `[trace-rss] <stage>` lines; these
+    // split the ~28 GB the from-cache window adds into per-array contributions,
+    // and the `alloc` lines report each array's size so a run that dies before
+    // the end (the from-cache peak does not fit a 32 GiB box) still attributes
+    // every array it got through.
+    macro_rules! tinfo {
+        ($($arg:tt)*) => {
+            if crate::trace::enabled() {
+                eprintln!("[trace-rss] {}", format!($($arg)*));
+            }
+        };
+    }
+    crate::trace::probe("load_mat_cache: enter");
     let cache = cache::CacheDir::for_dump(std::path::Path::new(input))?;
     if !cache.is_valid(cache::CacheMode::Graph) {
         eprintln!("hprof-cache: no usable graph cache next to the dump; running the full pipeline");
@@ -3912,6 +3940,13 @@ fn load_mat_cache(input: &str, p1: &pass1::Pass1) -> io::Result<Option<MatCached
         eprintln!("hprof-cache: graph cache has no fwd_off; running the full pipeline");
         return Ok(None);
     };
+    tinfo!(
+        "load_mat_cache: read fwd_off n={} rows={} = {} MB",
+        n,
+        fwd_off.len(),
+        fwd_off.len() * 4 / (1024 * 1024)
+    );
+    crate::trace::probe("load_mat_cache: after read_forward_offsets");
     if fwd_off.len() != n + 1 {
         eprintln!(
             "hprof-cache: graph cache covers {} objects but this dump has {n}; \
@@ -3925,14 +3960,48 @@ fn load_mat_cache(input: &str, p1: &pass1::Pass1) -> io::Result<Option<MatCached
         eprintln!("hprof-cache: graph cache has no usable fwd_tgt; running the full pipeline");
         return Ok(None);
     };
+    tinfo!(
+        "load_mat_cache: read fwd_tgt flat total_edges={total_edges} = {} MB",
+        total_edges * 4 / (1024 * 1024)
+    );
+    crate::trace::probe("load_mat_cache: after read_forward_targets (fwd_tgt flat resident)");
+    // ── Validate the remaining entries, then DROP them ───────────────────────
+    // They are re-read at their point of use (see the `mat_reused` branches at
+    // the dominator stage, the idom compress and the dominator-children build).
+    //
+    // They used to be returned and held for the whole run. On the 44 GB dump
+    // that is ~12 GB of arrays (inbound body + idom + dominator children) live
+    // from here to the end, stacked on top of the 8.9 GB forward targets and a
+    // ~15 GB pass-1 baseline — which is why the from-cache path peaked at
+    // ~52 GiB and was killed by the OOM killer on a 32 GiB box, *inside this
+    // function*, before it ever reached the graph build.
+    //
+    // The read-and-drop keeps the "unusable cache falls back to the pipeline"
+    // contract: the shapes are still checked before the from-cache path is
+    // committed to. Re-reading them costs one extra pass over ~12 GB of cache
+    // (page-cache resident) and buys ~12 GB of peak.
     let Some((inb_block_off, inb_data)) = cache.read_inbound_blocks()? else {
         eprintln!("hprof-cache: graph cache has no inbound CSR; running the full pipeline");
         return Ok(None);
     };
+    tinfo!(
+        "load_mat_cache: inb_block_off blocks={} = {} MB, inb_data = {} MB (validated, dropped)",
+        inb_block_off.len(),
+        inb_block_off.len() * 8 / (1024 * 1024),
+        inb_data.len() / (1024 * 1024)
+    );
+    drop(inb_block_off);
+    crate::trace::drop_vec(inb_data);
+    crate::trace::probe("load_mat_cache: after read_inbound_blocks (validated, dropped)");
     let Some(idom) = cache.read_idom()? else {
         eprintln!("hprof-cache: graph cache has no idom; running the full pipeline");
         return Ok(None);
     };
+    tinfo!(
+        "load_mat_cache: idom len={} = {} MB (validated, dropped)",
+        idom.len(),
+        idom.len() * 4 / (1024 * 1024)
+    );
     // `compute_dominators` returns `n + 1` entries: objects 0..n-1 plus the
     // virtual root at index `n` (see `dominator.rs`'s "Indexing convention").
     // Comparing against `n` here made this check false for every cache ever
@@ -3946,10 +4015,17 @@ fn load_mat_cache(input: &str, p1: &pass1::Pass1) -> io::Result<Option<MatCached
         );
         return Ok(None);
     }
+    crate::trace::drop_vec(idom);
     let Some((dc_off, dc_tgt)) = cache.read_dominator_children()? else {
         eprintln!("hprof-cache: graph cache has no dominator children; running the full pipeline");
         return Ok(None);
     };
+    tinfo!(
+        "load_mat_cache: dc_off rows={} = {} MB, dc_tgt = {} MB (validated, dropped)",
+        dc_off.len(),
+        dc_off.len() * 4 / (1024 * 1024),
+        dc_tgt.len() * 4 / (1024 * 1024)
+    );
     // `build_dom_children_csr` emits one row per object plus the virtual root.
     if dc_off.len() != n + 2 || dc_tgt.len() != dc_off[n + 1] as usize {
         eprintln!(
@@ -3960,15 +4036,10 @@ fn load_mat_cache(input: &str, p1: &pass1::Pass1) -> io::Result<Option<MatCached
         );
         return Ok(None);
     }
-    Ok(Some(MatCached {
-        fwd_off,
-        fwd_tgt,
-        inb_block_off,
-        inb_data,
-        idom,
-        dc_off,
-        dc_tgt,
-    }))
+    drop(dc_off);
+    crate::trace::drop_vec(dc_tgt);
+    crate::trace::probe("load_mat_cache: exit (fwd_off + fwd_tgt only)");
+    Ok(Some((MatCached { fwd_off, fwd_tgt }, cache)))
 }
 
 /// Build the `Graph` (plus the cold blobs and empty query state) that the rest
@@ -4005,8 +4076,11 @@ fn graph_from_mat_cache(
 )> {
     // The pass-1-derived tables: same code `Pass2::build` runs, so the class
     // histogram, GC roots, thread stacks and synthetic edges cannot drift.
-    let ct = pass2::Pass2::class_tables(&p1);
+    crate::trace::probe("graph_from_mat_cache: enter (cache arrays resident)");
+    let mut ct = pass2::Pass2::class_tables(&p1);
+    crate::trace::probe("graph_from_mat_cache: after class_tables");
     let ge = pass2::Pass2::graph_extras(&p1, &ct.class_loader_id, ct.ref_size, opts);
+    crate::trace::probe("graph_from_mat_cache: after graph_extras");
 
     // The same cold codec `Pass2::build` uses for these two arrays.
     #[cfg(feature = "native")]
@@ -4016,6 +4090,17 @@ fn graph_from_mat_cache(
     let class_idx_c = cvec::CompressedU32::compress(&ct.class_idx, cold)?;
     let shallow_c = cvec::CompressedU32::compress(&ct.shallow, cold)?;
     let alloc_serial_c = Some(cvec::CompressedU32::compress(&p1.alloc_stack_serial, cold)?);
+    // Mirror `Pass2::build`: once the compressed blobs exist the dense arrays are
+    // dead weight, and keeping them here held a second, uncompressed copy of both
+    // (~2 x n x 4 B, ~5.6 GB on the 44 GB dump) across the whole rpo/dominator
+    // window. Everything downstream restores from `shallow_c`/`class_idx_c` when
+    // it needs them (see the restore before `compute_retained`), which is exactly
+    // what the pipeline path does — there `g.shallow`/`g.class_idx` are empty.
+    if cold != cvec::Codec::None {
+        crate::trace::drop_vec(std::mem::take(&mut ct.shallow));
+        crate::trace::drop_vec(std::mem::take(&mut ct.class_idx));
+    }
+    crate::trace::probe("graph_from_mat_cache: after compress class_idx/shallow (dense dropped)");
 
     let n = p1.id_map.len();
     let source_name = source.display_name().to_string();
@@ -4030,15 +4115,20 @@ fn graph_from_mat_cache(
         ..
     } = p1;
     let inbound = pass2::InboundBuilder::empty(source.clone(), id_size, n);
-    // `rpo_dfs` and `unreachable_retained` take the CSR as a chunked store, so
-    // the flat targets the cache handed us are copied into one here. The flat
-    // copy is returned to the caller (the outbound emit needs it) and the
-    // chunked one is dropped right after those two stages.
+    // `rpo_dfs` and `unreachable_retained` take the CSR through a `TgtView`,
+    // which reads either representation, so the flat targets the cache handed us
+    // are passed straight through — no chunked copy is built.
+    //
+    // MEMORY: the copy used to be built here (a full second array, 9.3 GB on the
+    // 44 GB dump) and both copies stayed live through the rpo/unreachable window,
+    // because the flat one cannot be dropped — the outbound emit needs it
+    // verbatim. That duplicate was the single largest avoidable allocation on the
+    // from-cache path. The pipeline builds only the chunked form here and
+    // materialises its flat copy much later, after `rpo_dfs` /
+    // `unreachable_retained` have released the chunked one; handing the readers a
+    // flat slice gives the from-cache path the same one-array property.
     let fwd_tgt_flat = c.fwd_tgt;
-    let mut fwd_targets = crate::chunkvec::ChunkU32::zeroed(fwd_tgt_flat.len());
-    for (i, &v) in fwd_tgt_flat.iter().enumerate() {
-        fwd_targets.set(i, v);
-    }
+    crate::trace::probe("graph_from_mat_cache: flat fwd_tgt kept (no chunked duplicate built)");
     let g = pass2::Graph::from_cached(pass2::CachedGraphParts {
         n,
         format,
@@ -4062,12 +4152,15 @@ fn graph_from_mat_cache(
         class_obj_class_idx: ct.class_obj_class_idx,
         jlc_idx: ct.jlc_idx,
         fwd_offsets: c.fwd_off,
-        fwd_targets,
+        // Empty: this path's targets stay flat (see above), and the two readers
+        // that would have wanted the chunked form take the flat slice instead.
+        fwd_targets: crate::chunkvec::ChunkU32::default(),
         synthetic_root_count: ge.synthetic_root_count,
         system_classloader_shallow: ge.system_classloader_shallow,
-        idom: c.idom,
+        idom: Vec::new(),
         alloc_stack_serial: Vec::new(),
     });
+    crate::trace::probe("graph_from_mat_cache: after Graph::from_cached (before return)");
     Ok((
         g,
         inbound,
@@ -4113,7 +4206,7 @@ fn run(
     let t = Instant::now();
     progress::phase("scanning dump (pass 1)");
     let source = crate::source::HprofSource::from(input);
-    let p1 = match pass1::Pass1::run(&source, mat.is_some()) {
+    let mut p1 = match pass1::Pass1::run(&source, mat.is_some()) {
         Ok(p1) => p1,
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof && could_be_truncated_hprof(input) => {
             // File ended before or during the HPROF header — too truncated to
@@ -4233,6 +4326,14 @@ fn run(
     } else {
         None
     };
+    // `p1.hprof_offsets` (~4.9 GB on the 44 GB dump) has been folded into
+    // `mat_hprof_offsets_c` above and is not read again on the MAT path (pass 2
+    // and `graph_from_mat_cache` both drop it through their `..` destructuring).
+    // Freeing it now instead of at that destructuring takes it out of the
+    // from-cache path's load window, which is where the peak is set.
+    if mat.is_some() {
+        crate::trace::drop_vec(std::mem::take(&mut p1.hprof_offsets));
+    }
     // ── MAT from-cache fast path ─────────────────────────────────────────
     // `mat caches` used to re-run the whole pipeline even when a
     // `heap load --with-graph` cache sat next to the dump. Try the cache first;
@@ -4254,36 +4355,27 @@ fn run(
     // Until the three emitters are shown identical, a wrong index is worse than a
     // slow one: keep the default on the pipeline and require `HPROF_MAT_USE_CACHE=1`
     // to exercise the cached path.
-    let mut mat_cached: Option<MatCached> = if mat.is_some()
+    let (mut mat_cached, mat_cache_dir): (Option<MatCached>, Option<cache::CacheDir>) = if mat
+        .is_some()
         && std::env::var_os("HPROF_MAT_NO_CACHE").is_none()
         && std::env::var_os("HPROF_MAT_USE_CACHE").is_some()
     {
         match load_mat_cache(input, &p1) {
-            Ok(c) => c,
+            Ok(Some((c, dir))) => (Some(c), Some(dir)),
+            Ok(None) => (None, None),
             Err(e) => {
                 eprintln!("hprof-cache: {e}; running the full pipeline");
-                None
+                (None, None)
             }
         }
     } else {
-        None
+        (None, None)
     };
     // Sticky for the rest of the function: `mat_cached` is moved into the graph
     // builder below, but every later guard still needs to know which path ran.
     let mat_reused = mat_cached.is_some();
-    // The inbound CSR and the dominator-children CSR are consumed far below
-    // (after the dominator stage), so move them out of the cache bundle here
-    // rather than carrying them inside it.
-    let (cached_inb_block_off, cached_inb_data, cached_dc_off, cached_dc_tgt) =
-        match mat_cached.as_mut() {
-            Some(c) => (
-                std::mem::take(&mut c.inb_block_off),
-                std::mem::take(&mut c.inb_data),
-                std::mem::take(&mut c.dc_off),
-                std::mem::take(&mut c.dc_tgt),
-            ),
-            None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
-        };
+    // The deferred cache reads (inbound body, idom, dominator children) go
+    // through `mat_cache_dir` at their point of use.
     if mat_reused {
         eprintln!(
             "mat caches: reusing the graph cache next to the dump \
@@ -4388,8 +4480,10 @@ fn run(
             .or(inbound.id_map.as_ref())
             .expect("id_map must be live before compress_id_map for MAT idx emit");
         let addrs: Vec<u64> = (0..g.n).map(|i| id_map.addr_at(i)).collect();
+        crate::trace::probe("main: after MAT addrs Vec<u64> snapshot (8*n bytes)");
         let coc_snap = g.class_obj_class_idx.clone();
         let addrs_c = cvec::CompressedU64::compress(&addrs, compress)?;
+        crate::trace::probe("main: after MAT addrs compress + coc_snap clone");
         (Some(coc_snap), Some(addrs_c))
     } else {
         (None, None)
@@ -4410,7 +4504,16 @@ fn run(
     crate::trace::probe("main: after compress_id_map (before rpo_dfs)");
     let t = Instant::now();
     progress::phase("ordering objects (reverse post-order)");
-    let rpo = rpo_dfs::rpo_dfs(g.n, &g.gc_root_indices, &g.fwd_offsets, &g.fwd_targets);
+    // From-cache path: the flat target array decoded off `graph.bin` IS the
+    // forward CSR for these two readers — it is needed verbatim by the outbound
+    // emit far below, so it cannot be replaced by a chunked copy. Hand them the
+    // flat slice instead of building a second, chunked, copy of the same array.
+    let rpo_tgt = if mat_reused {
+        crate::chunkvec::TgtView::Flat(&mat_cached_fwd_tgt)
+    } else {
+        crate::chunkvec::TgtView::Chunked(&g.fwd_targets)
+    };
+    let rpo = rpo_dfs::rpo_dfs(g.n, &g.gc_root_indices, &g.fwd_offsets, rpo_tgt);
     crate::trace::probe("main: after rpo_dfs (before compress parent_pre)");
     log(verbose, "rpo", t.elapsed().as_secs_f64());
     t_dark!("rpo_dfs done");
@@ -4433,7 +4536,7 @@ fn run(
             g.n,
             &rpo.dfn,
             &g.fwd_offsets,
-            &g.fwd_targets,
+            rpo_tgt,
             &shallow_c,
             &class_idx_c,
             g.class_names.len(),
@@ -4445,12 +4548,10 @@ fn run(
         crate::trace::trim();
     }
     t_dark!("unreachable_retained done");
-    // From-cache path: `rpo_dfs` and `unreachable_retained` are the last readers
-    // of the chunked forward targets (the emit phase uses the flat copy the
-    // cache handed us), so free the ~9 GB chunked duplicate now.
-    if mat_reused {
-        g.fwd_targets = crate::chunkvec::ChunkU32::default();
-    }
+    // From-cache path: `rpo_dfs` and `unreachable_retained` were the only readers
+    // of the forward targets, and they read the flat array (see `rpo_tgt`); the
+    // chunked form was never built, so `g.fwd_targets` is already empty here and
+    // the emit phase uses the flat copy the cache handed us.
 
     // Compress parent_pre (~2 GB dense) between RPO and inbound to reduce
     // the peak during the transpose loop. parent_pre is not needed until
@@ -4699,7 +4800,10 @@ fn run(
     let (inb_block_off, inb_data) = if mat_reused {
         drop(std::mem::take(&mut g.fwd_offsets));
         t_dark!("fwd CSR dropped (mat from-cache path)");
-        (cached_inb_block_off, cached_inb_data)
+        // Filled in by the deferred read at the dominator stage below. Holding
+        // the ~5.6 GB inbound body from here (or from `load_mat_cache`, as it
+        // used to) is what made the from-cache peak exceed a 32 GiB box.
+        (Vec::new(), Vec::new())
     } else if mat.is_some() {
         // Drop fwd_targets BEFORE calling build_mat_scan so that inb_flat
         // allocation (6 GB) does not coexist with fwd_targets (8 GB).
@@ -4791,6 +4895,25 @@ fn run(
 
     let t = Instant::now();
     progress::phase("computing dominators");
+    // From-cache path: read the inbound body + block offsets HERE rather than in
+    // `load_mat_cache`. Nothing between there and here touched them (the
+    // dominator solver is the only consumer of `inb_block_off`, and it is skipped
+    // on this path), so holding them across the rpo/inbound windows bought
+    // nothing and cost ~5.6 GB of peak.
+    let (inb_block_off, inb_data) = if mat_reused {
+        let dir = mat_cache_dir
+            .as_ref()
+            .expect("from-cache path always has a cache dir");
+        let (off, data) = dir.read_inbound_blocks()?.ok_or_else(|| {
+            io::Error::other(
+                "graph cache lost its inbound CSR mid-run; re-run `heap load --with-graph`",
+            )
+        })?;
+        crate::trace::probe("main: (from-cache) read inbound CSR at dominator stage");
+        (off, data)
+    } else {
+        (inb_block_off, inb_data)
+    };
     // rpo moved by value; vertex/parent_pre owned through translation. dfn
     // already freed above. No separate drop(rpo).
     // ── Diagnostic (HPROF_DBG_GRAPH=1): graph stats around the dominator run.
@@ -4825,6 +4948,16 @@ fn run(
     // emit), so drop it here the same way `compute_dominators` would have.
     if mat_reused {
         drop(rpo);
+        // Read the cached dominator tree HERE rather than in `load_mat_cache`:
+        // it is first needed by the compress a few lines below, and holding it
+        // from the start of the run cost ~2.3 GB of peak.
+        let dir = mat_cache_dir
+            .as_ref()
+            .expect("from-cache path always has a cache dir");
+        g.idom = dir.read_idom()?.ok_or_else(|| {
+            io::Error::other("graph cache lost its idom mid-run; re-run `heap load --with-graph`")
+        })?;
+        crate::trace::probe("main: (from-cache) read idom after dominator stage");
     } else {
         g.idom =
             dominator::compute_dominators(g.n, rpo, &g.gc_root_indices, &inb_block_off, &inb_data)?;
@@ -5867,9 +6000,17 @@ fn run(
     // was the ~22GB global peak. It reads only idom.
     crate::trace::probe("main: before build_dom_children_csr");
     // From-cache path: `arrays.bin` already holds the dominator-children CSR, so
-    // the ~8 GB build transient is skipped entirely.
+    // the ~8 GB build transient is skipped entirely. Read it here — its first and
+    // only use — rather than holding it from the start of the run.
     let (dc_off, dc_tgt) = if mat_reused {
-        (cached_dc_off, cached_dc_tgt)
+        let dir = mat_cache_dir
+            .as_ref()
+            .expect("from-cache path always has a cache dir");
+        dir.read_dominator_children()?.ok_or_else(|| {
+            io::Error::other(
+                "graph cache lost its dominator children mid-run; re-run `heap load --with-graph`",
+            )
+        })?
     } else {
         retained::build_dom_children_csr(g.n, &g.idom)
     };

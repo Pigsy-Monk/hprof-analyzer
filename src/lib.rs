@@ -224,7 +224,12 @@ pub fn build_exploration(
 
     inbound.compress_id_map(compress)?;
 
-    let rpo = rpo_dfs::rpo_dfs(n, &g.gc_root_indices, &g.fwd_offsets, &g.fwd_targets);
+    let rpo = rpo_dfs::rpo_dfs(
+        n,
+        &g.gc_root_indices,
+        &g.fwd_offsets,
+        crate::chunkvec::TgtView::Chunked(&g.fwd_targets),
+    );
 
     // Clone forward CSR before it's consumed by build_from_fwd.
     let saved_fwd_offsets: Vec<u32> = g.fwd_offsets.clone();
@@ -393,7 +398,12 @@ fn analyze_to_report_inner(
 
     inbound.compress_id_map(compress)?;
 
-    let rpo = rpo_dfs::rpo_dfs(g.n, &g.gc_root_indices, &g.fwd_offsets, &g.fwd_targets);
+    let rpo = rpo_dfs::rpo_dfs(
+        g.n,
+        &g.gc_root_indices,
+        &g.fwd_offsets,
+        crate::chunkvec::TgtView::Chunked(&g.fwd_targets),
+    );
     progress("rpo", 1.0);
     t_pipe!("rpo done");
 
@@ -402,7 +412,7 @@ fn analyze_to_report_inner(
             g.n,
             &rpo.dfn,
             &g.fwd_offsets,
-            &g.fwd_targets,
+            crate::chunkvec::TgtView::Chunked(&g.fwd_targets),
             &shallow_c,
             &class_idx_c,
             g.class_names.len(),
@@ -835,7 +845,12 @@ fn analyze_to_report_inner_with_cache(
 
     inbound.compress_id_map(compress)?;
 
-    let rpo = rpo_dfs::rpo_dfs(g.n, &g.gc_root_indices, &g.fwd_offsets, &g.fwd_targets);
+    let rpo = rpo_dfs::rpo_dfs(
+        g.n,
+        &g.gc_root_indices,
+        &g.fwd_offsets,
+        crate::chunkvec::TgtView::Chunked(&g.fwd_targets),
+    );
     progress("rpo", 1.0);
 
     {
@@ -843,7 +858,7 @@ fn analyze_to_report_inner_with_cache(
             g.n,
             &rpo.dfn,
             &g.fwd_offsets,
-            &g.fwd_targets,
+            crate::chunkvec::TgtView::Chunked(&g.fwd_targets),
             &shallow_c,
             &class_idx_c,
             g.class_names.len(),

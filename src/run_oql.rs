@@ -245,7 +245,12 @@ pub(crate) fn run_oql_escalated(
     // projected row value. Empty map on `--all`.
     let row_src_by_slot = query_state.take_row_src_by_slot();
 
-    let rpo = rpo_dfs::rpo_dfs(g.n, &g.gc_root_indices, &g.fwd_offsets, &g.fwd_targets);
+    let rpo = rpo_dfs::rpo_dfs(
+        g.n,
+        &g.gc_root_indices,
+        &g.fwd_offsets,
+        crate::chunkvec::TgtView::Chunked(&g.fwd_targets),
+    );
     // Snapshot dfn for reachability pruning BEFORE rpo is consumed by dominators.
     let reach_dfn: Option<Vec<u32>> = if reachable_only {
         Some(rpo.dfn.clone())

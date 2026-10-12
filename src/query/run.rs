@@ -1756,7 +1756,12 @@ pub fn run_single_dump(
         // each flat result by its captured source index inside the resume layer,
         // BEFORE UNION-collapse — so `@objectAddress` rows prune correctly.
         let rpo = reachable_only.then(|| {
-            crate::rpo_dfs::rpo_dfs(g.n, &g.gc_root_indices, &g.fwd_offsets, &g.fwd_targets)
+            crate::rpo_dfs::rpo_dfs(
+                g.n,
+                &g.gc_root_indices,
+                &g.fwd_offsets,
+                crate::chunkvec::TgtView::Chunked(&g.fwd_targets),
+            )
         });
         let flat_results = resume_with_string_values(
             state,
@@ -1815,7 +1820,7 @@ pub fn run_single_dump(
             inner_g.n,
             &inner_g.gc_root_indices,
             &inner_g.fwd_offsets,
-            &inner_g.fwd_targets,
+            crate::chunkvec::TgtView::Chunked(&inner_g.fwd_targets),
         )
         .dfn
     });
@@ -1910,7 +1915,7 @@ pub fn run_single_dump(
             outer_g.n,
             &outer_g.gc_root_indices,
             &outer_g.fwd_offsets,
-            &outer_g.fwd_targets,
+            crate::chunkvec::TgtView::Chunked(&outer_g.fwd_targets),
         )
     });
     let mut flat_results = resume_with_string_values(
@@ -2660,8 +2665,13 @@ impl ReplCache {
         let class_ids = p1_owned.class_ids.clone();
         let dfn = if reachable_only {
             Some(
-                crate::rpo_dfs::rpo_dfs(g.n, &g.gc_root_indices, &g.fwd_offsets, &g.fwd_targets)
-                    .dfn,
+                crate::rpo_dfs::rpo_dfs(
+                    g.n,
+                    &g.gc_root_indices,
+                    &g.fwd_offsets,
+                    crate::chunkvec::TgtView::Chunked(&g.fwd_targets),
+                )
+                .dfn,
             )
         } else {
             None
