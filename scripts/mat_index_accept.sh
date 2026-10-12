@@ -16,7 +16,7 @@
 # -i is the cross-machine workflow: build the analyzer on your dev box, generate
 # the index there, copy just the small .index files over, and verify them here.
 #
-# Defaults are 10.28.211.179's layout:
+# Defaults follow one particular box's layout (override with -b/-d/-g/-m/-w):
 #   BIN     ~/hprof-analyzer/hprof-analyzer
 #   GOLDEN  /tmp/mathelp/heapdump     MAT's own 12 .index files + HeapDumpSample.hprof
 #   MAT     /tmp/mat                  MAT install (MemoryAnalyzer, ParseHeapDump.sh)
