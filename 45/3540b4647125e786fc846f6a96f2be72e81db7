@@ -1,0 +1,19 @@
+scripts/mat_index_accept.sh
+  s_9f05957e89db53::t_5ee36488229f3f 19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.45-trip",
+  "base_commit_sha": "453540b4647125e786fc846f6a96f2be72e81db7",
+  "prompts": {},
+  "sessions": {
+    "s_9f05957e89db53": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca1fb9b0-3b4d-470f-8fe7-9484e6312ac5",
+        "model": "deepseek-v4-1-flash-260910"
+      },
+      "human_author": "zwsong <zwsong@trip.com>"
+    }
+  }
+}
