@@ -1,0 +1,19 @@
+docs/server-and-graph-cache.md
+  s_9f05957e89db53::t_4588d772450ff0 1-130
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.45-trip",
+  "base_commit_sha": "5a07ac4856a0812e5b1bcd3de790276c9849cd40",
+  "prompts": {},
+  "sessions": {
+    "s_9f05957e89db53": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca1fb9b0-3b4d-470f-8fe7-9484e6312ac5",
+        "model": "deepseek-v4-1-flash-260910"
+      },
+      "human_author": "zwsong <zwsong@trip.com>"
+    }
+  }
+}
