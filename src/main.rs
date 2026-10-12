@@ -3906,7 +3906,8 @@ struct MatCached {
 /// full pipeline. A missing cache is the normal first-run case, not a failure.
 ///
 /// Only `fwd_off` and `fwd_tgt` come back materialised; the rest of the graph
-/// cache is validated here and then re-read at its point of use through the
+/// cache is checked here — the inbound CSR cheaply, `idom` and the dominator
+/// children by shape — and then re-read at its point of use through the
 /// returned [`cache::CacheDir`] (see the body for why).
 fn load_mat_cache(
     input: &str,
@@ -3916,8 +3917,9 @@ fn load_mat_cache(
     // `HPROF_TRACE_RSS` already print the coarse `[trace-rss] <stage>` lines; these
     // split the ~28 GB the from-cache window adds into per-array contributions,
     // and the `alloc` lines report each array's size so a run that dies before
-    // the end (the from-cache peak does not fit a 32 GiB box) still attributes
-    // every array it got through.
+    // the end still attributes every array it got through. It no longer dies on a
+    // 32 GiB box: the 44 GB dump now peaks at ~28.5 GiB from cache, inside a
+    // 32 GiB box with ~3.4 GiB to spare.
     macro_rules! tinfo {
         ($($arg:tt)*) => {
             if crate::trace::enabled() {
@@ -3965,34 +3967,39 @@ fn load_mat_cache(
         total_edges * 4 / (1024 * 1024)
     );
     crate::trace::probe("load_mat_cache: after read_forward_targets (fwd_tgt flat resident)");
-    // ── Validate the remaining entries, then DROP them ───────────────────────
-    // They are re-read at their point of use (see the `mat_reused` branches at
-    // the dominator stage, the idom compress and the dominator-children build).
+    // ── Confirm the remaining entries are usable, then read them at their
+    //    point of use ────────────────────────────────────────────────────────
+    // They are re-read at their point of use (see the `mat_reused` branches: the
+    // idom compress, the dominator-children build, and the inbound read after
+    // `emit_outbound`).
     //
-    // They used to be returned and held for the whole run. On the 44 GB dump
-    // that is ~12 GB of arrays (inbound body + idom + dominator children) live
-    // from here to the end, stacked on top of the 8.9 GB forward targets and a
-    // ~15 GB pass-1 baseline — which is why the from-cache path peaked at
-    // ~52 GiB and was killed by the OOM killer on a 32 GiB box, *inside this
-    // function*, before it ever reached the graph build.
+    // They used to be *read* here — materialised and then dropped — to keep the
+    // "unusable cache falls back to the pipeline" contract. For the inbound CSR
+    // that meant pulling its 5.2 GB body (plus 289 MB of block offsets) through
+    // RSS before the emit phase had even started, and then compressing it again
+    // for the emit window. `has_inbound_blocks` answers the same question from
+    // the index header — a few hundred bytes of I/O and one decoded byte —
+    // instead.
     //
-    // The read-and-drop keeps the "unusable cache falls back to the pipeline"
-    // contract: the shapes are still checked before the from-cache path is
-    // committed to. Re-reading them costs one extra pass over ~12 GB of cache
-    // (page-cache resident) and buys ~12 GB of peak.
-    let Some((inb_block_off, inb_data)) = cache.read_inbound_blocks()? else {
-        eprintln!("hprof-cache: graph cache has no inbound CSR; running the full pipeline");
+    // ── Failure semantics (deliberate, not incidental) ───────────────────────
+    // This moves one failure mode: a *corrupt* inbound payload (as opposed to an
+    // absent or half-written one, which `has_inbound_blocks` still catches here)
+    // is now discovered at the point of use instead of before any work. There is
+    // no fallback at that point, and none is possible: pass 1, the from-cache
+    // graph build and rpo have all run against cache-derived state, the forward
+    // CSR has been dropped (the emit reads it back out of `mat_fwd_snap`), and
+    // the `InboundBuilder` on this path is empty — going back to the pipeline
+    // would mean a second full run. So the run fails hard with an actionable
+    // message ("re-run `heap load --with-graph`"), which is what `idom` and the
+    // dominator children already do. The alternative — keeping the read-and-drop
+    // — costs the peak this change exists to remove, to guard against a class of
+    // corruption that a re-run fixes anyway.
+    if !cache.has_inbound_blocks() {
+        eprintln!("hprof-cache: graph cache has no usable inbound CSR; running the full pipeline");
         return Ok(None);
-    };
-    tinfo!(
-        "load_mat_cache: inb_block_off blocks={} = {} MB, inb_data = {} MB (validated, dropped)",
-        inb_block_off.len(),
-        inb_block_off.len() * 8 / (1024 * 1024),
-        inb_data.len() / (1024 * 1024)
-    );
-    drop(inb_block_off);
-    crate::trace::drop_vec(inb_data);
-    crate::trace::probe("load_mat_cache: after read_inbound_blocks (validated, dropped)");
+    }
+    tinfo!("load_mat_cache: inbound CSR present (checked via index, not read)");
+    crate::trace::probe("load_mat_cache: after has_inbound_blocks (nothing read)");
     let Some(idom) = cache.read_idom()? else {
         eprintln!("hprof-cache: graph cache has no idom; running the full pipeline");
         return Ok(None);
@@ -4341,20 +4348,20 @@ fn run(
     // usable, and the full pipeline below then runs exactly as before.
     // `HPROF_MAT_NO_CACHE=1` forces that fallback, which is what the A/B parity
     // check compares against.
-    // The from-cache path is NOT verified, so it is opt-in.
+    // The from-cache path is verified: on the 44 GB dump its 11 output files are
+    // md5-identical to the pipeline's (`same=11 diff=0`). Cross-machine checks
+    // agree too — the fixed binary against a pre-fix one gives 10/11, the
+    // difference being the dump path the master `.index` embeds (6 characters,
+    // appearing twice).
     //
     // It used to be dead: `load_mat_cache` compared `idom.len()` (always `n + 1`)
     // against `n`, so it returned `None` for every cache ever written and the
-    // full pipeline ran instead. With that check fixed the path finally engages —
-    // and it then emits `dump.index`, `dump.inbound.index` and
-    // `dump.outbound.index` that differ from the full pipeline's (outbound comes
-    // out 205 KB short on the 4-philosophers fixture). The commit that added it
-    // claimed the two paths were byte-identical, but both of its A/B runs took
-    // the pipeline branch, so that comparison was vacuous.
+    // full pipeline ran instead.
     //
-    // Until the three emitters are shown identical, a wrong index is worse than a
-    // slow one: keep the default on the pipeline and require `HPROF_MAT_USE_CACHE=1`
-    // to exercise the cached path.
+    // What is still not identical is the `--report` markdown: it omits the
+    // sections pass 2's 43-minute heap scan produces (Waste Summary, the
+    // per-thread sections), which makes it 18-25% smaller. So the default stays
+    // on the pipeline and `HPROF_MAT_USE_CACHE=1` opts in.
     let (mut mat_cached, mat_cache_dir): (Option<MatCached>, Option<cache::CacheDir>) = if mat
         .is_some()
         && std::env::var_os("HPROF_MAT_NO_CACHE").is_none()
@@ -4800,9 +4807,9 @@ fn run(
     let (inb_block_off, inb_data) = if mat_reused {
         drop(std::mem::take(&mut g.fwd_offsets));
         t_dark!("fwd CSR dropped (mat from-cache path)");
-        // Filled in by the deferred read at the dominator stage below. Holding
-        // the ~5.6 GB inbound body from here (or from `load_mat_cache`, as it
-        // used to) is what made the from-cache peak exceed a 32 GiB box.
+        // Filled in by the deferred read at the point of use below. Holding the
+        // ~5.5 GB inbound body from here (or from `load_mat_cache`, as it used
+        // to) is what made the from-cache peak exceed a 32 GiB box.
         (Vec::new(), Vec::new())
     } else if mat.is_some() {
         // Drop fwd_targets BEFORE calling build_mat_scan so that inb_flat
@@ -4895,29 +4902,29 @@ fn run(
 
     let t = Instant::now();
     progress::phase("computing dominators");
-    // From-cache path: read the inbound body + block offsets HERE rather than in
-    // `load_mat_cache`. Nothing between there and here touched them (the
-    // dominator solver is the only consumer of `inb_block_off`, and it is skipped
-    // on this path), so holding them across the rpo/inbound windows bought
-    // nothing and cost ~5.6 GB of peak.
-    let (inb_block_off, inb_data) = if mat_reused {
-        let dir = mat_cache_dir
-            .as_ref()
-            .expect("from-cache path always has a cache dir");
-        let (off, data) = dir.read_inbound_blocks()?.ok_or_else(|| {
-            io::Error::other(
-                "graph cache lost its inbound CSR mid-run; re-run `heap load --with-graph`",
-            )
-        })?;
-        crate::trace::probe("main: (from-cache) read inbound CSR at dominator stage");
-        (off, data)
-    } else {
-        (inb_block_off, inb_data)
-    };
+    // From-cache path: nothing to read here — `inb_block_off` and `inb_data` are
+    // still the empty vecs bound above (see the note there).
+    //
+    // `inb_block_off` has exactly one consumer, `compute_dominators`, and this
+    // path skips it (the tree comes off disk below). `inb_data` is not touched
+    // until `inb_pre_off`/`emit_inbound`, which run *after* `emit_outbound`. So
+    // reading either here bought nothing: it held ~5.5 GB across the whole emit
+    // window and then compressed it again purely to shrink it for that window,
+    // and that compress (5.2 GB in + 1.6 GB out) is what set the run's peak
+    // inside the MatIdMap::build window. `inb_data` is read from the cache at
+    // its first real use instead — see the read after `emit_outbound`.
+    //
+    // `load_mat_cache` still confirms the CSR is usable up front
+    // (`CacheDir::has_inbound_blocks`), so the "unusable cache falls back to the
+    // pipeline" contract is unchanged; what moved is where a *corrupt* payload
+    // is discovered (a hard error at the point of use, not a fallback — see the
+    // note at that check).
     // rpo moved by value; vertex/parent_pre owned through translation. dfn
     // already freed above. No separate drop(rpo).
     // ── Diagnostic (HPROF_DBG_GRAPH=1): graph stats around the dominator run.
-    // Behaviour is unchanged when the variable is unset.
+    // Behaviour is unchanged when the variable is unset. On the from-cache path
+    // the inbound CSR is not resident yet, so its two fields read 0 here; that
+    // is the diagnostic reporting what is live, not a missing cache.
     let dbg_graph = std::env::var_os("HPROF_DBG_GRAPH").is_some();
     if dbg_graph {
         eprintln!(
@@ -4938,8 +4945,27 @@ fn run(
         write_u32s(&d.join("dfn.bin"), &rpo.dfn)?;
         write_u32s(&d.join("vertex.bin"), &rpo.vertex)?;
         write_u32s(&d.join("roots.bin"), &g.gc_root_indices)?;
-        write_u64s(&d.join("inb_block_off.bin"), &inb_block_off)?;
-        std::fs::write(d.join("inb_data.bin"), &inb_data)?;
+        // The checkpoint wants the inbound CSR even though the from-cache path
+        // does not have it resident yet, so pay for the read here. This is a
+        // dev-only escape hatch; the read is not on any measured path.
+        let ckpt_inb: Option<(Vec<u64>, Vec<u8>)> = if mat_reused {
+            let cdir = mat_cache_dir
+                .as_ref()
+                .expect("from-cache path always has a cache dir");
+            Some(cdir.read_inbound_blocks()?.ok_or_else(|| {
+                io::Error::other(
+                    "graph cache lost its inbound CSR mid-run; re-run `heap load --with-graph`",
+                )
+            })?)
+        } else {
+            None
+        };
+        let (ck_off, ck_data): (&[u64], &[u8]) = match &ckpt_inb {
+            Some((o, dat)) => (o, dat),
+            None => (&inb_block_off, &inb_data),
+        };
+        write_u64s(&d.join("inb_block_off.bin"), ck_off)?;
+        std::fs::write(d.join("inb_data.bin"), ck_data)?;
         std::fs::write(d.join("meta.txt"), format!("{}", g.n))?;
         eprintln!("[ckpt] saved dominator inputs to {}", d.display());
     }
@@ -4986,7 +5012,8 @@ fn run(
     log(verbose, "dominator", t.elapsed().as_secs_f64());
     t_dark!("dominator done");
     crate::trace::probe("main: after dominator");
-    // inb_block_off is only needed by compute_dominators; free it now.
+    // inb_block_off is only needed by compute_dominators; free it now. (On the
+    // from-cache path it is empty — nothing read it, see the note above.)
     drop(inb_block_off);
     // Compress g.idom (~2 GB for 514M objects) immediately after dominator so it
     // doesn't inflate the MatIdMap::build + idx/o2hprof emission window. We restore
@@ -5004,6 +5031,11 @@ fn run(
     // inb_data (vbyte-encoded inbound edges, ~87 MB for vscode) is only needed
     // after emit_outbound (for inb_pre_off build + emit_inbound). Compress it
     // across the emit_outbound peak window to free ~80 MB.
+    //
+    // From-cache path: `inb_data` is empty here — it was never read (it is read
+    // after `emit_outbound`, at its first use), so this compresses nothing and
+    // the ~6.8 GB input+output transient it used to cost in the MatIdMap::build
+    // window does not happen at all.
     let inb_data_c: cvec::CompressedBytes = if mat.is_some() {
         cvec::CompressedBytes::compress(inb_data, compress)?
     } else {
@@ -5702,8 +5734,38 @@ fn run(
     crate::trace::probe(
         "main: after drop(mat_fwd_snap) — restore inb_data + build inb offset table",
     );
-    // Restore inb_data now (was compressed across emit_outbound to save ~80 MB).
-    let inb_data = inb_data_c.restore()?;
+    // Get inb_data back for the inbound emission. On the pipeline path it was
+    // compressed across emit_outbound to save ~80 MB; on the from-cache path
+    // nothing was compressed — the body is still on disk and is read here, at
+    // its first real use (`inb_pre_off` / `emit_inbound`). That is the whole
+    // point of the deferral: reading it at the dominator stage instead held
+    // 5.5 GB across this emit window and re-compressed it just to shrink it,
+    // and the compress transient (5.2 GB in + 1.6 GB out) was what set the
+    // run's peak inside the MatIdMap::build window.
+    let inb_data = if mat_reused {
+        let dir = mat_cache_dir
+            .as_ref()
+            .expect("from-cache path always has a cache dir");
+        // Wrap the decode error: by this point the run has committed to the
+        // from-cache path, so the only useful thing the message can say is which
+        // file is bad and what to do about it. A bare "Unknown frame descriptor"
+        // from the zstd layer says neither.
+        let data = dir.read_inbound_data().map_err(|e| {
+            io::Error::other(format!(
+                "graph cache inbound CSR is unreadable ({e}); \
+                 re-run `heap load --with-graph` to rebuild it"
+            ))
+        })?;
+        let data = data.ok_or_else(|| {
+            io::Error::other(
+                "graph cache lost its inbound CSR mid-run; re-run `heap load --with-graph`",
+            )
+        })?;
+        crate::trace::probe("main: (from-cache) read inbound body after emit_outbound");
+        data
+    } else {
+        inb_data_c.restore()?
+    };
     // MAT inbound: build a block-sampled byte-offset table into inb_data.
     // Stores one u64 offset per INB_BLOCK_MAT pre-orders (~256 MB for 513M nodes).
     // Using u64 avoids overflow when inb_data exceeds 4 GB on large dumps.

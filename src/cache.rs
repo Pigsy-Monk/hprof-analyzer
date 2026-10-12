@@ -304,6 +304,10 @@ impl CacheDir {
     ///
     /// Returns `(inb_block_off, inb_data)` or `None` when the cache predates
     /// the inbound half (or has no graph at all).
+    ///
+    /// Materialises the whole body (~5.2 GB on the 44 GB dump). Callers that
+    /// only need to know whether it is *there* want
+    /// [`CacheDir::has_inbound_blocks`] instead.
     pub fn read_inbound_blocks(&self) -> io::Result<Option<(Vec<u64>, Vec<u8>)>> {
         let path = self.path.join("graph.bin");
         let off = read_u64_array(&path, "inb_block_off")?;
@@ -312,6 +316,76 @@ impl CacheDir {
             (Some(o), Some(d)) if !o.is_empty() => Some((o, d)),
             _ => None,
         })
+    }
+
+    /// Read just the inbound *body*, without the block-offset table.
+    ///
+    /// `mat caches` reads this at its first real use (the inbound emission,
+    /// after `emit_outbound`). `inb_block_off` is not wanted there — its only
+    /// consumer is `compute_dominators`, which the from-cache path skips — so
+    /// going through [`CacheDir::read_inbound_blocks`] would decompress 289 MB
+    /// for nothing.
+    pub fn read_inbound_data(&self) -> io::Result<Option<Vec<u8>>> {
+        read_raw_array(&self.path.join("graph.bin"), "inb_data")
+    }
+
+    /// Cheap usability check for the inbound half of the graph cache: would
+    /// [`CacheDir::read_inbound_blocks`] hand back a usable inbound CSR?
+    ///
+    /// Costs the index header (a few hundred bytes of I/O) plus one decoded
+    /// byte, instead of the ~5.2 GB body `read_inbound_blocks` materialises.
+    /// `mat caches` uses it to decide whether the from-cache path is usable
+    /// *before* committing to it, and defers the real read to the point of use
+    /// (see `read_inbound_data`) — reading it up front, only to drop it, is what
+    /// pushed the from-cache peak over a 32 GiB box.
+    ///
+    /// The check mirrors `read_inbound_blocks`' own accept condition: both
+    /// entries present, both frames inside the file, and `inb_block_off`
+    /// decoding to a non-empty array (the `!o.is_empty()` guard — an old cache
+    /// wrote the inbound half as empty arrays, so a bare presence check would
+    /// accept a cache that reader rejects).
+    ///
+    /// What it deliberately does not do is decode the body: corruption *inside*
+    /// a frame that still has a well-formed index and lies in bounds is not
+    /// detectable here. That is a different failure class from the absent or
+    /// half-written cache this guards, and it surfaces as a hard error at the
+    /// point of use rather than a fallback.
+    pub fn has_inbound_blocks(&self) -> bool {
+        let path = self.path.join("graph.bin");
+        let Ok(Some((_f, entries))) = read_index(&path) else {
+            return false;
+        };
+        let Ok(file_len) = fs::metadata(&path).map(|m| m.len()) else {
+            return false;
+        };
+        let mut off_span: Option<(u64, u64)> = None;
+        let mut data_ok = false;
+        for (name, offset, len) in &entries {
+            if entry_name_eq(name, "inb_block_off") {
+                off_span = Some((*offset, *len));
+            } else if entry_name_eq(name, "inb_data") {
+                data_ok = *len > 0 && offset.saturating_add(*len) <= file_len;
+            }
+        }
+        let Some((off_off, off_len)) = off_span else {
+            return false;
+        };
+        if off_len == 0 || off_off.saturating_add(off_len) > file_len || !data_ok {
+            return false;
+        }
+        // Decode a single byte of the offset table: proves the frame is readable
+        // and that the table is non-empty, without holding any of it.
+        let Ok(mut f) = File::open(&path) else {
+            return false;
+        };
+        if f.seek(SeekFrom::Start(off_off)).is_err() {
+            return false;
+        }
+        let Ok(mut dec) = zstd::stream::read::Decoder::new(f.take(off_len)) else {
+            return false;
+        };
+        let mut one = [0u8; 1];
+        matches!(dec.read(&mut one), Ok(1))
     }
 
     // ── Object-offset layer ───────────────────────────────────────────────────
@@ -1120,6 +1194,15 @@ fn read_index(path: &Path) -> io::Result<Option<(File, Vec<([u8; 16], u64, u64)>
     Ok(Some((f, entries)))
 }
 
+/// Does a 16-byte zero-padded index entry name equal `want`?
+///
+/// Names shorter than 16 bytes are zero-padded by
+/// [`IndexedWriter::record_raw`]; a name of exactly 16 bytes has no padding.
+fn entry_name_eq(name: &[u8; 16], want: &str) -> bool {
+    let w = want.as_bytes();
+    w.len() <= 16 && name[..w.len()] == *w && name[w.len()..].iter().all(|&b| b == 0)
+}
+
 /// Find an entry by name and seek to it, returning (file, compressed_len).
 fn seek_to_entry(path: &Path, entry_name: &str) -> io::Result<Option<(File, usize)>> {
     let Some((mut f, entries)) = read_index(path)? else {
@@ -1394,6 +1477,85 @@ mod tests {
         w.add_u32("c", [3u32]).unwrap();
         let err = w.finish().unwrap_err().to_string();
         assert!(err.contains("expected 4 arrays, got 3"), "{err}");
+    }
+
+    /// `has_inbound_blocks` is the cheap stand-in for `read_inbound_blocks` on
+    /// the from-cache path, and a `true` from it commits `mat caches` to a path
+    /// with no fallback — the body is read at its point of use, long after the
+    /// forward CSR has been dropped. So it has to accept exactly what the reader
+    /// accepts.
+    ///
+    /// The empty-payload case is the one that makes a bare presence check
+    /// wrong: an old cache wrote the inbound half as *empty arrays* rather than
+    /// omitting it, and `read_inbound_blocks`' accept condition is
+    /// `!off.is_empty()`, not "the entries exist". Accepting such a cache here
+    /// would send the run into a hard error it could have fallen back from.
+    #[test]
+    fn has_inbound_blocks_matches_the_reader() {
+        // Complete cache: accepted by both.
+        let dir = tmp_dir("hasinb-complete");
+        let mut w = IndexedWriter::create(&dir.join("graph.bin"), 4).unwrap();
+        w.add_u32("fwd_off", [0u32, 2]).unwrap();
+        w.add_delta_u32("fwd_tgt", [1u32, 0]).unwrap();
+        w.add_u64("inb_block_off", [0u64, 4]).unwrap();
+        w.add_bytes("inb_data", &[1, 2, 3, 4]).unwrap();
+        w.finish().unwrap();
+        let cd = CacheDir { path: dir };
+        assert!(cd.has_inbound_blocks(), "complete cache must be accepted");
+        assert!(cd.read_inbound_blocks().unwrap().is_some());
+
+        // Legacy cache: the inbound entries are there but hold empty arrays.
+        let dir = tmp_dir("hasinb-empty");
+        let mut w = IndexedWriter::create(&dir.join("graph.bin"), 4).unwrap();
+        w.add_u32("fwd_off", [0u32, 2]).unwrap();
+        w.add_delta_u32("fwd_tgt", [1u32, 0]).unwrap();
+        w.add_u64("inb_block_off", std::iter::empty::<u64>())
+            .unwrap();
+        w.add_bytes("inb_data", &[]).unwrap();
+        w.finish().unwrap();
+        let cd = CacheDir { path: dir };
+        assert!(
+            !cd.has_inbound_blocks(),
+            "empty inbound payloads must be rejected, as the reader rejects them"
+        );
+        assert!(cd.read_inbound_blocks().unwrap().is_none());
+
+        // No inbound half at all (a `--with-graph` cache from before it existed).
+        let dir = tmp_dir("hasinb-absent");
+        let mut w = IndexedWriter::create(&dir.join("graph.bin"), 2).unwrap();
+        w.add_u32("fwd_off", [0u32, 2]).unwrap();
+        w.add_delta_u32("fwd_tgt", [1u32, 0]).unwrap();
+        w.finish().unwrap();
+        let cd = CacheDir { path: dir };
+        assert!(!cd.has_inbound_blocks());
+        assert!(cd.read_inbound_blocks().unwrap().is_none());
+
+        // Half-written cache: the index still points at an `inb_data` frame that
+        // now runs past EOF. Caught here rather than mid-run.
+        let dir = tmp_dir("hasinb-truncated");
+        let path = dir.join("graph.bin");
+        let mut w = IndexedWriter::create(&path, 4).unwrap();
+        w.add_u32("fwd_off", [0u32, 2]).unwrap();
+        w.add_delta_u32("fwd_tgt", [1u32, 0]).unwrap();
+        w.add_u64("inb_block_off", [0u64, 4]).unwrap();
+        w.add_bytes("inb_data", &[1, 2, 3, 4]).unwrap();
+        w.finish().unwrap();
+        let full = fs::metadata(&path).unwrap().len();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(full - 4)
+            .unwrap();
+        let cd = CacheDir { path: dir };
+        assert!(
+            !cd.has_inbound_blocks(),
+            "a frame past EOF must be rejected"
+        );
+        assert!(
+            cd.read_inbound_blocks().is_err(),
+            "the reader fails on the same file"
+        );
     }
 
     // ── Chunked fwd_tgt: the cross-chunk paths ────────────────────────────────
