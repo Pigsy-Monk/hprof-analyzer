@@ -15,9 +15,9 @@ directly comparable row-to-row; each row names its dump.
 
 | | 34 GB dump | 44.3 GB dump |
 |---|---|---|
-| `mat caches` wall time | — | **2 h 06 m 35 s** |
-| cache files written | 12 | **11 files, 45.9 GB** |
-| hprof-analyzer peak RSS | **19.2 GB** | **22.9 GiB** |
+| `mat caches` wall time | — | **1 h 15 m 12 s** |
+| cache files written | 12 | **11 files, 42.81 GiB** |
+| hprof-analyzer peak RSS | **19.2 GB** | **25.53 GiB** |
 | MAT's own parse peak RSS | **~55 GB** | not measured |
 
 The 44.3 GB run writes 11 files rather than 12 because `i2sv2` is no longer
@@ -111,8 +111,11 @@ once inside the JVM. hprof-analyzer instead:
   already live, rather than deferring everything to the end
 - **Streams per page** (1M ints at a time), never holding the full value array
 - Applies several targeted tricks in the hardest window (outbound emit, where
-  `fwd_tgt` 6.3 GB + `fwd_off` 2 GB + `class_obj_ids` 2 GB are all live):
+  `fwd_tgt` 8.87 GB + `fwd_off` 2.3 GB + `class_obj_ids` 2 GB are all live):
   - **In-place MAT-id translation** inside `fwd_tgt` — no per-object scratch Vec
+  - **Chunked `fwd_tgt`** — the 2.3-billion-entry forward-target array is kept
+    in 256 MB power-of-two chunks (`ChunkU32`) and never flattened into one
+    `Vec<u32>`; the outbound emitter streams it straight into the compressor
   - **Deferred `class_obj_ids` restore** — kept compressed across the scatter phase
   - **Streaming decompression** for `CompressedU32::restore` — 64 KiB read buffer,
     no intermediate 2 GB byte Vec
@@ -124,7 +127,40 @@ once inside the JVM. hprof-analyzer instead:
     restoring `class_obj_ids`
 
 The measured peak on the **34 GB** production dump is **19.2 GB** vs MAT's
-~55 GB; the same pipeline peaks at **22.9 GiB** on the **44.3 GB** dump.
+~55 GB; the same pipeline peaks at **25.53 GiB** on the **44.3 GB** dump.
+
+## Reusing the graph cache (the fast path)
+
+`mat caches` can skip the whole pipeline when a graph cache already sits next to
+the dump (written by `heap load --with-graph`). Opt in:
+
+```
+HPROF_MAT_USE_CACHE=1 hprof-analyzer mat caches dump.hprof outdir
+```
+
+- **Output is byte-identical** to the pipeline's: all 11 `.index` files match
+  (verified 2026-10-12 on a 44 GB dump; also cross-checked against a second
+  machine — the only differing file is the master `.index`, which embeds the
+  dump's path and so legitimately differs).
+- **24m18s / 29.37 GiB peak** vs the pipeline's **1h15m12s / 25.53 GiB**.
+
+**But the accounting only works if the cache already exists:**
+
+| scenario | total | vs pipeline |
+|---|---|---|
+| cache already there | **24m18s** | saves ~51 min |
+| cache must be built for this | 46m46s (build) + 24m18s = **71m04s** | saves ~4 min |
+
+So quote the fast path as 24m18s **only** when the cache is already paid for —
+otherwise it is barely worth it.
+
+Two caveats:
+- `--report` is **degraded** on this path (no Waste Summary, no per-thread
+  section, ~18–25% smaller) — those sections are by-products of pass 2's
+  ~43-minute scan. Full report or fast path: pick one.
+- The cache must be current; a cache missing inbound/idom/dominator-children
+  makes the tool log and fall back to the pipeline (a wasted run). The log line
+  `mat caches: reusing the graph cache…` is the tell.
 
 ## `o2hprof` implementation detail
 
