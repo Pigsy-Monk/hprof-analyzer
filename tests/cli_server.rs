@@ -56,13 +56,17 @@ fn ready_port() -> Option<u16> {
 /// Bind to an OS-assigned free port, record it, drop the listener, then start
 /// the server on that port.  There is a tiny TOCTOU window, but it is
 /// acceptable for tests.
-fn start_server(hprof: &str) -> (Child, u16) {
+/// Like [`start_server`], but with extra server arguments (e.g. `--allow-rescan`
+/// for a query the resident cache cannot answer — the server refuses those by
+/// default).
+fn start_server_with(hprof: &str, extra: &[&str]) -> (Child, u16) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
 
     let child = Command::new(BIN)
         .args(["server", hprof, "--port", &port.to_string()])
+        .args(extra)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -88,6 +92,12 @@ fn start_server(hprof: &str) -> (Child, u16) {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     (child, port)
+}
+
+/// Start a server with the default rescan policy (refuse queries that would
+/// re-read the dump).
+fn start_server(hprof: &str) -> (Child, u16) {
+    start_server_with(hprof, &[])
 }
 
 /// GET `path` from the server on `port`.
@@ -497,7 +507,12 @@ fn server_report_threads_md_has_thread_names() {
 #[test]
 fn server_oql_group_by_order_by() {
     let Some(hprof) = philosophers() else { return };
-    let (mut child, port) = start_server(&hprof);
+    // `@displayName` needs per-object string data the resident cache does not
+    // hold, so this query takes the scan path — which the server refuses by
+    // default. Opt in here: this test is about GROUP BY/ORDER BY correctness,
+    // not the rescan policy (`server_refuses_an_escalating_query_by_default`
+    // covers that).
+    let (mut child, port) = start_server_with(&hprof, &["--allow-rescan"]);
     let (status, body) = curl_post(
         port,
         "/",
@@ -515,6 +530,38 @@ fn server_oql_group_by_order_by() {
     assert!(
         body.contains("\"rows\""),
         "GROUP BY response should contain 'rows', got: {}",
+        &body[..body.len().min(500)]
+    );
+}
+
+/// The server refuses a query the resident cache cannot answer by default, and
+/// says which capability it wanted — rather than silently re-reading the dump
+/// while the analysis stays resident and OOM-killing the box. `--allow-rescan`
+/// is the escape hatch (`server_oql_group_by_order_by` uses it).
+#[test]
+fn server_refuses_an_escalating_query_by_default() {
+    let Some(hprof) = philosophers() else { return };
+    let (mut child, port) = start_server(&hprof);
+    let (status, body) = curl_post(
+        port,
+        "/",
+        "SELECT @displayName, COUNT(*) AS n FROM INSTANCEOF java.lang.Object \
+         GROUP BY @displayName ORDER BY n DESC LIMIT 5",
+    );
+    child.kill().ok();
+    child.wait().ok();
+    assert_eq!(
+        status, 400,
+        "the default policy must refuse this scan-bound query, got {status}: {body}"
+    );
+    assert!(
+        body.contains("rescan_refused"),
+        "the refusal must be a rescan_refused, got: {}",
+        &body[..body.len().min(500)]
+    );
+    assert!(
+        body.contains("--allow-rescan"),
+        "the refusal must name the escape hatch, got: {}",
         &body[..body.len().min(500)]
     );
 }
