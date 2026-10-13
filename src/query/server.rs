@@ -259,9 +259,10 @@ pub fn run_query_json_policy(
                 let c = cache.as_ref().expect("cache built above");
                 crate::query::run::run_resident_only(c, &[(q, plan)], reachable_only)
             } else if no_rescan {
-                // An addressed object the resident cache cannot deliver (an array
-                // or a class object) still needs the scan, so it is refused here
-                // exactly like any other non-resident query.
+                // An addressed object the resident cache cannot deliver — a
+                // CLASS object, or an ARRAY whose query reads its element count
+                // — still needs the scan, so it is refused here exactly like any
+                // other non-resident query.
                 return refuse_rescan(
                     if blob {
                         "per-object field values, and this cache carries no \
@@ -522,9 +523,18 @@ fn not_eligible_reason(
     } else if plan.from_subplan.is_some() || !plan.in_subplans.is_empty() {
         "a subquery".to_string()
     } else if matches!(q.from, crate::query::ast::FromSource::Object(_)) {
-        "an addressed object the resident cache cannot deliver (an array or a class \
-         object; the resident scan visits instances only)"
-            .to_string()
+        // An addressed object the resident cache cannot deliver. After arrays
+        // were relaxed onto the resident path (see `object_from_resident_ok`),
+        // this is one of two cases: a CLASS object (neither `visit_instance` nor
+        // `visit_array` delivers a CLASS_DUMP record), or an ARRAY whose query
+        // reads its element count (the resident path reports 0).
+        if crate::query::execute::query_observes_array_length(q) {
+            "an array element count the resident cache does not hold".to_string()
+        } else {
+            "an addressed CLASS object (the resident scan delivers instances and \
+             arrays, but not CLASS_DUMP class objects)"
+                .to_string()
+        }
     } else if q.from.class_spec().is_none() {
         "a FROM that is not a single concrete class (a class-name regex, INSTANCEOF, \
          or OBJECTS)"
@@ -1344,6 +1354,210 @@ mod tests {
             v["error"]["kind"],
             serde_json::json!("rescan_refused"),
             "must not refuse without the flag, got: {v}"
+        );
+    }
+
+    /// The heap address of the first ARRAY object (kind 1/2) in the cache.
+    fn first_array_addr(c: &ReplCache) -> Option<u64> {
+        (0..c.n)
+            .find(|&i| matches!(c.p1.kind[i], 1 | 2))
+            .map(|i| c.p1.id_map.addr_at(i))
+    }
+
+    /// The heap address of the first object of a given kind (0 = instance,
+    /// 3 = class object). `None` when the fixture cache holds none of that kind.
+    fn first_addr_of_kind(c: &ReplCache, kind: u8) -> Option<u64> {
+        (0..c.n)
+            .find(|&i| c.p1.kind[i] == kind)
+            .map(|i| c.p1.id_map.addr_at(i))
+    }
+
+    /// The scan-path reference rows for `oql`: parse → plan → optimize →
+    /// escalate, exactly as `lib::run_oql_query` does. Spelled out here because
+    /// `server.rs` is compiled into the *bin* module tree as well as the lib's,
+    /// and `run_oql_query` exists only in the lib root — `crate::run_oql::…` is
+    /// reachable from both.
+    fn scan_rows(oql: &str) -> Vec<Vec<crate::query::model::QueryValue>> {
+        let q = crate::query::parse::parse_or_report(oql).expect("parse");
+        let plan = crate::query::plan::plan_query(&q, 5).expect("plan");
+        let plan = crate::query::optimize::optimize(
+            plan,
+            &q,
+            &crate::query::optimize::SchemaStats::default(),
+        );
+        let (flat, groups) = crate::query::run::expand_union_queries(&[(q, plan)]);
+        let opts = crate::opts::AnalyzeOptions {
+            reachable_only: false,
+            ..crate::opts::AnalyzeOptions::default()
+        };
+        let res = crate::run_oql::run_oql_escalated(FIXTURE, &flat, &groups, false, &opts)
+            .expect("scan run");
+        assert_eq!(res.len(), 1, "one result per SELECT");
+        assert!(res[0].error.is_none(), "scan errored: {:?}", res[0].error);
+        res[0].rows.clone()
+    }
+
+    /// `FROM OBJECTS <array>` is a single addressed object, exactly like
+    /// `FROM OBJECTS <instance>` — so it must be served from the resident cache
+    /// rather than escalating to a full dump re-read. The resident scan delivers
+    /// arrays through `visit_array` (gated on `wants_arrays`, which is true for
+    /// an `OBJECTS` FROM), so an array target needs no scan.
+    ///
+    /// The load-bearing assertion is that the query is ANSWERED under the
+    /// no-rescan policy: a re-scan would have been refused, so `ok: true` is
+    /// proof the resident path served it. Asserting only that the row is right
+    /// would pass even if the query had silently taken the scan path — the
+    /// failure mode that let the `@retainedHeapSize` fast path stay dead while
+    /// its test stayed green (see the `used_fast_path` fix).
+    #[test]
+    fn no_rescan_answers_from_objects_on_an_array_resident() {
+        let Some(cache) = warm_cache(FIXTURE) else {
+            return;
+        };
+        let Some(addr) = first_array_addr(&cache) else {
+            return; // no arrays in the fixture cache → nothing to assert
+        };
+        let oql = format!("SELECT @objectAddress FROM OBJECTS {addr}");
+
+        let mut resident = Some(cache);
+        let v = run_query_json_policy(FIXTURE, &oql, 5, false, &mut resident, None, None, true);
+        let text = v.to_string();
+        assert_eq!(
+            v["ok"],
+            serde_json::json!(true),
+            "an array target must be served resident; a re-scan would have been \
+             refused: {text}"
+        );
+        assert!(
+            !text.contains("rescan_refused"),
+            "the array target must not be refused: {text}"
+        );
+        let rows = v["result"]["rows"].as_array().expect("rows");
+        assert_eq!(
+            rows.len(),
+            1,
+            "FROM OBJECTS <array> must return exactly one row: {text}"
+        );
+        assert_eq!(
+            rows[0][0]["v"].as_u64(),
+            Some(addr),
+            "the row must be the addressed array itself: {text}"
+        );
+
+        // Parity: the scan path (`run_oql_escalated` → `run_single_dump`) must
+        // give the same row. This is the reference the resident path is pinned
+        // to.
+        let scan_rows = serde_json::to_value(scan_rows(&oql)).expect("serialize rows");
+        assert_eq!(
+            v["result"]["rows"], scan_rows,
+            "resident rows must equal scan rows for `{oql}`"
+        );
+    }
+
+    /// Negative control for the test above: a query that can OBSERVE the array's
+    /// length must still be refused. The resident path reports every array's
+    /// element count as 0 (`visit_cached_arrays` cannot know it), so serving such
+    /// a query resident would answer 0 where the scan answers the real length —
+    /// a wrong answer, not a missing one.
+    #[test]
+    fn no_rescan_still_refuses_a_from_objects_query_that_reads_the_array_length() {
+        let Some(cache) = warm_cache(FIXTURE) else {
+            return;
+        };
+        let Some(addr) = first_array_addr(&cache) else {
+            return;
+        };
+        let oql = format!("SELECT @length FROM OBJECTS {addr}");
+        let mut resident = Some(cache);
+        let v = run_query_json_policy(FIXTURE, &oql, 5, false, &mut resident, None, None, true);
+        assert_eq!(
+            v["error"]["kind"],
+            serde_json::json!("rescan_refused"),
+            "a query that observes the array's length must stay on the scan path, \
+             got: {v}"
+        );
+        let msg = v["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("array element count"),
+            "the refusal must name the array element count as the missing datum, \
+             got: {msg}"
+        );
+    }
+
+    /// Negative control: a CLASS object (kind 3) is delivered by neither
+    /// `visit_instance` nor `visit_array`, so relaxing `object_from_resident_ok`
+    /// to arrays must NOT have relaxed it to class objects — such a target still
+    /// needs the scan and is refused under the policy.
+    #[test]
+    fn no_rescan_still_refuses_a_from_objects_query_on_a_class_object() {
+        let Some(cache) = warm_cache(FIXTURE) else {
+            return;
+        };
+        let Some(addr) = first_addr_of_kind(&cache, 3) else {
+            return; // fixture has no class objects → nothing to assert
+        };
+        let oql = format!("SELECT @objectAddress FROM OBJECTS {addr}");
+        let mut resident = Some(cache);
+        let v = run_query_json_policy(FIXTURE, &oql, 5, false, &mut resident, None, None, true);
+        assert_eq!(
+            v["error"]["kind"],
+            serde_json::json!("rescan_refused"),
+            "a class-object target is not resident-servable and must be refused, \
+             got: {v}"
+        );
+        let msg = v["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("CLASS object"),
+            "the refusal must name the class object as the reason (not the array \
+             relaxation), got: {msg}"
+        );
+    }
+
+    /// The real-world shape from the incident: `jsonify` an array addressed by
+    /// `FROM OBJECTS`. Same contract — answered resident under the no-rescan
+    /// policy, never escalated.
+    #[test]
+    fn no_rescan_answers_jsonify_of_an_addressed_array_resident() {
+        let Some(cache) = warm_cache(FIXTURE) else {
+            return;
+        };
+        if cache.offsets.is_none() {
+            return; // jsonify needs the object-offset table
+        }
+        let Some(addr) = first_array_addr(&cache) else {
+            return;
+        };
+        let oql = format!("SELECT jsonify(s, 1) FROM OBJECTS {addr} s");
+
+        let mut resident = Some(cache);
+        let v = run_query_json_policy(FIXTURE, &oql, 5, false, &mut resident, None, None, true);
+        let text = v.to_string();
+        assert_eq!(
+            v["ok"],
+            serde_json::json!(true),
+            "jsonify of an addressed array must be served resident; a re-scan \
+             would have been refused: {text}"
+        );
+        assert!(
+            !text.contains("rescan_refused"),
+            "jsonify of an addressed array must not be refused: {text}"
+        );
+        let rows = v["result"]["rows"].as_array().expect("rows");
+        assert_eq!(rows.len(), 1, "one row for the addressed array: {text}");
+        let cell = rows[0][0]["v"].as_str().unwrap_or_default();
+        let j: serde_json::Value = serde_json::from_str(cell).expect("cell must be JSON");
+        // A real expansion, not the "not expanded" placeholder the scan path
+        // leaves (it has no jsonify session): the resident path re-reads the
+        // array record from the dump through `offsets.bin`, so it knows the
+        // element count the scan path cannot.
+        assert!(
+            j["@element_count"].as_u64().is_some_and(|n| n > 0),
+            "the addressed array must be expanded with a real element count, \
+             got: {cell}"
+        );
+        assert!(
+            j["elements"].is_array(),
+            "the expansion must list the array's elements, got: {cell}"
         );
     }
 

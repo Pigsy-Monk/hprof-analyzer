@@ -99,6 +99,17 @@ All notable changes to hprof-analyzer are documented here.
 
 ### Fixed
 
+- **`FROM OBJECTS <array>` is answered from the resident cache, not a re-scan.**
+  The server served `FROM OBJECTS <addr>` from the resident cache only when the
+  addressed object was an *instance*; an array fell through to the escalated
+  re-run — the ~50-minute, ~20 GiB path that OOM-kills a 32 GiB box. But the
+  resident scan has delivered arrays through `visit_array` for a while (gated on
+  `wants_arrays`, which is true for an `OBJECTS` FROM), so an addressed array is
+  exactly one dense index and is now served the same way an instance is. A class
+  object is still refused (neither scan loop delivers one), as is an array whose
+  query reads its element count (the resident path reports every array's length
+  as 0).
+
 - **Report instance counts now name their scope.** One report showed
   `FareRecordContainer` as 2,174,154, 5,593,970 and 7,905,792 in three places
   and read like a bug. All three were correct and measuring different things:

@@ -5393,13 +5393,22 @@ pub(crate) fn object_from_shaped(
 }
 
 /// The cache-dependent half of [`object_from_shaped`]: the addressed object must
-/// be an INSTANCE_DUMP record (`kind == 0`).
+/// be one the resident scan actually delivers.
 ///
-/// The resident scan drives `visit_instance` over kind-0 objects only — it never
-/// calls `visit_array` — so an ARRAY target (kind 1/2) or a class object
-/// (kind 3) would yield zero rows resident where the scan yields one. Those must
-/// keep taking the scan path; that is exactly why `cache_shaped` excludes
-/// `FROM OBJECTS` today.
+/// The resident scan drives `visit_instance` over true instances (kind 0) AND
+/// `visit_cached_arrays` → `visit_array` over arrays (kind 1/2) whenever an armed
+/// query's `wants_arrays()` is set — which it is for `FROM OBJECTS` (see
+/// `from_may_match_arrays`, which returns `true` for an `Object` source). So an
+/// addressed INSTANCE **or ARRAY** is exactly one dense index and is served
+/// resident. A CLASS object (kind 3) is delivered by neither loop (the scan never
+/// sends CLASS_DUMP records to `visit_instance` either), so it keeps taking the
+/// scan path.
+///
+/// An ARRAY target whose query can OBSERVE the array's length is excluded: the
+/// resident path reports every array's element count as 0 (`visit_cached_arrays`
+/// cannot know it — Pass1's `elem_count` is freed by pass2), so such a query must
+/// keep taking the scan path or it would answer 0 where the scan answers the real
+/// length.
 ///
 /// A MISSING address is different: it names no live object, so BOTH paths yield
 /// zero rows (the executor's `target_index` stays `None` and nothing matches) —
@@ -5416,7 +5425,17 @@ pub(crate) fn object_from_resident_ok(
         return false;
     };
     match c.p1.id_map.index_of(addr) {
-        Some(i) => c.p1.kind.get(i).copied() == Some(0),
+        // kind 0 = instance, delivered by the resident scan's `visit_instance`;
+        // kind 1/2 = array, delivered by `visit_cached_arrays` → `visit_array`.
+        // Both are a single dense index, so both are served exactly.
+        Some(i) => match c.p1.kind.get(i).copied() {
+            Some(0) => true,
+            Some(1) | Some(2) => !crate::query::execute::query_observes_array_length(q),
+            // kind 3 = class object: neither loop delivers it, so it stays on
+            // the scan path.
+            _ => false,
+        },
+        // A missing address names no live object: both paths yield zero rows.
         None => true,
     }
 }
