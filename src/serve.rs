@@ -457,6 +457,17 @@ pub fn run_server(path: &str, port: u16, opts: AnalyzeOptions, no_rescan: bool) 
     println!("After POST /analyze completes, OQL queries can use @retainedHeapSize,");
     println!("dominators(), and @inbounds.");
     println!();
+    if no_rescan {
+        println!("Rescan policy: a query the resident cache cannot answer is REFUSED");
+        println!("  ({{kind:\"rescan_refused\"}}) rather than re-reading the dump, which");
+        println!("  would roughly double peak memory. Start with --allow-rescan to permit");
+        println!("  the escalated re-run on a box with memory to spare.");
+    } else {
+        println!("Rescan policy: --allow-rescan — a query the resident cache cannot answer");
+        println!("  re-reads the whole dump while the analysis stays resident, so peak");
+        println!("  memory is roughly additive. Omit the flag to refuse instead.");
+    }
+    println!();
     println!("examples:");
     println!("  curl -s http://{bound}/status");
     println!("  curl -s -X POST http://{bound}/analyze");

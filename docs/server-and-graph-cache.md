@@ -39,7 +39,7 @@ second parse of the dump.
 
 Without `--with-graph` the cache has no edges, so a cache-backed session cannot
 answer `@inbounds` / `@outbounds` / `path()`, and the server falls back to
-re-reading the dump (or refuses, under `--no-rescan`). Always build the graph.
+re-reading the dump (or, by default, refuses the query). Always build the graph.
 
 ## Warm start does not happen on its own
 
@@ -87,9 +87,9 @@ On the **44 GB** dump, on a **32 GB** machine:
 That is ~0.48× the dump for the steady state and ~0.63× at the peak. The peak is
 not at startup — it is when a query pulls in something the resident cache does
 not hold, and the server re-reads the dump *while the analysis stays resident*,
-so the cost is roughly additive. `--no-rescan` turns those queries into a
-`rescan_refused` response instead of letting them push the process over the
-edge.
+so the cost is roughly additive. By default the server refuses such a query with
+a `rescan_refused` response instead of letting it push the process over the edge;
+`--allow-rescan` re-enables the escalated re-run on a box with memory to spare.
 
 ## How the edges are stored
 

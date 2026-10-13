@@ -1,13 +1,14 @@
 //! Delivery-2 evidence, at the routing decision: an edge query is answered from
-//! a cache-assembled session under `--no-rescan`, and refused the moment the
-//! session has no edges — the negative control that proves the answer really
-//! came from the edges rather than from a hatch that still rescans.
+//! a cache-assembled session under the server's default rescan policy, and
+//! refused the moment the session has no edges — the negative control that
+//! proves the answer really came from the edges rather than from a hatch that
+//! still rescans.
 //!
 //! This drives `run_query_json_policy` directly, which is where the decision
 //! lives (`edges_servable`). The HTTP layer on top of it is covered by
 //! `tests/cli_server.rs`; going through a real server process here would only
 //! add a port, a second process and a temp directory to the same assertion. The
-//! end-to-end form was checked by hand as well — a `--no-rescan` server started
+//! end-to-end form was checked by hand as well — a default-policy server started
 //! on a dump whose cache has `graph.bin` answers `SELECT @outbounds FROM
 //! java.lang.String LIMIT 5` with real addresses (identical to `heap query`'s),
 //! and the same server on the same dump with `graph.bin` deleted answers
@@ -37,8 +38,8 @@ fn staged_fixture(tag: &str) -> Option<(PathBuf, PathBuf)> {
     Some((dir, dump))
 }
 
-/// Run the query against a warm session under `--no-rescan` and return the
-/// response as JSON.
+/// Run the query against a warm session under the default rescan policy
+/// (`no_rescan = true`) and return the response as JSON.
 fn ask(dump: &Path, cache: &mut Option<ReplCache>) -> serde_json::Value {
     hprof_analyzer::query::server::run_query_json_policy(
         dump.to_str().unwrap(),
@@ -83,8 +84,8 @@ fn no_rescan_answers_outbounds_from_the_cache_edges_and_refuses_without_them() {
     assert_eq!(answered["ok"], serde_json::json!(true), "{text}");
     assert!(
         !text.contains("rescan_refused"),
-        "under --no-rescan an edge query must be answered from the cache, not \
-         refused: {text}"
+        "under the default rescan policy an edge query must be answered from the \
+         cache, not refused: {text}"
     );
     assert!(
         !text.contains("the full analysis pipeline"),
@@ -118,7 +119,7 @@ fn no_rescan_answers_outbounds_from_the_cache_edges_and_refuses_without_them() {
     assert!(
         text.contains("rescan_refused"),
         "without edges the query has nothing to answer from and must be \
-         refused under --no-rescan; got: {text}"
+         refused under the default rescan policy; got: {text}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

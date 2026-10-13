@@ -22,14 +22,18 @@ All notable changes to hprof-analyzer are documented here.
   documented it). Both flags now exist on `server`, with the CLI's `auto`
   rule, and the server's stage boundaries emit progress phases.
 
-- **`server --no-rescan`.** Both of the server's query escape hatches re-read
-  the dump *while the resident analysis stays in memory*, so the peaks are
-  roughly additive: a single query needing dominators took a `ready` server
-  from 14.6 GiB to 31.3 GiB on a 32 GiB box and got it OOM-killed silently.
-  `--no-rescan` refuses such a query up front with
-  `{"kind":"rescan_refused"}`, naming the capability it wanted. Queries the
-  resident cache can answer — counts, histograms, plain class projections —
-  are unaffected.
+- **`server` refuses to re-read the dump by default; `--allow-rescan` opts in.**
+  Both of the server's query escape hatches re-read the dump *while the resident
+  analysis stays in memory*, so the peaks are roughly additive: a single query
+  needing dominators took a `ready` server from 14.6 GiB to 31.3 GiB on a 32 GiB
+  box and got it OOM-killed silently. The old `--no-rescan` flag was opt-in, so
+  the safe behavior had to be remembered — and on a 32 GB box the unsafe default
+  cost a live server. The default is now to refuse such a query up front with
+  `{"kind":"rescan_refused"}`, naming the capability it wanted. Start the server
+  with `--allow-rescan` (replacing the old `--no-rescan`, which is gone) to
+  restore the escalated re-run on a box with memory to spare. Queries the
+  resident cache can answer — counts, histograms, plain class projections,
+  `@retainedHeapSize`, and edges from a `--with-graph` cache — are unaffected.
 
 - **Queries answer `@inbounds` / `@outbounds` / `path()` from the cache.** A
   server warmed from `graph.bin` no longer re-reads the dump for edge

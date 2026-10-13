@@ -46,11 +46,11 @@ pub fn run_query_json(
 
 /// [`run_query_json`] with an explicit rescan policy.
 ///
-/// `no_rescan` is the server's `--no-rescan` switch. When a query cannot be
-/// answered from what the server keeps resident, **refuse it** instead of
-/// re-reading the dump. Both escape hatches are covered: the escalated
-/// full-pipeline re-run (`needs_full`) and the per-request scan
-/// (`!cache_eligible`).
+/// `no_rescan` is the server's default policy (the inverse of the CLI's
+/// `--allow-rescan` escape hatch). When a query cannot be answered from what the
+/// server keeps resident, **refuse it** instead of re-reading the dump. Both
+/// escape hatches are covered: the escalated full-pipeline re-run (`needs_full`)
+/// and the per-request scan (`!cache_eligible`).
 ///
 /// Why this exists: either hatch re-reads the dump *while the analysis's
 /// resident state is still held*, so peak memory is roughly additive. On a
@@ -202,7 +202,7 @@ pub fn run_query_json_policy(
             return refuse_rescan(
                 needs_full_reason(&plan),
                 "The server keeps only the retained-size array across the full \
-                 analysis. Restart it without --no-rescan to allow the escalated \
+                 analysis. Restart it with --allow-rescan to allow the escalated \
                  re-run, or ask this query of `heap query` instead.",
             );
         } else {
@@ -271,9 +271,9 @@ pub fn run_query_json_policy(
                     } else {
                         not_eligible_reason(&q, &plan)
                     },
-                    "Under --no-rescan only queries the resident cache can answer are \
-                     served; restart without it to allow a per-request scan, or use \
-                     `heap query`.",
+                    "By default only queries the resident cache can answer are \
+                     served; restart with --allow-rescan to allow a per-request \
+                     scan, or use `heap query`.",
                 );
             } else {
                 crate::query::run::run_single_dump(path, &[(q, plan)], reachable_only)
@@ -281,9 +281,9 @@ pub fn run_query_json_policy(
         } else if no_rescan {
             return refuse_rescan(
                 not_eligible_reason(&q, &plan),
-                "Under --no-rescan only queries the resident cache can answer are \
-                 served; restart without it to allow a per-request scan, or use \
-                 `heap query`.",
+                "By default only queries the resident cache can answer are \
+                 served; restart with --allow-rescan to allow a per-request \
+                 scan, or use `heap query`.",
             );
         } else {
             crate::query::run::run_single_dump(path, &[(q, plan)], reachable_only)
@@ -444,15 +444,16 @@ fn internal_error(e: io::Error) -> serde_json::Value {
     })
 }
 
-/// Refusal returned under `--no-rescan` instead of re-reading the dump.
-/// `what` names the capability the query wanted; `hint` says what to do about it.
+/// Refusal returned under the rescan policy (the server's default) instead of
+/// re-reading the dump. `what` names the capability the query wanted; `hint`
+/// says what to do about it.
 fn refuse_rescan(what: String, hint: &str) -> serde_json::Value {
     serde_json::json!({
         "ok": false,
         "error": {
             "kind": "rescan_refused",
             "message": format!(
-                "query refused by --no-rescan: answering it needs {what}, which this \
+                "query refused: answering it needs {what}, which this \
                  server does not keep resident, so it would have to re-read the dump \
                  — roughly doubling peak memory while the analysis stays in memory. \
                  {hint}"
@@ -557,9 +558,10 @@ pub struct ServerState {
     path_depth: usize,
     reachable_only: AtomicBool,
     /// Refuse any query that would re-read the dump instead of answering from
-    /// what is resident. Set from `server --no-rescan`. See
-    /// [`run_query_json_policy`] for why: both escape hatches re-read the dump
-    /// while the analysis stays resident, roughly doubling peak memory.
+    /// what is resident. The server's **default**; only `server --allow-rescan`
+    /// turns it off. See [`run_query_json_policy`] for why: both escape hatches
+    /// re-read the dump while the analysis stays resident, roughly doubling peak
+    /// memory.
     no_rescan: bool,
     cache: Mutex<Option<ReplCache>>,
     help_cache: OnceLock<serde_json::Value>,
@@ -578,7 +580,7 @@ impl ServerState {
         Self::load_with_policy(path, path_depth, reachable_only, false)
     }
 
-    /// [`Self::load`] plus the `--no-rescan` policy (see [`run_query_json_policy`]).
+    /// [`Self::load`] plus the rescan policy (see [`run_query_json_policy`]).
     pub fn load_with_policy(
         path: &str,
         path_depth: usize,
@@ -1181,11 +1183,11 @@ mod tests {
 
     /// A field-reading query (`SELECT s.name FROM …`) arms
     /// `needs.instance_scalar`, which `cache_eligible` rejects — so before the
-    /// offsets table was wired in, `--no-rescan` refused it outright. With the
-    /// cache's `offsets.bin` attached it is answered from the resident session by
-    /// seeking into the dump, and the rows are exactly the ones the real scan
-    /// produces (which is the whole contract: this may turn "cannot answer" into
-    /// "answered", never change an answer).
+    /// offsets table was wired in, the rescan policy refused it outright. With
+    /// the cache's `offsets.bin` attached it is answered from the resident
+    /// session by seeking into the dump, and the rows are exactly the ones the
+    /// real scan produces (which is the whole contract: this may turn "cannot
+    /// answer" into "answered", never change an answer).
     #[test]
     fn no_rescan_answers_a_field_query_when_the_cache_has_offsets() {
         const OQL: &str = "SELECT s.name, s.tid FROM java.lang.Thread s LIMIT 2";
@@ -1286,14 +1288,15 @@ mod tests {
         );
         let msg = v["error"]["message"].as_str().unwrap_or_default();
         assert!(
-            msg.contains("offsets.bin") && msg.contains("--no-rescan"),
-            "message should name the missing table and the flag, got: {msg}"
+            msg.contains("offsets.bin") && msg.contains("--allow-rescan"),
+            "message should name the missing table and the escape hatch, got: {msg}"
         );
     }
 
-    /// `--no-rescan` must refuse a query that would re-read the dump, and say
-    /// which capability it wanted — rather than silently re-running the
-    /// pipeline on top of the resident analysis and OOM-killing the server.
+    /// The rescan policy (the server's default) must refuse a query that would
+    /// re-read the dump, and say which capability it wanted — rather than
+    /// silently re-running the pipeline on top of the resident analysis and
+    /// OOM-killing the server.
     #[test]
     fn no_rescan_refuses_an_escalating_query() {
         let mut cache = None;
@@ -1318,8 +1321,8 @@ mod tests {
         );
         let msg = v["error"]["message"].as_str().unwrap_or_default();
         assert!(
-            msg.contains("retained sizes") && msg.contains("--no-rescan"),
-            "message should name the missing capability and the flag, got: {msg}"
+            msg.contains("retained sizes") && msg.contains("--allow-rescan"),
+            "message should name the missing capability and the escape hatch, got: {msg}"
         );
     }
 

@@ -318,21 +318,26 @@ enum Cmd {
         /// Port to bind (default 7070; loopback only).
         #[arg(long, value_name = "N")]
         port: Option<u16>,
-        /// Never re-read the dump to answer a query: refuse it instead.
+        /// Re-read the dump to answer a query the resident cache cannot serve.
         ///
-        /// Both of the server's escape hatches re-read the dump *while the
-        /// analysis stays resident*, so peak memory is roughly additive. On a
-        /// 32 GiB box a single query needing dominators, GC roots, edges or a
-        /// reference walk was enough to push a `ready` server from 14.6 GiB to
-        /// 31.3 GiB and get it OOM-killed — silently, minutes later. With this
-        /// flag such a query returns `{"kind":"rescan_refused"}` naming the
-        /// capability it wanted, instead of killing the server.
+        /// OFF by default, and that default is the whole point: both of the
+        /// server's escape hatches re-read the dump *while the analysis stays
+        /// resident*, so peak memory is roughly additive. On a 32 GiB box a
+        /// single query needing dominators, GC roots, edges or a reference walk
+        /// was enough to push a `ready` server from 14.6 GiB to 31.3 GiB and get
+        /// it OOM-killed — silently, minutes later. So by default such a query
+        /// returns `{"kind":"rescan_refused"}` naming the capability it wanted,
+        /// instead of killing the server.
+        ///
+        /// Pass this only on a box with memory to spare: the query then runs the
+        /// escalated pipeline (a full dump re-read) and answers slowly, in
+        /// addition to whatever the analysis already holds.
         ///
         /// Queries that the resident cache can answer — counts, histograms,
         /// `@retainedHeapSize`, and `@inbounds`/`@outbounds`/`path()` when the
-        /// cache was written with `--with-graph` — are unaffected.
+        /// cache was written with `--with-graph` — are unaffected either way.
         #[arg(long)]
-        no_rescan: bool,
+        allow_rescan: bool,
         /// Print resident-set size (RSS) at each labeled pipeline stage to
         /// stderr while the analysis runs — the same `[trace-rss] <stage>
         /// RSS=N MB (peak N MB)` lines the CLI prints with `--trace-rss`.
@@ -628,7 +633,7 @@ enum HeapCmd {
         dump: String,
         /// Also build the reference graph: without it a cache-backed session
         /// cannot answer @inbounds/@outbounds/path(), and the server falls back
-        /// to re-reading the dump (or refusing under --no-rescan).
+        /// to re-reading the dump (or, by default, refusing the query).
         #[arg(long)]
         with_graph: bool,
     },
@@ -1143,7 +1148,7 @@ fn main() {
         Some(Cmd::Server {
             input,
             port,
-            no_rescan,
+            allow_rescan,
             trace_rss,
             progress,
         }) => {
@@ -1171,6 +1176,10 @@ fn main() {
                 keep_oql_cache: true,
                 ..DetailLevel::Default.options()
             };
+            // Refuse to re-read the dump unless `--allow-rescan` was given
+            // explicitly: the escalated re-run happens while the analysis stays
+            // resident, so its peak is additive and can OOM a 32 GiB box.
+            let no_rescan = server_no_rescan(allow_rescan);
             if let Err(e) =
                 serve::run_server(&input, port.unwrap_or(serve::DEFAULT_PORT), opts, no_rescan)
             {
@@ -2376,6 +2385,17 @@ fn analyze_to_report_inner(
 /// has a `.hprof` / `.hprof.gz` extension OR the file begins with the HPROF
 /// magic (`JAVA PROFILE`). `-` (stdin) is never HPROF: a non-seekable pipe of a
 /// dump was never supported, and the render path handles `-`.
+/// The `server` subcommand's rescan policy, in one place so the default is
+/// testable: **refuse by default**, and let `--allow-rescan` opt back in.
+///
+/// A query the resident cache cannot answer would otherwise re-read the whole
+/// dump *while the analysis stays resident*, roughly doubling peak memory — the
+/// 32 GiB OOM this default exists to prevent. See [`Cmd::Server`]'s
+/// `allow_rescan` for the full rationale.
+fn server_no_rescan(allow_rescan: bool) -> bool {
+    !allow_rescan
+}
+
 fn input_is_hprof(input: &str) -> bool {
     if input == "-" {
         return false;
@@ -7172,6 +7192,41 @@ mod cli_tests {
         assert_eq!(full_char_len(Char, 0, 1000, Some(3)), 3);
         // ...and falls back to the array when the dump records no `count`.
         assert_eq!(full_char_len(Char, 0, 12, None), 12);
+    }
+
+    /// The `server` subcommand must refuse to re-read the dump by default — the
+    /// escalated re-run happens while the analysis stays resident, so its peak
+    /// is additive and OOM-kills a 32 GiB box. Pin the default so a later edit
+    /// cannot quietly flip it back to the old "bare" behavior.
+    #[test]
+    fn server_refuses_rescan_by_default() {
+        let cli = Cli::try_parse_from(["hprof-analyzer", "server", "heap.hprof"]).unwrap();
+        let allow_rescan = match cli.cmd {
+            Some(Cmd::Server { allow_rescan, .. }) => allow_rescan,
+            _ => panic!("expected the server subcommand"),
+        };
+        assert!(!allow_rescan, "the escape hatch must be OFF by default");
+        assert!(
+            server_no_rescan(allow_rescan),
+            "the server must refuse to re-read the dump unless --allow-rescan is given"
+        );
+    }
+
+    /// `--allow-rescan` is the explicit escape hatch: it is the only way to turn
+    /// the escalated re-run back on.
+    #[test]
+    fn server_allow_rescan_opts_back_in() {
+        let cli = Cli::try_parse_from(["hprof-analyzer", "server", "heap.hprof", "--allow-rescan"])
+            .unwrap();
+        let allow_rescan = match cli.cmd {
+            Some(Cmd::Server { allow_rescan, .. }) => allow_rescan,
+            _ => panic!("expected the server subcommand"),
+        };
+        assert!(allow_rescan, "--allow-rescan must set the escape hatch");
+        assert!(
+            !server_no_rescan(allow_rescan),
+            "--allow-rescan must permit the escalated re-run"
+        );
     }
 
     #[test]
