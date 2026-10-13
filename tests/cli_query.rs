@@ -5033,7 +5033,14 @@ mod server_cli {
     fn http(port: u16, method: &str, path: &str, body: &str) -> String {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
         stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
+            // The FIRST request on a fresh `query --server` builds the resident
+            // ReplCache (Pass1+Pass2), which is ~16 s for this fixture in an
+            // unoptimized debug build — so a 10 s read timeout raced it and made
+            // every OQL-issuing test here fail locally (the help/schema/version
+            // ones, which never touch the cache, stayed green). 60 s still
+            // catches a genuinely hung server. Measured: cold 16.6 s, warm
+            // 0.07 s.
+            .set_read_timeout(Some(Duration::from_secs(60)))
             .unwrap();
         let req = format!(
             "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
