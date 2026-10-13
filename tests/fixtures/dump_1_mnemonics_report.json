@@ -1,6 +1,6 @@
 {
   "schema_version": 11,
-  "generated": "2026-08-04T06:58:52.476022000Z",
+  "generated": "2026-10-13T07:58:04.383089500Z",
   "overview": {
     "source_name": "dump_1_mnemonics.hprof",
     "file_path": "tests/fixtures/dump_1_mnemonics.hprof",
@@ -34,17 +34,17 @@
           "shallow_heap": 5965480
         },
         {
-          "kind": "Object arrays",
+          "kind": "Object Arrays",
           "objects": 4667,
           "shallow_heap": 1297664
         },
         {
-          "kind": "Primitive arrays",
+          "kind": "Primitive Arrays",
           "objects": 61681,
           "shallow_heap": 4507432
         },
         {
-          "kind": "Class objects",
+          "kind": "Class Objects",
           "objects": 2285,
           "shallow_heap": 30088
         }
@@ -187,17 +187,17 @@
           "shallow_heap": 32432
         },
         {
-          "kind": "Object arrays",
+          "kind": "Object Arrays",
           "objects": 40,
           "shallow_heap": 1592
         },
         {
-          "kind": "Primitive arrays",
+          "kind": "Primitive Arrays",
           "objects": 2477,
           "shallow_heap": 641416
         },
         {
-          "kind": "Class objects",
+          "kind": "Class Objects",
           "objects": 101,
           "shallow_heap": 0
         }
@@ -25382,8 +25382,205 @@
       }
     ],
     "histogram_truncated_to": null,
-    "system_properties": [],
-    "jvm_version": null,
+    "system_properties": [
+      {
+        "key": "file.encoding",
+        "value": "UTF-8"
+      },
+      {
+        "key": "file.separator",
+        "value": "/"
+      },
+      {
+        "key": "java.class.path",
+        "value": "/home/i560383/renaissance.jar"
+      },
+      {
+        "key": "java.class.version",
+        "value": "65.0"
+      },
+      {
+        "key": "java.home",
+        "value": "/usr/lib/jvm/java-21-openjdk-amd64"
+      },
+      {
+        "key": "java.io.tmpdir",
+        "value": "/tmp"
+      },
+      {
+        "key": "java.library.path",
+        "value": "/usr/java/packages/lib:/usr/lib/x86_64-linux-gnu/jni:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/usr/lib/jni:/lib:/usr/lib"
+      },
+      {
+        "key": "java.runtime.name",
+        "value": "OpenJDK Runtime Environment"
+      },
+      {
+        "key": "java.runtime.version",
+        "value": "21.0.11+10-1-25.10.2-Ubuntu"
+      },
+      {
+        "key": "java.specification.name",
+        "value": "Java Platform API Specification"
+      },
+      {
+        "key": "java.specification.vendor",
+        "value": "Oracle Corporation"
+      },
+      {
+        "key": "java.specification.version",
+        "value": "21"
+      },
+      {
+        "key": "java.util.logging.SimpleFormatter.format",
+        "value": "[%1$tFT%1$tT.%1$tL%1$tz] %3$s (%2$s)%n%4$s: %5$s%n%6$s"
+      },
+      {
+        "key": "java.vendor",
+        "value": "Ubuntu"
+      },
+      {
+        "key": "java.vendor.url",
+        "value": "https://ubuntu.com/"
+      },
+      {
+        "key": "java.vendor.url.bug",
+        "value": "https://bugs.launchpad.net/ubuntu/+source/openjdk-21"
+      },
+      {
+        "key": "java.version",
+        "value": "21.0.11"
+      },
+      {
+        "key": "java.version.date",
+        "value": "2026-04-21"
+      },
+      {
+        "key": "java.vm.compressedOopsMode",
+        "value": "32-bit"
+      },
+      {
+        "key": "java.vm.info",
+        "value": "mixed mode, sharing"
+      },
+      {
+        "key": "java.vm.name",
+        "value": "OpenJDK 64-Bit Server VM"
+      },
+      {
+        "key": "java.vm.specification.name",
+        "value": "Java Virtual Machine Specification"
+      },
+      {
+        "key": "java.vm.specification.vendor",
+        "value": "Oracle Corporation"
+      },
+      {
+        "key": "java.vm.specification.version",
+        "value": "21"
+      },
+      {
+        "key": "java.vm.vendor",
+        "value": "Ubuntu"
+      },
+      {
+        "key": "java.vm.version",
+        "value": "21.0.11+10-1-25.10.2-Ubuntu"
+      },
+      {
+        "key": "jdk.debug",
+        "value": "release"
+      },
+      {
+        "key": "line.separator",
+        "value": "\n"
+      },
+      {
+        "key": "native.encoding",
+        "value": "UTF-8"
+      },
+      {
+        "key": "os.arch",
+        "value": "amd64"
+      },
+      {
+        "key": "os.name",
+        "value": "Linux"
+      },
+      {
+        "key": "os.version",
+        "value": "6.17.0-40-generic"
+      },
+      {
+        "key": "path.separator",
+        "value": ":"
+      },
+      {
+        "key": "stderr.encoding",
+        "value": "UTF-8"
+      },
+      {
+        "key": "stdout.encoding",
+        "value": "UTF-8"
+      },
+      {
+        "key": "sun.arch.data.model",
+        "value": "64"
+      },
+      {
+        "key": "sun.boot.library.path",
+        "value": "/usr/lib/jvm/java-21-openjdk-amd64/lib"
+      },
+      {
+        "key": "sun.cpu.endian",
+        "value": "little"
+      },
+      {
+        "key": "sun.io.unicode.encoding",
+        "value": "UnicodeLittle"
+      },
+      {
+        "key": "sun.java.command",
+        "value": "/home/i560383/renaissance.jar mnemonics -r 4"
+      },
+      {
+        "key": "sun.java.launcher",
+        "value": "SUN_STANDARD"
+      },
+      {
+        "key": "sun.jnu.encoding",
+        "value": "UTF-8"
+      },
+      {
+        "key": "sun.management.compiler",
+        "value": "HotSpot 64-Bit Tiered Compilers"
+      },
+      {
+        "key": "user.country",
+        "value": "US"
+      },
+      {
+        "key": "user.dir",
+        "value": "/home/i560383"
+      },
+      {
+        "key": "user.home",
+        "value": "/home/i560383"
+      },
+      {
+        "key": "user.language",
+        "value": "en"
+      },
+      {
+        "key": "user.name",
+        "value": "i560383"
+      },
+      {
+        "key": "user.timezone",
+        "value": "Europe/Berlin"
+      }
+    ],
+    "jvm_version": "21.0.11+10-1-25.10.2-Ubuntu",
     "loader_rollup": [
       {
         "loader_label": "<boot>",
@@ -99987,12 +100184,305 @@
       {
         "pretty_class": "java.lang.Thread",
         "instances": 25,
-        "retained": 5768024
+        "retained": 5768024,
+        "holders": [
+          {
+            "holder_class": "java.lang.Object[]",
+            "count": 2,
+            "retained": 576,
+            "level2": [
+              {
+                "holder_class": "java.lang.Class",
+                "count": 1062,
+                "retained": 2771904
+              },
+              {
+                "holder_class": "java.util.ImmutableCollections$SetN",
+                "count": 149,
+                "retained": 92256
+              },
+              {
+                "holder_class": "java.util.ArrayList",
+                "count": 512,
+                "retained": 65008
+              },
+              {
+                "holder_class": "java.lang.Object[]",
+                "count": 132,
+                "retained": 55200
+              },
+              {
+                "holder_class": "java.lang.invoke.LambdaForm$Name",
+                "count": 309,
+                "retained": 8800
+              },
+              {
+                "holder_class": "java.util.concurrent.CopyOnWriteArrayList",
+                "count": 77,
+                "retained": 7696
+              },
+              {
+                "holder_class": "java.util.ImmutableCollections$MapN",
+                "count": 6,
+                "retained": 6728
+              },
+              {
+                "holder_class": "java.lang.OutOfMemoryError",
+                "count": 4,
+                "retained": 2752
+              },
+              {
+                "holder_class": "java.util.ImmutableCollections$ListN",
+                "count": 31,
+                "retained": 1568
+              },
+              {
+                "holder_class": "java.util.IdentityHashMap",
+                "count": 3,
+                "retained": 1408
+              }
+            ]
+          }
+        ]
       },
       {
         "pretty_class": "java.lang.Class",
         "instances": 1622,
-        "retained": 3589808
+        "retained": 3589808,
+        "holders": [
+          {
+            "holder_class": "java.lang.Object[]",
+            "count": 393,
+            "retained": 33072,
+            "level2": [
+              {
+                "holder_class": "java.lang.Class",
+                "count": 1062,
+                "retained": 2771904
+              },
+              {
+                "holder_class": "java.util.ImmutableCollections$SetN",
+                "count": 149,
+                "retained": 92256
+              },
+              {
+                "holder_class": "java.util.ArrayList",
+                "count": 512,
+                "retained": 65008
+              },
+              {
+                "holder_class": "java.lang.Object[]",
+                "count": 132,
+                "retained": 55200
+              },
+              {
+                "holder_class": "java.lang.invoke.LambdaForm$Name",
+                "count": 309,
+                "retained": 8800
+              },
+              {
+                "holder_class": "java.util.concurrent.CopyOnWriteArrayList",
+                "count": 77,
+                "retained": 7696
+              },
+              {
+                "holder_class": "java.util.ImmutableCollections$MapN",
+                "count": 6,
+                "retained": 6728
+              },
+              {
+                "holder_class": "java.lang.OutOfMemoryError",
+                "count": 4,
+                "retained": 2752
+              },
+              {
+                "holder_class": "java.util.ImmutableCollections$ListN",
+                "count": 31,
+                "retained": 1568
+              },
+              {
+                "holder_class": "java.util.IdentityHashMap",
+                "count": 3,
+                "retained": 1408
+              }
+            ]
+          },
+          {
+            "holder_class": "java.lang.invoke.DirectMethodHandle$Constructor",
+            "count": 65,
+            "retained": 2176,
+            "level2": [
+              {
+                "holder_class": "java.lang.Object[]",
+                "count": 117,
+                "retained": 19072
+              },
+              {
+                "holder_class": "jdk.internal.reflect.DirectConstructorHandleAccessor",
+                "count": 1,
+                "retained": 144
+              }
+            ]
+          },
+          {
+            "holder_class": "java.lang.invoke.MemberName",
+            "count": 57,
+            "retained": 1040,
+            "level2": [
+              {
+                "holder_class": "java.lang.invoke.DirectMethodHandle",
+                "count": 160,
+                "retained": 17976
+              },
+              {
+                "holder_class": "java.lang.invoke.LambdaForm",
+                "count": 136,
+                "retained": 11048
+              },
+              {
+                "holder_class": "java.lang.invoke.DirectMethodHandle$Constructor",
+                "count": 241,
+                "retained": 9640
+              },
+              {
+                "holder_class": "java.lang.invoke.DirectMethodHandle$Special",
+                "count": 66,
+                "retained": 7904
+              },
+              {
+                "holder_class": "java.lang.invoke.LambdaForm$NamedFunction",
+                "count": 103,
+                "retained": 5608
+              },
+              {
+                "holder_class": "java.util.concurrent.ConcurrentHashMap$Node",
+                "count": 10,
+                "retained": 400
+              },
+              {
+                "holder_class": "java.lang.Object[]",
+                "count": 6,
+                "retained": 336
+              },
+              {
+                "holder_class": "java.lang.invoke.MemberName[]",
+                "count": 4,
+                "retained": 224
+              },
+              {
+                "holder_class": "java.lang.invoke.MethodType",
+                "count": 1,
+                "retained": 56
+              },
+              {
+                "holder_class": "java.lang.Thread",
+                "count": 1,
+                "retained": 56
+              }
+            ]
+          },
+          {
+            "holder_class": "java.lang.Class",
+            "count": 18,
+            "retained": 432,
+            "level2": [
+              {
+                "holder_class": "java.lang.Object[]",
+                "count": 393,
+                "retained": 33072
+              },
+              {
+                "holder_class": "java.lang.invoke.DirectMethodHandle$Constructor",
+                "count": 65,
+                "retained": 2176
+              },
+              {
+                "holder_class": "java.lang.invoke.MemberName",
+                "count": 57,
+                "retained": 1040
+              },
+              {
+                "holder_class": "java.lang.Class",
+                "count": 18,
+                "retained": 432
+              },
+              {
+                "holder_class": "org.renaissance.harness.Config$$Lambda+0x00007ff1d4116280",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "scopt.OptionDef$$Lambda+0x00007ff1d40fd950",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "scopt.OptionDef$$Lambda+0x00007ff1d40d2a28",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "scopt.Read$$anon$2$$Lambda+0x00007ff1d40d7750",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "org.renaissance.harness.ConfigParser$$anon$1$$Lambda+0x00007ff1d40dd6a0",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "org.renaissance.harness.ConfigParser$$anon$1$$Lambda+0x00007ff1d40de018",
+                "count": 1,
+                "retained": 48
+              }
+            ]
+          },
+          {
+            "holder_class": "org.renaissance.harness.Config$$Lambda+0x00007ff1d4116280",
+            "count": 1,
+            "retained": 48,
+            "level2": [
+              {
+                "holder_class": "java.lang.invoke.BoundMethodHandle$Species_L",
+                "count": 1,
+                "retained": 64
+              }
+            ]
+          },
+          {
+            "holder_class": "scopt.OptionDef$$Lambda+0x00007ff1d40fd950",
+            "count": 1,
+            "retained": 48,
+            "level2": [
+              {
+                "holder_class": "java.lang.invoke.BoundMethodHandle$Species_L",
+                "count": 1,
+                "retained": 64
+              }
+            ]
+          },
+          {
+            "holder_class": "scopt.OptionDef$$Lambda+0x00007ff1d40d2a28",
+            "count": 1,
+            "retained": 48
+          },
+          {
+            "holder_class": "scopt.Read$$anon$2$$Lambda+0x00007ff1d40d7750",
+            "count": 1,
+            "retained": 48
+          },
+          {
+            "holder_class": "org.renaissance.harness.ConfigParser$$anon$1$$Lambda+0x00007ff1d40dd6a0",
+            "count": 1,
+            "retained": 48
+          },
+          {
+            "holder_class": "org.renaissance.harness.ConfigParser$$anon$1$$Lambda+0x00007ff1d40de018",
+            "count": 1,
+            "retained": 48
+          }
+        ]
       },
       {
         "pretty_class": "java.util.jar.JarFile",
@@ -100002,7 +100492,329 @@
       {
         "pretty_class": "java.lang.String",
         "instances": 8922,
-        "retained": 605792
+        "retained": 605792,
+        "holders": [
+          {
+            "holder_class": "java.util.HashMap$Node",
+            "count": 44967,
+            "retained": 4156728,
+            "level2": [
+              {
+                "holder_class": "java.util.HashMap$Node[]",
+                "count": 37059,
+                "retained": 6138512
+              },
+              {
+                "holder_class": "java.util.HashMap$Node",
+                "count": 10671,
+                "retained": 1675512
+              },
+              {
+                "holder_class": "java.lang.Thread",
+                "count": 16,
+                "retained": 1936
+              }
+            ]
+          },
+          {
+            "holder_class": "java.lang.Class",
+            "count": 1720,
+            "retained": 109256,
+            "level2": [
+              {
+                "holder_class": "java.lang.Object[]",
+                "count": 393,
+                "retained": 33072
+              },
+              {
+                "holder_class": "java.lang.invoke.DirectMethodHandle$Constructor",
+                "count": 65,
+                "retained": 2176
+              },
+              {
+                "holder_class": "java.lang.invoke.MemberName",
+                "count": 57,
+                "retained": 1040
+              },
+              {
+                "holder_class": "java.lang.Class",
+                "count": 18,
+                "retained": 432
+              },
+              {
+                "holder_class": "org.renaissance.harness.Config$$Lambda+0x00007ff1d4116280",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "scopt.OptionDef$$Lambda+0x00007ff1d40fd950",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "scopt.OptionDef$$Lambda+0x00007ff1d40d2a28",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "scopt.Read$$anon$2$$Lambda+0x00007ff1d40d7750",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "org.renaissance.harness.ConfigParser$$anon$1$$Lambda+0x00007ff1d40dd6a0",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "org.renaissance.harness.ConfigParser$$anon$1$$Lambda+0x00007ff1d40de018",
+                "count": 1,
+                "retained": 48
+              }
+            ]
+          },
+          {
+            "holder_class": "java.util.LinkedHashMap$Entry",
+            "count": 1125,
+            "retained": 100432,
+            "level2": [
+              {
+                "holder_class": "java.util.LinkedHashMap",
+                "count": 1179,
+                "retained": 148544
+              }
+            ]
+          },
+          {
+            "holder_class": "java.lang.Object[]",
+            "count": 1195,
+            "retained": 61296,
+            "level2": [
+              {
+                "holder_class": "java.lang.Class",
+                "count": 1062,
+                "retained": 2771904
+              },
+              {
+                "holder_class": "java.util.ImmutableCollections$SetN",
+                "count": 149,
+                "retained": 92256
+              },
+              {
+                "holder_class": "java.util.ArrayList",
+                "count": 512,
+                "retained": 65008
+              },
+              {
+                "holder_class": "java.lang.Object[]",
+                "count": 132,
+                "retained": 55200
+              },
+              {
+                "holder_class": "java.lang.invoke.LambdaForm$Name",
+                "count": 309,
+                "retained": 8800
+              },
+              {
+                "holder_class": "java.util.concurrent.CopyOnWriteArrayList",
+                "count": 77,
+                "retained": 7696
+              },
+              {
+                "holder_class": "java.util.ImmutableCollections$MapN",
+                "count": 6,
+                "retained": 6728
+              },
+              {
+                "holder_class": "java.lang.OutOfMemoryError",
+                "count": 4,
+                "retained": 2752
+              },
+              {
+                "holder_class": "java.util.ImmutableCollections$ListN",
+                "count": 31,
+                "retained": 1568
+              },
+              {
+                "holder_class": "java.util.IdentityHashMap",
+                "count": 3,
+                "retained": 1408
+              }
+            ]
+          },
+          {
+            "holder_class": "java.util.concurrent.ConcurrentHashMap$Node",
+            "count": 665,
+            "retained": 44536,
+            "level2": [
+              {
+                "holder_class": "java.util.concurrent.ConcurrentHashMap$Node[]",
+                "count": 4719,
+                "retained": 401968
+              },
+              {
+                "holder_class": "java.util.concurrent.ConcurrentHashMap$Node",
+                "count": 1239,
+                "retained": 94472
+              }
+            ]
+          },
+          {
+            "holder_class": "java.lang.invoke.MethodType",
+            "count": 274,
+            "retained": 29584,
+            "level2": [
+              {
+                "holder_class": "jdk.internal.util.WeakReferenceKey",
+                "count": 6,
+                "retained": 240
+              }
+            ]
+          },
+          {
+            "holder_class": "java.lang.invoke.MemberName",
+            "count": 276,
+            "retained": 17720,
+            "level2": [
+              {
+                "holder_class": "java.lang.invoke.DirectMethodHandle",
+                "count": 160,
+                "retained": 17976
+              },
+              {
+                "holder_class": "java.lang.invoke.LambdaForm",
+                "count": 136,
+                "retained": 11048
+              },
+              {
+                "holder_class": "java.lang.invoke.DirectMethodHandle$Constructor",
+                "count": 241,
+                "retained": 9640
+              },
+              {
+                "holder_class": "java.lang.invoke.DirectMethodHandle$Special",
+                "count": 66,
+                "retained": 7904
+              },
+              {
+                "holder_class": "java.lang.invoke.LambdaForm$NamedFunction",
+                "count": 103,
+                "retained": 5608
+              },
+              {
+                "holder_class": "java.util.concurrent.ConcurrentHashMap$Node",
+                "count": 10,
+                "retained": 400
+              },
+              {
+                "holder_class": "java.lang.Object[]",
+                "count": 6,
+                "retained": 336
+              },
+              {
+                "holder_class": "java.lang.invoke.MemberName[]",
+                "count": 4,
+                "retained": 224
+              },
+              {
+                "holder_class": "java.lang.invoke.MethodType",
+                "count": 1,
+                "retained": 56
+              },
+              {
+                "holder_class": "java.lang.Thread",
+                "count": 1,
+                "retained": 56
+              }
+            ]
+          },
+          {
+            "holder_class": "java.lang.String[]",
+            "count": 252,
+            "retained": 14808,
+            "level2": [
+              {
+                "holder_class": "java.lang.Class",
+                "count": 23,
+                "retained": 17880
+              },
+              {
+                "holder_class": "java.util.HashMap$Node",
+                "count": 82,
+                "retained": 4608
+              },
+              {
+                "holder_class": "sun.security.util.KnownOIDs",
+                "count": 264,
+                "retained": 4504
+              },
+              {
+                "holder_class": "java.util.Arrays$ArrayList",
+                "count": 1,
+                "retained": 2432
+              },
+              {
+                "holder_class": "java.util.HashMap$Node[]",
+                "count": 40,
+                "retained": 1736
+              },
+              {
+                "holder_class": "java.lang.String[][]",
+                "count": 25,
+                "retained": 600
+              },
+              {
+                "holder_class": "java.lang.Thread",
+                "count": 2,
+                "retained": 288
+              },
+              {
+                "holder_class": "sun.nio.cs.UTF_8",
+                "count": 1,
+                "retained": 24
+              },
+              {
+                "holder_class": "sun.security.util.KnownOIDs$2",
+                "count": 1,
+                "retained": 16
+              },
+              {
+                "holder_class": "sun.security.util.KnownOIDs$1",
+                "count": 1,
+                "retained": 16
+              }
+            ]
+          },
+          {
+            "holder_class": "java.net.URI",
+            "count": 129,
+            "retained": 7672,
+            "level2": [
+              {
+                "holder_class": "java.lang.Class",
+                "count": 3,
+                "retained": 576
+              },
+              {
+                "holder_class": "jdk.internal.module.ModuleReferenceImpl",
+                "count": 1,
+                "retained": 200
+              }
+            ]
+          },
+          {
+            "holder_class": "java.lang.Thread",
+            "count": 76,
+            "retained": 4600,
+            "level2": [
+              {
+                "holder_class": "java.lang.Object[]",
+                "count": 2,
+                "retained": 576
+              }
+            ]
+          }
+        ]
       },
       {
         "pretty_class": "java.util.zip.ZipFile$Source",
@@ -100012,12 +100824,378 @@
       {
         "pretty_class": "java.lang.Object[]",
         "instances": 4,
-        "retained": 109120
+        "retained": 109120,
+        "holders": [
+          {
+            "holder_class": "java.lang.Class",
+            "count": 1062,
+            "retained": 2771904,
+            "level2": [
+              {
+                "holder_class": "java.lang.Object[]",
+                "count": 393,
+                "retained": 33072
+              },
+              {
+                "holder_class": "java.lang.invoke.DirectMethodHandle$Constructor",
+                "count": 65,
+                "retained": 2176
+              },
+              {
+                "holder_class": "java.lang.invoke.MemberName",
+                "count": 57,
+                "retained": 1040
+              },
+              {
+                "holder_class": "java.lang.Class",
+                "count": 18,
+                "retained": 432
+              },
+              {
+                "holder_class": "org.renaissance.harness.Config$$Lambda+0x00007ff1d4116280",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "scopt.OptionDef$$Lambda+0x00007ff1d40fd950",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "scopt.OptionDef$$Lambda+0x00007ff1d40d2a28",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "scopt.Read$$anon$2$$Lambda+0x00007ff1d40d7750",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "org.renaissance.harness.ConfigParser$$anon$1$$Lambda+0x00007ff1d40dd6a0",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "org.renaissance.harness.ConfigParser$$anon$1$$Lambda+0x00007ff1d40de018",
+                "count": 1,
+                "retained": 48
+              }
+            ]
+          },
+          {
+            "holder_class": "java.util.ImmutableCollections$SetN",
+            "count": 149,
+            "retained": 92256,
+            "level2": [
+              {
+                "holder_class": "sun.util.cldr.CLDRLocaleProviderAdapter",
+                "count": 1,
+                "retained": 61736
+              },
+              {
+                "holder_class": "java.lang.module.ModuleDescriptor",
+                "count": 92,
+                "retained": 28800
+              },
+              {
+                "holder_class": "java.lang.module.ModuleDescriptor$Exports",
+                "count": 26,
+                "retained": 2136
+              },
+              {
+                "holder_class": "java.lang.Object[]",
+                "count": 23,
+                "retained": 1736
+              },
+              {
+                "holder_class": "jdk.internal.module.SystemModuleFinders$SystemModuleFinder",
+                "count": 1,
+                "retained": 536
+              },
+              {
+                "holder_class": "java.lang.module.Configuration",
+                "count": 1,
+                "retained": 536
+              },
+              {
+                "holder_class": "java.lang.Class",
+                "count": 4,
+                "retained": 312
+              }
+            ]
+          },
+          {
+            "holder_class": "java.util.ArrayList",
+            "count": 512,
+            "retained": 65008,
+            "level2": [
+              {
+                "holder_class": "java.util.HashMap$Node",
+                "count": 432,
+                "retained": 34568
+              },
+              {
+                "holder_class": "java.net.URLClassLoader",
+                "count": 2,
+                "retained": 31920
+              },
+              {
+                "holder_class": "jdk.internal.loader.ClassLoaders$AppClassLoader",
+                "count": 1,
+                "retained": 5024
+              },
+              {
+                "holder_class": "java.util.concurrent.ConcurrentHashMap$Node",
+                "count": 31,
+                "retained": 2864
+              },
+              {
+                "holder_class": "java.security.Provider$Service",
+                "count": 30,
+                "retained": 1568
+              },
+              {
+                "holder_class": "jdk.internal.loader.URLClassPath",
+                "count": 6,
+                "retained": 440
+              },
+              {
+                "holder_class": "java.lang.Thread",
+                "count": 16,
+                "retained": 384
+              },
+              {
+                "holder_class": "java.util.logging.LogManager$RootLogger",
+                "count": 1,
+                "retained": 208
+              },
+              {
+                "holder_class": "scala.collection.convert.JavaCollectionWrappers$JListWrapper",
+                "count": 1,
+                "retained": 176
+              },
+              {
+                "holder_class": "java.lang.module.ModuleDescriptor$Version",
+                "count": 3,
+                "retained": 152
+              }
+            ]
+          },
+          {
+            "holder_class": "java.lang.Object[]",
+            "count": 132,
+            "retained": 55200,
+            "level2": [
+              {
+                "holder_class": "java.lang.Class",
+                "count": 1062,
+                "retained": 2771904
+              },
+              {
+                "holder_class": "java.util.ImmutableCollections$SetN",
+                "count": 149,
+                "retained": 92256
+              },
+              {
+                "holder_class": "java.util.ArrayList",
+                "count": 512,
+                "retained": 65008
+              },
+              {
+                "holder_class": "java.lang.Object[]",
+                "count": 132,
+                "retained": 55200
+              },
+              {
+                "holder_class": "java.lang.invoke.LambdaForm$Name",
+                "count": 309,
+                "retained": 8800
+              },
+              {
+                "holder_class": "java.util.concurrent.CopyOnWriteArrayList",
+                "count": 77,
+                "retained": 7696
+              },
+              {
+                "holder_class": "java.util.ImmutableCollections$MapN",
+                "count": 6,
+                "retained": 6728
+              },
+              {
+                "holder_class": "java.lang.OutOfMemoryError",
+                "count": 4,
+                "retained": 2752
+              },
+              {
+                "holder_class": "java.util.ImmutableCollections$ListN",
+                "count": 31,
+                "retained": 1568
+              },
+              {
+                "holder_class": "java.util.IdentityHashMap",
+                "count": 3,
+                "retained": 1408
+              }
+            ]
+          },
+          {
+            "holder_class": "java.lang.invoke.LambdaForm$Name",
+            "count": 309,
+            "retained": 8800,
+            "level2": [
+              {
+                "holder_class": "java.lang.invoke.LambdaForm$Name[]",
+                "count": 371,
+                "retained": 27368
+              },
+              {
+                "holder_class": "java.lang.invoke.LambdaForm",
+                "count": 4,
+                "retained": 128
+              }
+            ]
+          },
+          {
+            "holder_class": "java.util.concurrent.CopyOnWriteArrayList",
+            "count": 77,
+            "retained": 7696,
+            "level2": [
+              {
+                "holder_class": "java.util.concurrent.ConcurrentHashMap$Node",
+                "count": 71,
+                "retained": 9488
+              },
+              {
+                "holder_class": "java.util.logging.Logger$ConfigurationData",
+                "count": 4,
+                "retained": 1168
+              },
+              {
+                "holder_class": "java.lang.Class",
+                "count": 1,
+                "retained": 64
+              },
+              {
+                "holder_class": "java.util.logging.LogManager",
+                "count": 1,
+                "retained": 56
+              }
+            ]
+          },
+          {
+            "holder_class": "java.util.ImmutableCollections$MapN",
+            "count": 6,
+            "retained": 6728,
+            "level2": [
+              {
+                "holder_class": "java.lang.module.Configuration",
+                "count": 2,
+                "retained": 4688
+              },
+              {
+                "holder_class": "java.lang.Class",
+                "count": 2,
+                "retained": 1144
+              },
+              {
+                "holder_class": "jdk.internal.module.SystemModuleFinders$SystemModuleFinder",
+                "count": 1,
+                "retained": 1040
+              }
+            ]
+          },
+          {
+            "holder_class": "java.lang.OutOfMemoryError",
+            "count": 4,
+            "retained": 2752,
+            "level2": [
+              {
+                "holder_class": "java.lang.OutOfMemoryError[]",
+                "count": 12,
+                "retained": 3688
+              }
+            ]
+          },
+          {
+            "holder_class": "java.util.ImmutableCollections$ListN",
+            "count": 31,
+            "retained": 1568,
+            "level2": [
+              {
+                "holder_class": "java.lang.module.ModuleDescriptor$Provides",
+                "count": 12,
+                "retained": 792
+              },
+              {
+                "holder_class": "java.lang.invoke.BoundMethodHandle$SpeciesData",
+                "count": 12,
+                "retained": 696
+              },
+              {
+                "holder_class": "java.lang.invoke.BoundMethodHandle$Specializer$Factory",
+                "count": 3,
+                "retained": 288
+              },
+              {
+                "holder_class": "java.lang.Runtime$Version",
+                "count": 1,
+                "retained": 56
+              },
+              {
+                "holder_class": "java.lang.Class",
+                "count": 1,
+                "retained": 40
+              }
+            ]
+          },
+          {
+            "holder_class": "java.util.IdentityHashMap",
+            "count": 3,
+            "retained": 1408,
+            "level2": [
+              {
+                "holder_class": "java.lang.Class",
+                "count": 1,
+                "retained": 1096
+              },
+              {
+                "holder_class": "java.util.Collections$SynchronizedMap",
+                "count": 1,
+                "retained": 312
+              },
+              {
+                "holder_class": "java.util.Collections$SetFromMap",
+                "count": 1,
+                "retained": 120
+              }
+            ]
+          }
+        ]
       },
       {
         "pretty_class": "java.lang.invoke.MethodType",
         "instances": 675,
-        "retained": 85688
+        "retained": 85688,
+        "holders": [
+          {
+            "holder_class": "jdk.internal.util.WeakReferenceKey",
+            "count": 6,
+            "retained": 240,
+            "level2": [
+              {
+                "holder_class": "java.util.concurrent.ConcurrentHashMap$Node",
+                "count": 681,
+                "retained": 22032
+              },
+              {
+                "holder_class": "jdk.internal.util.ReferencedKeyMap",
+                "count": 17,
+                "retained": 544
+              }
+            ]
+          }
+        ]
       },
       {
         "pretty_class": "java.net.URLClassLoader",
@@ -100027,7 +101205,103 @@
       {
         "pretty_class": "java.lang.Module",
         "instances": 61,
-        "retained": 64640
+        "retained": 64640,
+        "holders": [
+          {
+            "holder_class": "java.util.HashMap$Node",
+            "count": 4,
+            "retained": 1696,
+            "level2": [
+              {
+                "holder_class": "java.util.HashMap$Node[]",
+                "count": 37059,
+                "retained": 6138512
+              },
+              {
+                "holder_class": "java.util.HashMap$Node",
+                "count": 10671,
+                "retained": 1675512
+              },
+              {
+                "holder_class": "java.lang.Thread",
+                "count": 16,
+                "retained": 1936
+              }
+            ]
+          },
+          {
+            "holder_class": "java.net.URLClassLoader",
+            "count": 2,
+            "retained": 96
+          },
+          {
+            "holder_class": "java.lang.Class",
+            "count": 1,
+            "retained": 48,
+            "level2": [
+              {
+                "holder_class": "java.lang.Object[]",
+                "count": 393,
+                "retained": 33072
+              },
+              {
+                "holder_class": "java.lang.invoke.DirectMethodHandle$Constructor",
+                "count": 65,
+                "retained": 2176
+              },
+              {
+                "holder_class": "java.lang.invoke.MemberName",
+                "count": 57,
+                "retained": 1040
+              },
+              {
+                "holder_class": "java.lang.Class",
+                "count": 18,
+                "retained": 432
+              },
+              {
+                "holder_class": "org.renaissance.harness.Config$$Lambda+0x00007ff1d4116280",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "scopt.OptionDef$$Lambda+0x00007ff1d40fd950",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "scopt.OptionDef$$Lambda+0x00007ff1d40d2a28",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "scopt.Read$$anon$2$$Lambda+0x00007ff1d40d7750",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "org.renaissance.harness.ConfigParser$$anon$1$$Lambda+0x00007ff1d40dd6a0",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "org.renaissance.harness.ConfigParser$$anon$1$$Lambda+0x00007ff1d40de018",
+                "count": 1,
+                "retained": 48
+              }
+            ]
+          },
+          {
+            "holder_class": "jdk.internal.loader.ClassLoaders$BootClassLoader",
+            "count": 1,
+            "retained": 48
+          },
+          {
+            "holder_class": "jdk.internal.loader.ClassLoaders$PlatformClassLoader",
+            "count": 1,
+            "retained": 48
+          }
+        ]
       },
       {
         "pretty_class": "sun.security.provider.Sun",
@@ -100042,7 +101316,179 @@
       {
         "pretty_class": "java.lang.invoke.LambdaForm",
         "instances": 103,
-        "retained": 42688
+        "retained": 42688,
+        "holders": [
+          {
+            "holder_class": "java.lang.invoke.LambdaFormEditor$Transform",
+            "count": 12,
+            "retained": 11312,
+            "level2": [
+              {
+                "holder_class": "java.lang.invoke.LambdaForm",
+                "count": 21,
+                "retained": 12320
+              },
+              {
+                "holder_class": "java.lang.invoke.LambdaFormEditor$Transform[]",
+                "count": 2,
+                "retained": 96
+              }
+            ]
+          },
+          {
+            "holder_class": "java.lang.ref.SoftReference",
+            "count": 20,
+            "retained": 7720,
+            "level2": [
+              {
+                "holder_class": "java.util.jar.JarFile",
+                "count": 6,
+                "retained": 604616
+              },
+              {
+                "holder_class": "java.lang.ref.SoftReference[]",
+                "count": 128,
+                "retained": 12840
+              },
+              {
+                "holder_class": "jdk.internal.loader.ClassLoaders$BootClassLoader",
+                "count": 1,
+                "retained": 536
+              },
+              {
+                "holder_class": "jdk.internal.loader.ClassLoaders$PlatformClassLoader",
+                "count": 1,
+                "retained": 536
+              },
+              {
+                "holder_class": "jdk.internal.loader.ClassLoaders$AppClassLoader",
+                "count": 1,
+                "retained": 536
+              },
+              {
+                "holder_class": "sun.util.locale.BaseLocale$Key",
+                "count": 10,
+                "retained": 400
+              },
+              {
+                "holder_class": "sun.security.util.CryptoAlgorithmConstraints",
+                "count": 1,
+                "retained": 280
+              }
+            ]
+          },
+          {
+            "holder_class": "java.lang.invoke.LambdaForm[]",
+            "count": 1,
+            "retained": 480,
+            "level2": [
+              {
+                "holder_class": "java.lang.Class",
+                "count": 3,
+                "retained": 1104
+              }
+            ]
+          },
+          {
+            "holder_class": "java.lang.Class",
+            "count": 1,
+            "retained": 232,
+            "level2": [
+              {
+                "holder_class": "java.lang.Object[]",
+                "count": 393,
+                "retained": 33072
+              },
+              {
+                "holder_class": "java.lang.invoke.DirectMethodHandle$Constructor",
+                "count": 65,
+                "retained": 2176
+              },
+              {
+                "holder_class": "java.lang.invoke.MemberName",
+                "count": 57,
+                "retained": 1040
+              },
+              {
+                "holder_class": "java.lang.Class",
+                "count": 18,
+                "retained": 432
+              },
+              {
+                "holder_class": "org.renaissance.harness.Config$$Lambda+0x00007ff1d4116280",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "scopt.OptionDef$$Lambda+0x00007ff1d40fd950",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "scopt.OptionDef$$Lambda+0x00007ff1d40d2a28",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "scopt.Read$$anon$2$$Lambda+0x00007ff1d40d7750",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "org.renaissance.harness.ConfigParser$$anon$1$$Lambda+0x00007ff1d40dd6a0",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "org.renaissance.harness.ConfigParser$$anon$1$$Lambda+0x00007ff1d40de018",
+                "count": 1,
+                "retained": 48
+              }
+            ]
+          },
+          {
+            "holder_class": "java.lang.invoke.DirectMethodHandle",
+            "count": 1,
+            "retained": 200,
+            "level2": [
+              {
+                "holder_class": "java.lang.Object[]",
+                "count": 113,
+                "retained": 19120
+              },
+              {
+                "holder_class": "java.lang.invoke.MethodHandleImpl$AsVarargsCollector",
+                "count": 22,
+                "retained": 3032
+              },
+              {
+                "holder_class": "java.lang.Class",
+                "count": 1,
+                "retained": 296
+              },
+              {
+                "holder_class": "java.util.ImmutableCollections$List12",
+                "count": 2,
+                "retained": 192
+              },
+              {
+                "holder_class": "java.lang.invoke.BoundMethodHandle$SpeciesData",
+                "count": 1,
+                "retained": 96
+              },
+              {
+                "holder_class": "java.lang.invoke.MethodType",
+                "count": 1,
+                "retained": 40
+              },
+              {
+                "holder_class": "java.lang.Thread",
+                "count": 1,
+                "retained": 40
+              }
+            ]
+          }
+        ]
       },
       {
         "pretty_class": "java.lang.module.ModuleDescriptor",
@@ -100052,7 +101498,156 @@
       {
         "pretty_class": "java.util.concurrent.ConcurrentHashMap",
         "instances": 1,
-        "retained": 34864
+        "retained": 34864,
+        "holders": [
+          {
+            "holder_class": "java.lang.Class",
+            "count": 27,
+            "retained": 120320,
+            "level2": [
+              {
+                "holder_class": "java.lang.Object[]",
+                "count": 393,
+                "retained": 33072
+              },
+              {
+                "holder_class": "java.lang.invoke.DirectMethodHandle$Constructor",
+                "count": 65,
+                "retained": 2176
+              },
+              {
+                "holder_class": "java.lang.invoke.MemberName",
+                "count": 57,
+                "retained": 1040
+              },
+              {
+                "holder_class": "java.lang.Class",
+                "count": 18,
+                "retained": 432
+              },
+              {
+                "holder_class": "org.renaissance.harness.Config$$Lambda+0x00007ff1d4116280",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "scopt.OptionDef$$Lambda+0x00007ff1d40fd950",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "scopt.OptionDef$$Lambda+0x00007ff1d40d2a28",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "scopt.Read$$anon$2$$Lambda+0x00007ff1d40d7750",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "org.renaissance.harness.ConfigParser$$anon$1$$Lambda+0x00007ff1d40dd6a0",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "org.renaissance.harness.ConfigParser$$anon$1$$Lambda+0x00007ff1d40de018",
+                "count": 1,
+                "retained": 48
+              }
+            ]
+          },
+          {
+            "holder_class": "java.time.zone.TzdbZoneRulesProvider",
+            "count": 1,
+            "retained": 118480,
+            "level2": [
+              {
+                "holder_class": "java.lang.Class",
+                "count": 1,
+                "retained": 121008
+              }
+            ]
+          },
+          {
+            "holder_class": "sun.security.provider.Sun",
+            "count": 3,
+            "retained": 54440
+          },
+          {
+            "holder_class": "jdk.internal.util.ReferencedKeyMap",
+            "count": 1,
+            "retained": 48568,
+            "level2": [
+              {
+                "holder_class": "jdk.internal.util.ReferencedKeySet",
+                "count": 1,
+                "retained": 49192
+              }
+            ]
+          },
+          {
+            "holder_class": "jdk.internal.loader.ClassLoaders$AppClassLoader",
+            "count": 7,
+            "retained": 47632
+          },
+          {
+            "holder_class": "java.net.URLClassLoader",
+            "count": 8,
+            "retained": 45336
+          },
+          {
+            "holder_class": "jdk.internal.loader.ClassLoaders$PlatformClassLoader",
+            "count": 7,
+            "retained": 32544
+          },
+          {
+            "holder_class": "jdk.internal.module.ServicesCatalog",
+            "count": 4,
+            "retained": 12736,
+            "level2": [
+              {
+                "holder_class": "java.lang.ModuleLayer",
+                "count": 1,
+                "retained": 7656
+              }
+            ]
+          },
+          {
+            "holder_class": "java.util.Properties",
+            "count": 4,
+            "retained": 8576,
+            "level2": [
+              {
+                "holder_class": "java.lang.Class",
+                "count": 3,
+                "retained": 7112
+              },
+              {
+                "holder_class": "java.util.logging.LogManager",
+                "count": 1,
+                "retained": 1688
+              }
+            ]
+          },
+          {
+            "holder_class": "java.security.Permissions",
+            "count": 7,
+            "retained": 2912,
+            "level2": [
+              {
+                "holder_class": "java.security.ProtectionDomain",
+                "count": 5,
+                "retained": 2600
+              },
+              {
+                "holder_class": "sun.security.util.LazyCodeSourcePermissionCollection",
+                "count": 2,
+                "retained": 536
+              }
+            ]
+          }
+        ]
       },
       {
         "pretty_class": "jdk.internal.loader.ClassLoaders$PlatformClassLoader",
@@ -100062,17 +101657,154 @@
       {
         "pretty_class": "java.lang.invoke.MethodTypeForm",
         "instances": 107,
-        "retained": 29616
+        "retained": 29616,
+        "holders": [
+          {
+            "holder_class": "java.lang.invoke.MethodType",
+            "count": 60,
+            "retained": 9240,
+            "level2": [
+              {
+                "holder_class": "jdk.internal.util.WeakReferenceKey",
+                "count": 6,
+                "retained": 240
+              }
+            ]
+          }
+        ]
       },
       {
         "pretty_class": "java.io.PrintStream",
         "instances": 1,
-        "retained": 17696
+        "retained": 17696,
+        "holders": [
+          {
+            "holder_class": "java.lang.Class",
+            "count": 1,
+            "retained": 17720,
+            "level2": [
+              {
+                "holder_class": "java.lang.Object[]",
+                "count": 393,
+                "retained": 33072
+              },
+              {
+                "holder_class": "java.lang.invoke.DirectMethodHandle$Constructor",
+                "count": 65,
+                "retained": 2176
+              },
+              {
+                "holder_class": "java.lang.invoke.MemberName",
+                "count": 57,
+                "retained": 1040
+              },
+              {
+                "holder_class": "java.lang.Class",
+                "count": 18,
+                "retained": 432
+              },
+              {
+                "holder_class": "org.renaissance.harness.Config$$Lambda+0x00007ff1d4116280",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "scopt.OptionDef$$Lambda+0x00007ff1d40fd950",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "scopt.OptionDef$$Lambda+0x00007ff1d40d2a28",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "scopt.Read$$anon$2$$Lambda+0x00007ff1d40d7750",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "org.renaissance.harness.ConfigParser$$anon$1$$Lambda+0x00007ff1d40dd6a0",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "org.renaissance.harness.ConfigParser$$anon$1$$Lambda+0x00007ff1d40de018",
+                "count": 1,
+                "retained": 48
+              }
+            ]
+          }
+        ]
       },
       {
         "pretty_class": "java.net.URI",
         "instances": 61,
-        "retained": 12096
+        "retained": 12096,
+        "holders": [
+          {
+            "holder_class": "java.lang.Class",
+            "count": 3,
+            "retained": 576,
+            "level2": [
+              {
+                "holder_class": "java.lang.Object[]",
+                "count": 393,
+                "retained": 33072
+              },
+              {
+                "holder_class": "java.lang.invoke.DirectMethodHandle$Constructor",
+                "count": 65,
+                "retained": 2176
+              },
+              {
+                "holder_class": "java.lang.invoke.MemberName",
+                "count": 57,
+                "retained": 1040
+              },
+              {
+                "holder_class": "java.lang.Class",
+                "count": 18,
+                "retained": 432
+              },
+              {
+                "holder_class": "org.renaissance.harness.Config$$Lambda+0x00007ff1d4116280",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "scopt.OptionDef$$Lambda+0x00007ff1d40fd950",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "scopt.OptionDef$$Lambda+0x00007ff1d40d2a28",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "scopt.Read$$anon$2$$Lambda+0x00007ff1d40d7750",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "org.renaissance.harness.ConfigParser$$anon$1$$Lambda+0x00007ff1d40dd6a0",
+                "count": 1,
+                "retained": 48
+              },
+              {
+                "holder_class": "org.renaissance.harness.ConfigParser$$anon$1$$Lambda+0x00007ff1d40de018",
+                "count": 1,
+                "retained": 48
+              }
+            ]
+          },
+          {
+            "holder_class": "jdk.internal.module.ModuleReferenceImpl",
+            "count": 1,
+            "retained": 200
+          }
+        ]
       },
       {
         "pretty_class": "java.lang.ModuleLayer",
@@ -100716,6 +102448,7 @@
         "significant_frames": [
           {
             "frame": "java.lang.StringLatin1$CharsSpliterator.forEachRemaining (StringLatin1.java:811)",
+            "frame_number": 2,
             "locals": [
               {
                 "display_class": "java.util.stream.IntPipeline$1$1",
@@ -100731,6 +102464,7 @@
           },
           {
             "frame": "java.util.stream.AbstractPipeline.copyInto (AbstractPipeline.java:509)",
+            "frame_number": 4,
             "locals": [
               {
                 "display_class": "java.util.stream.IntPipeline$1$1",
@@ -100741,6 +102475,7 @@
           },
           {
             "frame": "java.util.stream.AbstractPipeline.wrapAndCopyInto (AbstractPipeline.java:499)",
+            "frame_number": 5,
             "locals": [
               {
                 "display_class": "java.util.stream.ReduceOps$3ReducingSink",
@@ -100751,6 +102486,7 @@
           },
           {
             "frame": "java.util.stream.Collectors.lambda$groupingBy$53 (Collectors.java:1105)",
+            "frame_number": 11,
             "locals": [
               {
                 "display_class": "java.util.HashMap",
@@ -100776,6 +102512,7 @@
           },
           {
             "frame": "java.util.Spliterators$ArraySpliterator.forEachRemaining (Spliterators.java:1024)",
+            "frame_number": 14,
             "locals": [
               {
                 "display_class": "java.lang.String[]",
@@ -100791,6 +102528,7 @@
           },
           {
             "frame": "java.util.stream.AbstractPipeline.copyInto (AbstractPipeline.java:509)",
+            "frame_number": 15,
             "locals": [
               {
                 "display_class": "java.util.stream.ReduceOps$3ReducingSink",
@@ -100801,6 +102539,7 @@
           },
           {
             "frame": "java.util.stream.AbstractPipeline.wrapAndCopyInto (AbstractPipeline.java:499)",
+            "frame_number": 16,
             "locals": [
               {
                 "display_class": "java.util.stream.ReduceOps$3ReducingSink",
@@ -100811,6 +102550,7 @@
           },
           {
             "frame": "java.util.stream.ReferencePipeline.collect (ReferencePipeline.java:682)",
+            "frame_number": 19,
             "locals": [
               {
                 "display_class": "java.util.stream.Collectors$CollectorImpl",
@@ -100821,6 +102561,7 @@
           },
           {
             "frame": "org.renaissance.jdk.streams.MnemonicsCoderWithStream.encode (MnemonicsCoderWithStream.java:62)",
+            "frame_number": 21,
             "locals": [
               {
                 "display_class": "org.renaissance.jdk.streams.MnemonicsCoderWithStream",
@@ -100841,6 +102582,7 @@
           },
           {
             "frame": "org.renaissance.jdk.streams.MnemonicsCoderWithStream.lambda$encode$9 (MnemonicsCoderWithStream.java:67)",
+            "frame_number": 22,
             "locals": [
               {
                 "display_class": "java.lang.String",
@@ -100856,6 +102598,7 @@
           },
           {
             "frame": "java.util.stream.ReferencePipeline$3$1.accept (ReferencePipeline.java:197)",
+            "frame_number": 24,
             "locals": [
               {
                 "display_class": "java.util.stream.ReferencePipeline$7$1",
@@ -100866,6 +102609,7 @@
           },
           {
             "frame": "java.util.ArrayList$ArrayListSpliterator.forEachRemaining (ArrayList.java:1708)",
+            "frame_number": 25,
             "locals": [
               {
                 "display_class": "java.util.ArrayList$ArrayListSpliterator",
@@ -100961,6 +102705,7 @@
         "significant_frames": [
           {
             "frame": "java.lang.Object.wait (Object.java:366)",
+            "frame_number": 1,
             "locals": [
               {
                 "display_class": "java.lang.ref.NativeReferenceQueue$Lock",
@@ -100971,6 +102716,7 @@
           },
           {
             "frame": "java.lang.Object.wait (Object.java:339)",
+            "frame_number": 2,
             "locals": [
               {
                 "display_class": "java.lang.ref.NativeReferenceQueue$Lock",
@@ -100981,6 +102727,7 @@
           },
           {
             "frame": "java.lang.ref.NativeReferenceQueue.await (NativeReferenceQueue.java:48)",
+            "frame_number": 3,
             "locals": [
               {
                 "display_class": "java.lang.ref.NativeReferenceQueue",
@@ -100991,6 +102738,7 @@
           },
           {
             "frame": "java.lang.ref.ReferenceQueue.remove0 (ReferenceQueue.java:158)",
+            "frame_number": 4,
             "locals": [
               {
                 "display_class": "java.lang.ref.NativeReferenceQueue",
@@ -101001,6 +102749,7 @@
           },
           {
             "frame": "java.lang.ref.NativeReferenceQueue.remove (NativeReferenceQueue.java:89)",
+            "frame_number": 5,
             "locals": [
               {
                 "display_class": "java.lang.ref.NativeReferenceQueue",
@@ -101016,6 +102765,7 @@
           },
           {
             "frame": "java.lang.ref.Finalizer$FinalizerThread.run (Finalizer.java:173)",
+            "frame_number": 6,
             "locals": [
               {
                 "display_class": "java.lang.System$2",
@@ -101126,6 +102876,7 @@
         "significant_frames": [
           {
             "frame": "java.util.concurrent.locks.LockSupport.parkNanos (LockSupport.java:269)",
+            "frame_number": 1,
             "locals": [
               {
                 "display_class": "java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject",
@@ -101136,6 +102887,7 @@
           },
           {
             "frame": "java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject.await (AbstractQueuedSynchronizer.java:1886)",
+            "frame_number": 2,
             "locals": [
               {
                 "display_class": "java.util.concurrent.TimeUnit",
@@ -101156,6 +102908,7 @@
           },
           {
             "frame": "java.lang.ref.ReferenceQueue.await (ReferenceQueue.java:71)",
+            "frame_number": 3,
             "locals": [
               {
                 "display_class": "java.lang.ref.ReferenceQueue",
@@ -101166,6 +102919,7 @@
           },
           {
             "frame": "java.lang.ref.ReferenceQueue.remove0 (ReferenceQueue.java:143)",
+            "frame_number": 4,
             "locals": [
               {
                 "display_class": "java.lang.ref.ReferenceQueue",
@@ -101176,6 +102930,7 @@
           },
           {
             "frame": "java.lang.ref.ReferenceQueue.remove (ReferenceQueue.java:218)",
+            "frame_number": 5,
             "locals": [
               {
                 "display_class": "java.lang.ref.ReferenceQueue",
@@ -101186,6 +102941,7 @@
           },
           {
             "frame": "jdk.internal.ref.CleanerImpl.run (CleanerImpl.java:140)",
+            "frame_number": 6,
             "locals": [
               {
                 "display_class": "jdk.internal.ref.CleanerImpl",
@@ -101196,6 +102952,7 @@
           },
           {
             "frame": "java.lang.Thread.runWith (Thread.java:1596)",
+            "frame_number": 7,
             "locals": [
               {
                 "display_class": "java.lang.Class",
@@ -101211,6 +102968,7 @@
           },
           {
             "frame": "java.lang.Thread.run (Thread.java:1583)",
+            "frame_number": 8,
             "locals": [
               {
                 "display_class": "java.lang.Class",
@@ -101542,7 +103300,7 @@
   },
   "dominator_analysis": {
     "big_drops": {
-      "threshold": 118005,
+      "threshold": 118006,
       "rows": [
         {
           "obj_index_1based": 176145,
@@ -112596,10 +114354,10 @@
           "retained": 1728
         },
         {
-          "pretty_class": "[Ljava.lang.Object;",
+          "pretty_class": "java.lang.Object[]",
           "objects": 2,
           "shallow": 64,
-          "retained": 0
+          "retained": 64
         },
         {
           "pretty_class": "java.util.ArrayList",
@@ -112823,18 +114581,21 @@
   "leak_indicators": {
     "anonymous_class_count": 174,
     "thread_local_null_key_count": 0,
-    "direct_byte_buffer_capacity_sum": 140862014
+    "direct_byte_buffer_capacity_sum": 140862014,
+    "direct_byte_buffer_distinct_capacity_sum": 140862014,
+    "direct_byte_buffer_instance_count": 8
   },
   "waste_summary": {
     "total_bytes": 1251176,
+    "reachable_bytes": 1183438,
     "sources": [
       {
-        "label": "Under-filled object arrays",
+        "label": "Under-filled Object Arrays",
         "bytes": 754336,
         "anchor": "collections"
       },
       {
-        "label": "Under-filled collections",
+        "label": "Under-filled Collections",
         "bytes": 496840,
         "anchor": "collections"
       }
@@ -112844,8 +114605,8 @@
     {
       "id": "headline-retainer",
       "severity": "critical",
-      "title": "Headline retainer",
-      "detail": "`java.lang.Thread` (a single object) retains 5.5 MB (48.8% of reachable heap).",
+      "title": "Headline Retainer",
+      "detail": "`java.lang.Thread` (a single object) retains 5.5 MiB (48.8% of reachable heap).",
       "anchor": "leak-suspects",
       "anchor_label": "Leak Suspects",
       "nav_class": "java.lang.Thread"
@@ -112854,23 +114615,23 @@
       "id": "concentration",
       "severity": "info",
       "title": "Concentration",
-      "detail": "diffuse — retention is spread across multiple roots, so there is no single object to free.",
+      "detail": "diffuse — no suspect exceeds the threshold; retention is spread across multiple roots. Inspect individual suspects to find the most impactful target.",
       "anchor": "leak-suspects",
       "anchor_label": "Leak Suspects"
     },
     {
       "id": "shape",
       "severity": "info",
-      "title": "Shape",
-      "detail": "deep (retention flows through long dominator chains — often nested collections or linked structures) — 90% of objects within depth 8, max depth 28.",
+      "title": "Heap Shape",
+      "detail": "deep — long dominator chains suggest nested collections or linked structures; the depth histogram shows the distribution; use the Big Drops table to find the retaining objects — 90% of objects within depth 8, max depth 28.",
       "anchor": "dominator-depth-distribution",
       "anchor_label": "Dominator-Depth Distribution"
     },
     {
       "id": "one-leak-or-many",
       "severity": "info",
-      "title": "One leak or many",
-      "detail": "the single biggest object, `java.lang.Thread`, retains 48.8% and the top 10 retain 84.3% of the heap; 6 object(s) each hold >=1%.",
+      "title": "One Leak or Many",
+      "detail": "the single biggest object, `java.lang.Thread`, retains 48.8% and the top 10 retain 84.3% of the heap; 6 objects each hold ≥1%.",
       "anchor": "top-consumers",
       "anchor_label": "Top Consumers",
       "nav_class": "java.lang.Thread"
@@ -112878,40 +114639,56 @@
     {
       "id": "thread-pinning",
       "severity": "warning",
-      "title": "Thread pinning",
-      "detail": "thread `main` retains 5.5 MB (48.8% of heap) and pins 329 thread-local roots — a live thread is holding memory alive.",
+      "title": "Thread Pinning",
+      "detail": "thread `main` retains 5.5 MiB (48.8% of heap) via 329 thread-local GC root references — a running thread is pinning a disproportionate share of the heap. Inspect the thread's stack frames and ThreadLocal values.",
       "anchor": "threads",
       "anchor_label": "Threads"
     },
     {
       "id": "off-heap",
       "severity": "warning",
-      "title": "Off-heap (DirectByteBuffer)",
-      "detail": "134.3 MB of native memory is held by live DirectByteBuffers — not counted in heap size but can dominate RSS.",
-      "anchor": "leak-indicators",
-      "anchor_label": "Leak Indicators"
+      "title": "Off-Heap (DirectByteBuffer)",
+      "detail": "134.3 MiB of native memory (de-duplicated) is held by live DirectByteBuffers — not reflected in the on-heap totals, but counts against process RSS and can trigger OS-level OOM.",
+      "anchor": "off-heap-nio",
+      "anchor_label": "Off-Heap NIO"
     },
     {
       "id": "fixed-per-object-overhead",
       "severity": "warning",
-      "title": "Fixed per-object header overhead",
-      "detail": "334,875 objects × 12 B header = 3.8 MB (34.1% of heap) is consumed by JVM object headers alone — consider value types, primitive arrays, or fewer wrapper objects.",
+      "title": "Fixed per-Object Header Overhead",
+      "detail": "3.8 MiB (34.1% of heap) consumed by JVM object headers alone (334,875 objects × 12 B each) — consider replacing wrapper objects with primitive arrays, off-heap buffers, or primitive-specialized collections.",
       "anchor": "object-header-overhead",
-      "anchor_label": "Header Overhead"
+      "anchor_label": "Object Header Overhead"
     },
     {
       "id": "empty-collection-cemetery",
       "severity": "info",
-      "title": "Empty-collection cemetery",
-      "detail": "2,943 of 3,891 tracked collections (75.6%) are empty (size == 0) — pre-allocated but never populated containers waste object-header overhead; consider lazy initialisation or null.",
+      "title": "Empty-Collection Cemetery",
+      "detail": "2,943 of 3,891 tracked collections (75.6%) are empty — pre-allocated but never populated containers waste object-header overhead at scale. Use lazy initialization (allocate only when the first element is added) or return `Collections.emptyList()` / `List.of()` sentinels for the read-only empty case.",
       "anchor": "collections",
       "anchor_label": "Collections"
     },
     {
+      "id": "stale-jdk",
+      "severity": "info",
+      "title": "Stale JDK Version",
+      "detail": "JVM version `21.0.11+10-1-25.10.2-Ubuntu` (JDK 21) was released ~1023 days before this dump was captured. Update to the latest patch release to rule out known JDK memory bugs and GC regressions.",
+      "anchor": "system-overview",
+      "anchor_label": "System Overview"
+    },
+    {
+      "id": "component-retention-imbalance",
+      "severity": "warning",
+      "title": "Component Retention Imbalance",
+      "detail": "Component `<boot>` retains 95.4% of heap (59.0 MiB) while the next largest component (`java/net/URLClassLoader`) retains only 4.2%. In a multi-module or multi-app deployment (OSGi, EE, Tomcat) this imbalance means one component dominates the heap. Investigate whether a class-loader-scoped cache, static field, or event-listener registration in `<boot>` is accumulating without a release path.",
+      "anchor": "top-components",
+      "anchor_label": "Top Components"
+    },
+    {
       "id": "collections-not-analyzed",
       "severity": "info",
-      "title": "Collection waste not analyzed",
-      "detail": "_Collection waste not analyzed — re-run with `--collections` to check for wasted capacity._"
+      "title": "Collection Waste Not Analyzed",
+      "detail": "Collection waste not analyzed — re-run with `--collections` to check for wasted capacity."
     }
   ],
   "top_retainers": [

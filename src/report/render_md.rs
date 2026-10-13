@@ -247,11 +247,38 @@ always bugs — see the **What to Check** column for how to triage each one._\n\
         ]);
     }
     if li.direct_byte_buffer_capacity_sum > 0 {
-        t.row([
-            "`DirectByteBuffer` off-heap capacity".into(),
-            format_bytes(li.direct_byte_buffer_capacity_sum),
-            "Native memory, excluded from JVM heap totals. Check for NIO buffer pools that leak on close, or Netty/gRPC allocators missing a buffer cap.".into(),
-        ]);
+        let sum = li.direct_byte_buffer_capacity_sum;
+        let distinct = li.direct_byte_buffer_distinct_capacity_sum;
+        let value = if distinct > 0 {
+            format!(
+                "{} (sum) / {} (de-duplicated)",
+                format_bytes(sum),
+                format_bytes(distinct)
+            )
+        } else {
+            format!("{} (sum)", format_bytes(sum))
+        };
+        let advice = if distinct > 0 {
+            format!(
+                "Native memory, excluded from JVM heap totals. Two figures, two scopes: the \
+**sum** adds up the `capacity` of all {} `DirectByteBuffer` instances, so memory shared \
+between a buffer and its `duplicate()`/`slice()` views is counted once per view; the \
+**de-duplicated** figure merges those overlapping ranges and is the one to compare against \
+process RSS (MAT's `direct` reports the same quantity). A large gap between them means the \
+app is view-heavy, not that it holds that much native memory. Check for NIO buffer pools \
+that leak on close, or Netty/gRPC allocators missing a buffer cap.",
+                fmt_count(li.direct_byte_buffer_instance_count)
+            )
+        } else {
+            "Native memory, excluded from JVM heap totals. This is the **sum** over all \
+`DirectByteBuffer` instances: buffers sharing memory with a `duplicate()`/`slice()` view are \
+counted once per view, so treat it as an upper bound — it can overstate real native usage by \
+an order of magnitude. The de-duplicated figure is unavailable for this dump (no \
+`java.nio.Buffer.address` field, i.e. JDK 22+, or too many buffer instances). Check for NIO \
+buffer pools that leak on close, or Netty/gRPC allocators missing a buffer cap."
+                .to_string()
+        };
+        t.row(["`DirectByteBuffer` off-heap capacity".into(), value, advice]);
     }
     t.render(out);
     out.push('\n');
@@ -282,18 +309,14 @@ pub fn render_markdown(r: &Report) -> String {
     render_executive_summary(r, &mut out);
     render_oom_triage(r, &mut out);
     render_waste_summary(r, &mut out);
-    render_system_overview(
-        &r.overview,
-        r.leak_indicators.direct_byte_buffer_capacity_sum,
-        &mut out,
-    );
+    render_system_overview(&r.overview, &r.leak_indicators, &mut out);
     render_leak_suspects(&r.leaks, &mut out);
     render_top_consumers(&r.top, r.leaks.total_shallow, &mut out);
     render_dominator_analysis(&r.dominator_analysis, false, &mut out);
     render_threads(&r.threads, false, &mut out);
     render_thread_local_analysis(&r.thread_local_analysis, &mut out);
     render_framework_analysis(&r.framework_analysis, &mut out);
-    render_top_components(&r.top_components, false, &mut out);
+    render_top_components(&r.top_components, r.overview.total_shallow, false, &mut out);
     render_arrays_by_size(&r.arrays_by_size, r.overview.total_shallow, false, &mut out);
     render_collections(&r.collections, &r.collection_attribution, false, &mut out);
     render_collection_attribution(&r.collection_attribution, false, &mut out);
@@ -941,6 +964,16 @@ _Definitions for the heap analysis terms used throughout this report._
 - **Instance vs. class**: an *instance* is one object; a *class* row aggregates
   every instance of that type. \"Largest\" in the histogram is the shallow size of
   the single biggest instance of a class.
+- **Instance counts — three scopes**: the report counts instances at three
+  different scopes, so the same class legitimately shows three different numbers.
+  (1) `Instances (heap)` in the Class Histogram is the **class total**: every
+  reachable instance of that class. (2) `Top Dominators` in
+  \"Biggest Classes by Retained Heap\" counts only the objects of that class whose
+  immediate dominator is a GC root — a class with millions of instances can have
+  a handful of top-level dominators. (3) `In Subtree` under a leak suspect's
+  \"Accumulated objects by class\" counts only the instances **inside that one
+  suspect's dominated subtree**. None of the three is a subset relation you can
+  read off directly, and none of them should be expected to match.
 - **Collection fill ratio**: the fraction of a collection's backing-array capacity
   that is actually occupied by elements — `elements / capacity`. A fill ratio near
   0 means the backing array is mostly empty (wasted memory). A ratio near 1 means
@@ -957,7 +990,7 @@ _Definitions for the heap analysis terms used throughout this report._
   ReferenceQueue.
 - **Compressed OOPs** (Compressed Ordinary Object Pointers): a JVM optimization
   where object references are stored as 32-bit integers instead of 64-bit pointers,
-  halving reference-field overhead on heaps ≤ ~32 GB. Visible in the Heap Summary
+  halving reference-field overhead on heaps ≤ ~32 GiB. Visible in the Heap Summary
   as `Compressed OOPs: yes`.
 - **Class#field**: the notation used throughout this report to identify a specific
   field — `HolderClass#fieldName`. For example `java.util.HashMap#table` names the
@@ -965,9 +998,83 @@ _Definitions for the heap analysis terms used throughout this report._
   object, not a guaranteed allocation site — it is a hint, not a precise origin.
 ";
 
+/// Append the off-heap `DirectByteBuffer` rows to a Heap Summary table.
+///
+/// Two different quantities, always shown together and always labelled: the
+/// per-instance sum (which double-counts memory shared between a buffer and its
+/// `duplicate()`/`slice()` views) and the de-duplicated range union. Reporting
+/// only the first is what let a few hundred MiB of real native memory read as
+/// several GiB. Shared by the plain and the ASCII-graph renderers so the two
+/// can never drift.
+pub(crate) fn push_off_heap_rows(
+    summary: &mut crate::md::Table,
+    o: &SystemOverview,
+    li: &crate::report::LeakIndicators,
+) {
+    let off_heap_cap = li.direct_byte_buffer_capacity_sum;
+    if off_heap_cap == 0 {
+        return;
+    }
+    summary.row([
+        "Off-Heap (sum over instances)".into(),
+        format!(
+            "{}{}",
+            format_bytes(off_heap_cap),
+            if o.total_shallow > 0 {
+                format!(
+                    " ({:.1}\u{00d7} on-heap)",
+                    off_heap_cap as f64 / o.total_shallow as f64
+                )
+            } else {
+                String::new()
+            }
+        ),
+    ]);
+    let distinct = li.direct_byte_buffer_distinct_capacity_sum;
+    if distinct > 0 {
+        summary.row([
+            "Off-Heap (de-duplicated)".into(),
+            if distinct == off_heap_cap {
+                format!(
+                    "{} over {} buffer instances — no shared views, so the two figures agree",
+                    format_bytes(distinct),
+                    fmt_count(li.direct_byte_buffer_instance_count),
+                )
+            } else {
+                format!(
+                    "{} over {} buffer instances — {:.1}\u{00d7} less than the sum above",
+                    format_bytes(distinct),
+                    fmt_count(li.direct_byte_buffer_instance_count),
+                    off_heap_cap as f64 / distinct as f64,
+                )
+            },
+        ]);
+    } else {
+        summary.row([
+            "Off-Heap (de-duplicated)".into(),
+            "_not computed for this dump (no `java.nio.Buffer.address` field, i.e. JDK 22+, or \
+too many buffer instances) \u{2014} the figure above is an upper bound_"
+                .into(),
+        ]);
+    }
+}
+
+/// Caption above the System Properties table. States what the table can and
+/// cannot answer, because the JVM launch command line — and therefore `-Xmx`,
+/// the GC selection, and the humongous-allocation threshold — is **not** part of
+/// a HPROF dump: the format has no record type for it. A reader who greps this
+/// report for `-Xmx` and finds nothing must be told that the dump has no such
+/// field, not left to conclude that the renderer dropped it.
+pub(crate) const SYSTEM_PROPERTIES_CAPTION: &str = "_The `java.lang.System` property table as it stood when the dump was taken, sorted by key. \
+**This is not the JVM command line:** HPROF records no launch arguments, so `-Xmx`, `-XX:` GC flags and the humongous-allocation threshold are absent from every heap dump (MAT cannot show them either). Heap-limit and GC-mode conclusions must come from outside the dump._\n\n";
+
 /// Render the "System Overview" section (plain Markdown): scalars, GC-roots and
 /// heap-composition breakdowns, and the full class histogram. Byte-exact-tested.
-pub(crate) fn render_system_overview(o: &SystemOverview, off_heap_cap: u64, out: &mut String) {
+pub(crate) fn render_system_overview(
+    o: &SystemOverview,
+    li: &crate::report::LeakIndicators,
+    out: &mut String,
+) {
     use crate::md::{Align, Table};
     out.push_str("## System Overview\n\n");
     out.push_str("_JVM and dump metadata, heap totals, GC root breakdown, class loader sizes, and system properties._\n\n");
@@ -993,18 +1100,7 @@ pub(crate) fn render_system_overview(o: &SystemOverview, off_heap_cap: u64, out:
     }
     summary.row(["Total Objects".into(), fmt_count(o.total_objects)]);
     summary.row([HEAP_SCALAR_LABEL.into(), format_bytes(o.total_shallow)]);
-    if off_heap_cap > 0 {
-        let ratio_str = if o.total_shallow > 0 {
-            format!(
-                "{} off-heap ({:.1}× on-heap)",
-                format_bytes(off_heap_cap),
-                off_heap_cap as f64 / o.total_shallow as f64,
-            )
-        } else {
-            format!("{} off-heap", format_bytes(off_heap_cap))
-        };
-        summary.row(["Off-Heap / On-Heap".into(), ratio_str]);
-    }
+    push_off_heap_rows(&mut summary, o, li);
     summary.row(["GC Roots".into(), fmt_count(o.gc_roots)]);
     summary.row(["Classes Loaded".into(), fmt_count(o.classes_loaded)]);
     summary.row(["Class Loaders".into(), fmt_count(o.classloaders_loaded)]);
@@ -1064,6 +1160,7 @@ pub(crate) fn render_system_overview(o: &SystemOverview, off_heap_cap: u64, out:
         const CAP: usize = 40;
         const VAL_MAX: usize = 120;
         out.push_str("### System Properties\n\n");
+        out.push_str(SYSTEM_PROPERTIES_CAPTION);
         let shown = o.system_properties.len().min(CAP);
         let mut t = Table::new(&["Property", "Value"], &[Align::Left, Align::Left]);
         for p in &o.system_properties[..shown] {
@@ -1082,6 +1179,14 @@ pub(crate) fn render_system_overview(o: &SystemOverview, off_heap_cap: u64, out:
             ));
         }
         out.push('\n');
+    } else {
+        // The heading is part of the section's contract — the intro line above
+        // promises system properties — so say plainly that this dump has none
+        // rather than leaving the reader to wonder whether the table was
+        // dropped by the renderer.
+        out.push_str("### System Properties\n\n");
+        out.push_str(SYSTEM_PROPERTIES_CAPTION);
+        out.push_str("_None recorded in this dump._\n\n");
     }
 
     // (a single-type breakdown restates the "GC roots" scalar above).
@@ -1231,13 +1336,20 @@ registering JNI globals without a matching `DeleteGlobalRef`._\n\n",
     out.push_str("### Class Histogram (by Retained Heap)\n\n");
     out.push_str(
         "_Every loaded class with its instance count, shallow heap (own bytes), and retained heap \
-(bytes freed when all instances become unreachable). Top 50 shown._\n\n",
+(bytes freed when all instances become unreachable). Top 50 shown._\n\n\
+_`Instances (heap)` counts **every instance of the class in the reachable heap** — this is the \
+class total, and it is the number to quote when asked \"how many of X are there?\". The other \
+instance counts in this report measure different things: \
+[Biggest Classes by Retained Heap](#biggest-classes-by-retained-heap) counts only \
+**top-level dominators** of the class, and a leak suspect's \
+[Accumulated objects by class](#leak-suspects) counts only instances **inside that suspect's \
+dominated subtree**. The three numbers are all correct and will not agree._\n\n",
     );
     let mut hist = Table::new(
         &[
             "#",
             "Class",
-            "Instances",
+            "Instances (heap)",
             "Shallow",
             "Largest",
             "Retained",
@@ -1512,8 +1624,13 @@ Investigate only if the instance count is unexpectedly high \
                 ));
             }
             out.push_str("**Accumulated objects by class:**\n\n");
+            out.push_str(
+                "_`In Subtree` counts instances **dominated by this suspect only** — it is a \
+subset of the class's total instance count (see the \
+[Class Histogram](#class-histogram-by-retained-heap)), and the two will not agree._\n\n",
+            );
             let mut t = Table::new(
-                &["Class", "Instances", "Shallow", "Retained", "% of Suspect"],
+                &["Class", "In Subtree", "Shallow", "Retained", "% of Suspect"],
                 &[
                     Align::Left,
                     Align::Right,
@@ -1619,9 +1736,13 @@ that holds each object (the primary referrer; an object may have several)._\n\n"
     out.push('\n');
 
     out.push_str("### Biggest Classes by Retained Heap\n\n");
-    out.push_str("_Classes ranked by total retained heap. High retained with low shallow means the class is keeping many other objects alive — investigate it in Dominator Analysis._\n\n");
+    out.push_str("_Classes ranked by total retained heap. High retained with low shallow means the class is keeping many other objects alive — investigate it in Dominator Analysis._\n\n\
+_`Top Dominators` is the number of objects of this class whose **immediate dominator is a GC \
+root** (i.e. this class's top-level dominator nodes) — **not** the class's total instance count. \
+A class can have millions of instances and only a handful of top-level dominators. For the total, \
+see the [Class Histogram](#class-histogram-by-retained-heap)._\n\n");
     let mut classes = Table::new(
-        &["#", "Class", "Instances", "Retained"],
+        &["#", "Class", "Top Dominators", "Retained"],
         &[Align::Right, Align::Left, Align::Right, Align::Right],
     );
     for (rank, row) in t.biggest_classes.iter().enumerate() {
@@ -1829,14 +1950,66 @@ daemon flag, priority, and thread state for every recorded thread._\n\n",
             }
             render_thread_locals(objs, out);
         }
-        // Significant-frames interleave (frames with their retained locals),
-        // when locals were sampled; otherwise the plain frame list.
-        if !th.significant_frames.is_empty() {
+        // ── The COMPLETE call stack, top-first ──────────────────────────────
+        // This is every frame the dump recorded for the thread. It is never
+        // narrowed to the frames that happen to hold a sampled local: those
+        // frames are annotated *within* the full stack below. Filtering the
+        // stack down to local-holding frames used to hide the call chain that
+        // explains the retention — a 30-frame Tomcat dispatch rendered as the
+        // single frame that held an object, which reads as "no evidence" when
+        // the evidence is the frames in between.
+        if th.frames.is_empty() {
+            out.push_str("_No frames were recorded for this thread._\n\n");
+        } else {
             out.push_str(&format!(
-                "_Frame percentages are of this thread's {} retained heap._\n\n",
+                "_Complete stack: {} frame{} as recorded in the dump._\n\n",
+                fmt_count(th.frames.len() as u64),
+                if th.frames.len() == 1 { "" } else { "s" },
+            ));
+        }
+        // Index the significant frames by the stack slot they belong to, so each
+        // one lands under its own line even when every line renders identically
+        // (recursion). `u32::MAX` (or an out-of-range slot) is deferred to the
+        // trailing block below.
+        let mut by_slot: std::collections::HashMap<usize, &SignificantFrame> =
+            std::collections::HashMap::new();
+        let mut unplaced: Vec<&SignificantFrame> = Vec::new();
+        for sf in &th.significant_frames {
+            let slot = sf.frame_number as usize;
+            if sf.frame_number != u32::MAX && slot < th.frames.len() {
+                by_slot.insert(slot, sf);
+            } else {
+                unplaced.push(sf);
+            }
+        }
+        if !by_slot.is_empty() {
+            out.push_str(&format!(
+                "_Frames marked ✦ hold a sampled local variable; its retained heap is a \
+percentage of this thread's {} retained heap._\n\n",
                 format_bytes(th.retained)
             ));
-            for sf in &th.significant_frames {
+        }
+        for (i, frame) in th.frames.iter().enumerate() {
+            match by_slot.get(&i) {
+                Some(sf) => {
+                    out.push_str(&format!("- ✦ `{frame}`\n"));
+                    for loc in &sf.locals {
+                        out.push_str(&format!(
+                            "  - `{}` retains {} ({} of thread retained)\n",
+                            loc.display_class,
+                            format_bytes(loc.retained),
+                            fmt_pct(loc.pct)
+                        ));
+                    }
+                }
+                None => out.push_str(&format!("- `{frame}`\n")),
+            }
+        }
+        // Significant frames with no slot in the stack (JNI locals / native
+        // stack), or from a report written before frames carried a slot index.
+        if !unplaced.is_empty() {
+            out.push_str("\n_Frames with sampled locals that have no stack slot (JNI local / native stack):_\n\n");
+            for sf in unplaced {
                 out.push_str(&format!("- `{}`\n", sf.frame));
                 for loc in &sf.locals {
                     out.push_str(&format!(
@@ -1846,10 +2019,6 @@ daemon flag, priority, and thread state for every recorded thread._\n\n",
                         fmt_pct(loc.pct)
                     ));
                 }
-            }
-        } else {
-            for frame in &th.frames {
-                out.push_str(&format!("- `{frame}`\n"));
             }
         }
         out.push('\n');
@@ -1940,7 +2109,12 @@ so stale values accumulate; call `ThreadLocal.remove()` to clean up._\n\n",
 /// component's retained heap, its share of total reachable retained heap, and
 /// its top classes inlined. `graphs` adds a proportional retained bar column.
 /// Shared by plain md and md-graphs.
-pub(crate) fn render_top_components(tc: &TopComponents, graphs: bool, out: &mut String) {
+pub(crate) fn render_top_components(
+    tc: &TopComponents,
+    reachable_heap: u64,
+    graphs: bool,
+    out: &mut String,
+) {
     use crate::md::{Align, Table};
     out.push_str("## Top Components\n\n");
     if tc.components.is_empty() {
@@ -1948,9 +2122,48 @@ pub(crate) fn render_top_components(tc: &TopComponents, graphs: bool, out: &mut 
         return;
     }
     out.push_str(
-        "_Retained heap grouped by class loader (component). `% Heap` is the share of total reachable heap. \
-Totals can exceed 100% because retained sets overlap — an object held by multiple components is counted in each._\n\n",
+        "_Retained heap grouped by class loader (component). `% Heap` is the share of the total \
+per-class retained heap — the same overlapping sum the `Retained` column is drawn from — \
+**not** a share of the reachable heap._\n\n",
     );
+    // A component's retained figure is the sum of the retained heap of every
+    // class the loader defined. Those per-class retained sets overlap heavily
+    // (an object is retained through whatever holds it, regardless of who loaded
+    // its class), so the column is an OVERLAPPING SUM: it is not addable, and it
+    // is not comparable with the heap total. When the sum overshoots the whole
+    // reachable heap the table is actively misleading — a component cannot
+    // retain more than the entire heap — so say so loudly before the numbers.
+    let sum_retained: u64 = tc
+        .components
+        .iter()
+        .fold(0u64, |acc, c| acc.saturating_add(c.retained));
+    let overlaps_heap = reachable_heap > 0 && sum_retained > reachable_heap;
+    let any_over_heap =
+        reachable_heap > 0 && tc.components.iter().any(|c| c.retained > reachable_heap);
+    if overlaps_heap {
+        out.push_str(&format!(
+            "> ⚠ **These numbers do not add up, and must not be added up.**\n\
+             >\n\
+             > The `Retained` column sums, per class loader, the retained heap of every class \
+that loader defined. Those retained sets **overlap**, so the same object is counted under \
+every component that can reach it. The column total here is {} — **{:.1}× the entire \
+reachable heap** ({}).\n\
+             >\n\
+             > A single component cannot retain more than the whole heap. Use this table to \
+compare components *against each other*; do not compare a row with the heap total, and do not \
+sum rows. For addable, non-overlapping totals use \
+[Heap Composition](#heap-composition) and the [Class Histogram](#class-histogram-by-retained-heap).\n\n",
+            format_bytes(sum_retained),
+            sum_retained as f64 / reachable_heap as f64,
+            format_bytes(reachable_heap),
+        ));
+    }
+    if any_over_heap {
+        out.push_str(
+            "> ⚠ Rows marked ✦ individually exceed the reachable heap — an artifact of the \
+overlapping sum described above, not a measurement error in the dump.\n\n",
+        );
+    }
     let retained_max = tc.components.iter().map(|c| c.retained).max().unwrap_or(0);
     let mut headers: Vec<&str> = vec!["Component", "Retained", "% Heap", "Top Classes"];
     let mut aligns = vec![Align::Left, Align::Right, Align::Right, Align::Left];
@@ -1966,8 +2179,13 @@ Totals can exceed 100% because retained sets overlap — an object held by multi
             .map(|cc| format!("`{}` ({})", cc.pretty_class, format_bytes(cc.retained)))
             .collect::<Vec<_>>()
             .join(", ");
+        let flag = if reachable_heap > 0 && c.retained > reachable_heap {
+            " ✦"
+        } else {
+            ""
+        };
         let mut row = vec![
-            format!("`{}`", c.loader_label),
+            format!("`{}`{flag}", c.loader_label),
             format_bytes(c.retained),
             fmt_pct(c.pct),
             top,
@@ -3563,7 +3781,7 @@ by how much dominated shallow heap they gate._\n\n",
 in the object or spread across many small dominated children. \
 Drop = object retained − largest child retained; the memory freed by dropping just this \
 object, not counting what its largest dominated child already retains. \
-Threshold {:.1} MB (1% of reachable heap). \
+Threshold {:.1} MiB (1% of reachable heap). \
 Multiple rows with the same class are distinct objects._\n\n",
         threshold_mb,
     ));

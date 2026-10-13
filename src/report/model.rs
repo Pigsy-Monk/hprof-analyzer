@@ -889,8 +889,23 @@ pub struct ThreadInfo {
 pub struct SignificantFrame {
     /// Rendered frame line `class.method (source:line)`.
     pub frame: String,
+    /// Zero-based index of this frame in the owning thread's `ThreadInfo::frames`
+    /// (top-first). `u32::MAX` marks a frame that has no slot in that list — the
+    /// synthetic no-frame bucket (JNI locals / native stack) — and is also the
+    /// deserialization default for reports written before this field existed.
+    /// The renderer uses it to attach each frame's locals to the right line of
+    /// the complete stack, including in recursive stacks where every frame
+    /// renders identically.
+    #[serde(default = "significant_frame_number_default")]
+    pub frame_number: u32,
     /// Significant local objects held at this frame, retained desc.
     pub locals: Vec<SignificantLocal>,
+}
+
+/// Deserialization default for `SignificantFrame::frame_number`: "unknown", so
+/// reports written before the field existed fall back to matching by frame text.
+fn significant_frame_number_default() -> u32 {
+    u32::MAX
 }
 
 /// One significant local-variable object held at a frame.
@@ -1512,7 +1527,26 @@ pub struct LeakIndicators {
     pub thread_local_null_key_count: u64,
     /// Sum of `capacity` fields across all live `DirectByteBuffer` instances,
     /// representing total off-heap memory tracked by live NIO buffers.
+    ///
+    /// This is an **overlapping sum**: `duplicate()`, `slice()` and
+    /// `asReadOnlyBuffer()` views each report the capacity of memory they
+    /// *share* with their parent, so the same native allocation is counted once
+    /// per view. Treat it as an upper bound. Use
+    /// [`direct_byte_buffer_distinct_capacity_sum`](Self::direct_byte_buffer_distinct_capacity_sum)
+    /// for the de-duplicated figure.
     pub direct_byte_buffer_capacity_sum: u64,
+    /// De-duplicated off-heap total: the size of the union of every
+    /// `DirectByteBuffer`'s `[address, address + capacity)` memory range, so
+    /// each native allocation is counted once however many views share it.
+    /// 0 means **not computed** (the JVM has no `java.nio.Buffer.address` field,
+    /// i.e. JDK 22+, or the range bound was exceeded) — never "zero bytes".
+    #[serde(default)]
+    pub direct_byte_buffer_distinct_capacity_sum: u64,
+    /// Number of `DirectByteBuffer` instances both sums were taken over. The
+    /// ratio `capacity_sum / distinct_capacity_sum` is the average number of
+    /// views per allocation.
+    #[serde(default)]
+    pub direct_byte_buffer_instance_count: u64,
 }
 
 /// Severity of a fired OOM-triage signal. Currently carried for future HTML

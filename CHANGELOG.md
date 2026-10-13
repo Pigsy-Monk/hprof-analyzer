@@ -95,6 +95,60 @@ All notable changes to hprof-analyzer are documented here.
 
 ### Fixed
 
+- **Report instance counts now name their scope.** One report showed
+  `FareRecordContainer` as 2,174,154, 5,593,970 and 7,905,792 in three places
+  and read like a bug. All three were correct and measuring different things:
+  the Class Histogram's column is the class's **total instance count**, the
+  Dominator Analysis "Biggest Classes by Retained Heap" column counts only
+  **top-level dominators**, and a leak suspect's "Accumulated objects by
+  class" counts only instances **inside that suspect's dominated subtree**.
+  The columns are now `Instances (heap)`, `Top Dominators` and `In Subtree`,
+  each table carries a one-line scope note, and the Glossary gains an
+  "Instance counts — three scopes" entry.
+
+- **The Threads section prints the complete stack.** It used to print only the
+  frames that held a sampled local variable whenever `--thread-locals` data
+  existed, which collapsed a 30-frame Tomcat dispatch to the single frame that
+  happened to hold an object — hiding the call chain that explained the
+  retention. Every recorded frame is now listed; frames that do hold a local
+  are marked `✦` and annotated in place.
+
+- **Top Components warns when its numbers cannot be added up.** A component's
+  `Retained` is a sum of per-class retained heaps, which overlap, so the column
+  total can exceed the entire heap — on a real dump one
+  `ParallelWebappClassLoader` read 118.49 GB against a 24.86 GiB heap. When the
+  column total exceeds the reachable heap the section now says so in a
+  prominent warning, flags the offending rows, and states that `% Heap` is a
+  share of that overlapping sum rather than of the heap.
+
+- **One unit spelling: `KiB`/`MiB`/`GiB`/`TiB`/`PiB`.** `format_bytes` emitted
+  `KB`/`MB`/`GB` for 1024-based quantities, so the same report read as
+  "24.86 GB" in one place and "22.42 GiB" in another — a reader could reach
+  opposite conclusions from one sentence. Every size in the Markdown report,
+  the `--md-graphs` report and `compare reports` now carries the binary-unit
+  suffix, and the size-basis caption matches.
+
+- **Off-heap memory is reported twice, and labelled.** The single
+  `DirectByteBuffer` figure was a per-instance sum of `capacity`, which counts
+  memory shared between a buffer and its `duplicate()` / `slice()` views once
+  per view: on a real dump it read 9.14 GB against 268 MB of actual direct
+  memory. The decoder now also computes the size of the union of every
+  buffer's `[address, address + capacity)` range — each allocation counted once
+  — as `direct_byte_buffer_distinct_capacity_sum`, alongside the instance
+  count. Both figures appear in the Heap Summary and Leak Indicators, and the
+  OOM-triage off-heap rule fires on the de-duplicated one.
+
+- **System properties are rendered at all.** They never were on JDK 9+: the
+  overview's intro promised a System Properties table that never appeared,
+  because `java.util.Properties` overrides every accessor to use its own
+  `ConcurrentHashMap map` field, leaving the inherited `Hashtable.table` null
+  forever, so the resolver found nothing. The props walk now follows
+  `Properties.map` when `Hashtable.table` is empty, and decodes
+  `ConcurrentHashMap$Node` as well as `Hashtable$Entry`. The table also carries
+  a caption stating that the dump does **not** contain the JVM command line —
+  HPROF records no `-Xmx` or GC flags — and a dump with no properties now says
+  so instead of omitting the section.
+
 - **`FROM INSTANCEOF <class>` no longer drops array types.** `FROM INSTANCEOF
   java.lang.Object` answered differently on the two query paths: the CLI
   (scan) reported `byte[]` and `java.lang.Object[]`, the server reported

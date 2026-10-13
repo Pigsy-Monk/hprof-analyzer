@@ -14,18 +14,14 @@ pub fn render_markdown_graphs(r: &Report) -> String {
     render_executive_summary(r, &mut out);
     render_oom_triage(r, &mut out);
     render_waste_summary(r, &mut out);
-    render_system_overview_graphs(
-        &r.overview,
-        r.leak_indicators.direct_byte_buffer_capacity_sum,
-        &mut out,
-    );
+    render_system_overview_graphs(&r.overview, &r.leak_indicators, &mut out);
     render_leak_suspects_graphs(&r.leaks, &mut out);
     render_top_consumers_graphs(&r.top, r.leaks.total_shallow, &mut out);
     render_dominator_analysis(&r.dominator_analysis, true, &mut out);
     render_threads(&r.threads, true, &mut out);
     render_thread_local_analysis(&r.thread_local_analysis, &mut out);
     render_framework_analysis(&r.framework_analysis, &mut out);
-    render_top_components(&r.top_components, true, &mut out);
+    render_top_components(&r.top_components, r.overview.total_shallow, true, &mut out);
     render_arrays_by_size(&r.arrays_by_size, r.overview.total_shallow, true, &mut out);
     render_collections(&r.collections, &r.collection_attribution, true, &mut out);
     render_collection_attribution(&r.collection_attribution, true, &mut out);
@@ -144,7 +140,11 @@ pub(crate) const GRAPH_BAR_WIDTH: usize = 16;
 
 /// System Overview with bar columns on GC Roots / Heap Composition, a sparkline
 /// for the dominator-depth distribution, and a share bar on the class histogram.
-fn render_system_overview_graphs(o: &SystemOverview, off_heap_cap: u64, out: &mut String) {
+fn render_system_overview_graphs(
+    o: &SystemOverview,
+    li: &crate::report::LeakIndicators,
+    out: &mut String,
+) {
     use crate::md::{Align, Table, bar};
     out.push_str("## System Overview\n\n");
     out.push_str("_JVM and dump metadata, heap totals, GC root breakdown, class loader sizes, and system properties._\n\n");
@@ -170,18 +170,7 @@ fn render_system_overview_graphs(o: &SystemOverview, off_heap_cap: u64, out: &mu
     }
     summary.row(["Total Objects".into(), fmt_count(o.total_objects)]);
     summary.row([HEAP_SCALAR_LABEL.into(), format_bytes(o.total_shallow)]);
-    if off_heap_cap > 0 {
-        let ratio_str = if o.total_shallow > 0 {
-            format!(
-                "{} off-heap ({:.1}× on-heap)",
-                format_bytes(off_heap_cap),
-                off_heap_cap as f64 / o.total_shallow as f64,
-            )
-        } else {
-            format!("{} off-heap", format_bytes(off_heap_cap))
-        };
-        summary.row(["Off-Heap / On-Heap".into(), ratio_str]);
-    }
+    super::render_md::push_off_heap_rows(&mut summary, o, li);
     summary.row(["GC Roots".into(), fmt_count(o.gc_roots)]);
     summary.row(["Classes Loaded".into(), fmt_count(o.classes_loaded)]);
     summary.row(["Class Loaders".into(), fmt_count(o.classloaders_loaded)]);
@@ -235,6 +224,7 @@ fn render_system_overview_graphs(o: &SystemOverview, off_heap_cap: u64, out: &mu
         const CAP: usize = 40;
         const VAL_MAX: usize = 120;
         out.push_str("### System Properties\n\n");
+        out.push_str(SYSTEM_PROPERTIES_CAPTION);
         let shown = o.system_properties.len().min(CAP);
         let mut t = Table::new(&["Property", "Value"], &[Align::Left, Align::Left]);
         for p in &o.system_properties[..shown] {
@@ -253,6 +243,10 @@ fn render_system_overview_graphs(o: &SystemOverview, off_heap_cap: u64, out: &mu
             ));
         }
         out.push('\n');
+    } else {
+        out.push_str("### System Properties\n\n");
+        out.push_str(SYSTEM_PROPERTIES_CAPTION);
+        out.push_str("_None recorded in this dump._\n\n");
     }
 
     // GC Roots by Type — with a proportional retained bar when data is available.

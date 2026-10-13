@@ -1,7 +1,7 @@
 # Heap Dump Analysis: `dump_4_philosophers.hprof`
 
 
-_All sizes are binary (1 KB = 1024 bytes, 1 MB = 1024 KB, and so on)._
+_All sizes are binary (1 KiB = 1024 bytes, 1 MiB = 1024 KiB, and so on)._
 
 ----
 
@@ -33,47 +33,48 @@ _All sizes are binary (1 KB = 1024 bytes, 1 MB = 1024 KB, and so on)._
 
 _At-a-glance digest; see the sections below for full detail._
 
-| Metric               |   Value |
-| -------------------- | ------: |
-| Total Reachable Heap | 11.6 MB |
-| Objects              | 236,457 |
-| Classes              |   2,784 |
-| Class Loaders        |       5 |
-| Threads              |     133 |
-| GC Roots             |   1,681 |
+| Metric               |    Value |
+| -------------------- | -------: |
+| Total Reachable Heap | 11.6 MiB |
+| Objects              |  236,457 |
+| Classes              |    2,784 |
+| Class Loaders        |        5 |
+| Threads              |      133 |
+| GC Roots             |    1,681 |
 
 **Top suspects by retained heap**
 
 |  # | Suspect                                               | Retained | % Heap |
 | -: | ----------------------------------------------------- | -------: | -----: |
-|  1 | `scala.concurrent.stm.ccstm.InTxnImpl` (94 instances) |   2.7 MB |  22.9% |
-|  2 | `scala.runtime.LazyVals$` (single object)             |   2.5 MB |  21.5% |
-|  3 | `java.util.zip.ZipFile$Source` (19 instances)         |   1.3 MB |  11.1% |
+|  1 | `scala.concurrent.stm.ccstm.InTxnImpl` (94 instances) |  2.7 MiB |  22.9% |
+|  2 | `scala.runtime.LazyVals$` (single object)             |  2.5 MiB |  21.5% |
+|  3 | `java.util.zip.ZipFile$Source` (19 instances)         |  1.3 MiB |  11.1% |
 
 **Likely problem:** retention is spread across several roots; no single object dominates.
 
 ## Memory Triage
 
-_Automated signals pointing to where memory concentrates and what to investigate first. Total reachable heap: 11.6 MB_
+_Automated signals pointing to where memory concentrates and what to investigate first. Total reachable heap: 11.6 MiB_
 
-- **Headline Retainer:** `scala.concurrent.stm.ccstm.InTxnImpl` (a class group) retains 2.7 MB (22.9% of reachable heap). See [Leak Suspects](#leak-suspects).
+- **Headline Retainer:** `scala.concurrent.stm.ccstm.InTxnImpl` (a class group) retains 2.7 MiB (22.9% of reachable heap). See [Leak Suspects](#leak-suspects).
 - **Concentration:** diffuse — no suspect exceeds the threshold; retention is spread across multiple roots. Inspect individual suspects to find the most impactful target. See [Leak Suspects](#leak-suspects).
 - **Heap Shape:** deep — long dominator chains suggest nested collections or linked structures; the depth histogram shows the distribution; use the Big Drops table to find the retaining objects — 90% of objects within depth 7, max depth 28. See [Dominator-Depth Distribution](#dominator-depth-distribution).
 - **One Leak or Many:** the single biggest object, `scala.runtime.LazyVals$`, retains 21.5% and the top 10 retain 44.7% of the heap; 12 objects each hold ≥1%. See [Top Consumers](#top-consumers).
-- **Off-Heap (DirectByteBuffer):** 134.3 MB of native memory is held by live DirectByteBuffers — not reflected in the on-heap totals, but counts against process RSS and can trigger OS-level OOM. See [Off-Heap NIO](#off-heap-nio).
-- **Fixed per-Object Header Overhead:** 2.7 MB (23.3% of heap) consumed by JVM object headers alone (236,457 objects × 12 B each) — consider replacing wrapper objects with primitive arrays, off-heap buffers, or primitive-specialized collections. See [Object Header Overhead](#object-header-overhead).
+- **Off-Heap (DirectByteBuffer):** 134.3 MiB of native memory (de-duplicated) is held by live DirectByteBuffers — not reflected in the on-heap totals, but counts against process RSS and can trigger OS-level OOM. See [Off-Heap NIO](#off-heap-nio).
+- **Fixed per-Object Header Overhead:** 2.7 MiB (23.3% of heap) consumed by JVM object headers alone (236,457 objects × 12 B each) — consider replacing wrapper objects with primitive arrays, off-heap buffers, or primitive-specialized collections. See [Object Header Overhead](#object-header-overhead).
 - **Empty-Collection Cemetery:** 5,497 of 5,998 tracked collections (91.6%) are empty — pre-allocated but never populated containers waste object-header overhead at scale. Use lazy initialization (allocate only when the first element is added) or return `Collections.emptyList()` / `List.of()` sentinels for the read-only empty case. See [Collections](#collections).
-- **Component Retention Imbalance:** Component `<boot>` retains 76.0% of heap (31.4 MB) while the next largest component (`java/net/URLClassLoader`) retains only 17.1%. In a multi-module or multi-app deployment (OSGi, EE, Tomcat) this imbalance means one component dominates the heap. Investigate whether a class-loader-scoped cache, static field, or event-listener registration in `<boot>` is accumulating without a release path. See [Top Components](#top-components).
+- **Stale JDK Version:** JVM version `21.0.11+10-1-25.10.2-Ubuntu` (JDK 21) was released ~1023 days before this dump was captured. Update to the latest patch release to rule out known JDK memory bugs and GC regressions. See [System Overview](#system-overview).
+- **Component Retention Imbalance:** Component `<boot>` retains 76.0% of heap (31.4 MiB) while the next largest component (`java/net/URLClassLoader`) retains only 17.1%. In a multi-module or multi-app deployment (OSGi, EE, Tomcat) this imbalance means one component dominates the heap. Investigate whether a class-loader-scoped cache, static field, or event-listener registration in `<boot>` is accumulating without a release path. See [Top Components](#top-components).
 - **Collection Waste Not Analyzed:** Collection waste not analyzed — re-run with `--collections` to check for wasted capacity.
 
 ## Waste Summary
 
-**4.5 MB** estimated reclaimable across the sources below — duplicate strings, duplicate primitive arrays, boxed primitives, and empty/singleton collection overhead. Fix the biggest category first for the highest impact. Figures are approximate; sources may overlap.
+**4.5 MiB** estimated reclaimable across the sources below — duplicate strings, duplicate primitive arrays, boxed primitives, and empty/singleton collection overhead. Fix the biggest category first for the highest impact. Figures are approximate; sources may overlap.
 
 | Source                                     | Reclaimable |
 | ------------------------------------------ | ----------: |
-| [Under-filled Object Arrays](#collections) |      4.4 MB |
-| [Under-filled Collections](#collections)   |    186.4 KB |
+| [Under-filled Object Arrays](#collections) |     4.4 MiB |
+| [Under-filled Collections](#collections)   |   186.4 KiB |
 
 ## System Overview
 
@@ -81,35 +82,86 @@ _JVM and dump metadata, heap totals, GC root breakdown, class loader sizes, and 
 
 ### Heap Summary
 
-| Property                                | Value                             |
-| --------------------------------------- | --------------------------------- |
-| HPROF Format                            | JAVA PROFILE 1.0.2                |
-| File Size                               | 22.6 MB                           |
-| Identifier Size                         | 64-bit                            |
-| Compressed OOPs                         | Yes                               |
-| Dump Created                            | 2026-07-08T12:44:59Z              |
-| Total Objects                           | 236,457                           |
-| Total Reachable Heap                    | 11.6 MB                           |
-| Off-Heap / On-Heap                      | 134.3 MB off-heap (11.6× on-heap) |
-| GC Roots                                | 1,681                             |
-| Classes Loaded                          | 2,784                             |
-| Class Loaders                           | 5                                 |
-| Unreachable (Excluded)                  | 5,970 (816.8 KB)                  |
-| Dead Object Ratio (unreachable / total) | 6.4%                              |
-| Top-Class Retained Concentration        | 31.9%                             |
+| Property                                | Value                                                                         |
+| --------------------------------------- | ----------------------------------------------------------------------------- |
+| HPROF Format                            | JAVA PROFILE 1.0.2                                                            |
+| File Size                               | 22.6 MiB                                                                      |
+| Identifier Size                         | 64-bit                                                                        |
+| Compressed OOPs                         | Yes                                                                           |
+| Dump Created                            | 2026-07-08T12:44:59Z                                                          |
+| JVM Version                             | 21.0.11+10-1-25.10.2-Ubuntu                                                   |
+| Total Objects                           | 236,457                                                                       |
+| Total Reachable Heap                    | 11.6 MiB                                                                      |
+| Off-Heap (sum over instances)           | 134.3 MiB (11.6× on-heap)                                                     |
+| Off-Heap (de-duplicated)                | 134.3 MiB over 8 buffer instances — no shared views, so the two figures agree |
+| GC Roots                                | 1,681                                                                         |
+| Classes Loaded                          | 2,784                                                                         |
+| Class Loaders                           | 5                                                                             |
+| Unreachable (Excluded)                  | 5,970 (816.8 KiB)                                                             |
+| Dead Object Ratio (unreachable / total) | 6.4%                                                                          |
+| Top-Class Retained Concentration        | 31.9%                                                                         |
 
 - **Class loaders (labels):** java/net/URLClassLoader, jdk/internal/loader/ClassLoaders$AppClassLoader, jdk/internal/loader/ClassLoaders$PlatformClassLoader
+
+### System Properties
+
+_The `java.lang.System` property table as it stood when the dump was taken, sorted by key. **This is not the JVM command line:** HPROF records no launch arguments, so `-Xmx`, `-XX:` GC flags and the humongous-allocation threshold are absent from every heap dump (MAT cannot show them either). Heap-limit and GC-mode conclusions must come from outside the dump._
+
+| Property                                 | Value                                                                                                                     |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| file.encoding                            | UTF-8                                                                                                                     |
+| file.separator                           | /                                                                                                                         |
+| java.class.path                          | /home/i560383/renaissance.jar                                                                                             |
+| java.class.version                       | 65.0                                                                                                                      |
+| java.home                                | /usr/lib/jvm/java-21-openjdk-amd64                                                                                        |
+| java.io.tmpdir                           | /tmp                                                                                                                      |
+| java.library.path                        | /usr/java/packages/lib:/usr/lib/x86_64-linux-gnu/jni:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/usr/lib/jni:/lib:/… |
+| java.runtime.name                        | OpenJDK Runtime Environment                                                                                               |
+| java.runtime.version                     | 21.0.11+10-1-25.10.2-Ubuntu                                                                                               |
+| java.specification.name                  | Java Platform API Specification                                                                                           |
+| java.specification.vendor                | Oracle Corporation                                                                                                        |
+| java.specification.version               | 21                                                                                                                        |
+| java.util.logging.SimpleFormatter.format | [%1$tFT%1$tT.%1$tL%1$tz] %3$s (%2$s)%n%4$s: %5$s%n%6$s                                                                    |
+| java.vendor                              | Ubuntu                                                                                                                    |
+| java.vendor.url                          | https://ubuntu.com/                                                                                                       |
+| java.vendor.url.bug                      | https://bugs.launchpad.net/ubuntu/+source/openjdk-21                                                                      |
+| java.version                             | 21.0.11                                                                                                                   |
+| java.version.date                        | 2026-04-21                                                                                                                |
+| java.vm.compressedOopsMode               | 32-bit                                                                                                                    |
+| java.vm.info                             | mixed mode, sharing                                                                                                       |
+| java.vm.name                             | OpenJDK 64-Bit Server VM                                                                                                  |
+| java.vm.specification.name               | Java Virtual Machine Specification                                                                                        |
+| java.vm.specification.vendor             | Oracle Corporation                                                                                                        |
+| java.vm.specification.version            | 21                                                                                                                        |
+| java.vm.vendor                           | Ubuntu                                                                                                                    |
+| java.vm.version                          | 21.0.11+10-1-25.10.2-Ubuntu                                                                                               |
+| jdk.debug                                | release                                                                                                                   |
+| line.separator                           |                                                                                                                           |
+| native.encoding                          | UTF-8                                                                                                                     |
+| os.arch                                  | amd64                                                                                                                     |
+| os.name                                  | Linux                                                                                                                     |
+| os.version                               | 6.17.0-40-generic                                                                                                         |
+| path.separator                           | :                                                                                                                         |
+| stderr.encoding                          | UTF-8                                                                                                                     |
+| stdout.encoding                          | UTF-8                                                                                                                     |
+| sun.arch.data.model                      | 64                                                                                                                        |
+| sun.boot.library.path                    | /usr/lib/jvm/java-21-openjdk-amd64/lib                                                                                    |
+| sun.cpu.endian                           | little                                                                                                                    |
+| sun.io.unicode.encoding                  | UnicodeLittle                                                                                                             |
+| sun.java.command                         | /home/i560383/renaissance.jar philosophers -r 4                                                                           |
+
+_… (+9 more properties not shown)_
 
 ### GC Roots by Type
 
 _GC roots are the entry points where the JVM starts reachability scanning — anything reachable from a root stays alive. Common root types: thread-stack locals, JNI global references, static fields of loaded classes, and synchronized lock objects._
 
-| Root Type    | Count | % of Roots | Retained |                  | Top Retained Classes                                                                                                                                                                                  |
-| ------------ | ----: | ---------: | -------: | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Thread       |   136 |       8.1% |   1.5 MB | ████████████████ | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread` ×128 (1.0 MB), `java.lang.Thread` ×4 (303.1 KB), `org.renaissance.scala.stm.RealityShowPhilosophers$CameraThread` ×1 (155.3 KB) |
-| Sticky Class | 1,436 |      85.0% | 867.8 KB | █████████        | `java.lang.Class` ×1,436 (867.8 KB)                                                                                                                                                                   |
-| JNI Global   |   109 |       6.5% | 127.4 KB | █▎               | `java.lang.Object[]` ×2 (106.5 KB), `java.lang.invoke.MethodType` ×54 (9.8 KB), `java.lang.Thread` ×21 (5.4 KB)                                                                                       |
-| System Class |     8 |       0.5% |      0 B |                  | `java.lang.Class` ×8 (0 B)                                                                                                                                                                            |
+| Root Type    | Count | % of Roots |  Retained |                  | Top Retained Classes                                                                                                                                                                                     |
+| ------------ | ----: | ---------: | --------: | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Thread       |   136 |       8.1% |   1.5 MiB | ████████████████ | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread` ×128 (1.0 MiB), `java.lang.Thread` ×4 (303.1 KiB), `org.renaissance.scala.stm.RealityShowPhilosophers$CameraThread` ×1 (155.3 KiB) |
+| Sticky Class | 1,436 |      85.0% | 867.8 KiB | █████████        | `java.lang.Class` ×1,436 (867.8 KiB)                                                                                                                                                                     |
+| JNI Global   |   109 |       6.5% | 127.4 KiB | █▎               | `java.lang.Object[]` ×2 (106.5 KiB), `java.lang.invoke.MethodType` ×54 (9.8 KiB), `java.lang.Thread` ×21 (5.4 KiB)                                                                                       |
+| System Class |     8 |       0.5% |       0 B |                  | `java.lang.Class` ×8 (0 B)                                                                                                                                                                               |
 
 ### Heap Composition
 
@@ -117,10 +169,10 @@ _Shallow heap broken down by object kind: instances, object arrays, primitive ar
 
 | Kind             | Objects | Shallow Heap |                  |
 | ---------------- | ------: | -----------: | ---------------- |
-| Instances        | 201,988 |       4.1 MB | ██████████████▏  |
-| Object Arrays    |   5,834 |       3.0 MB | ██████████▍      |
-| Primitive Arrays |  25,851 |       4.6 MB | ████████████████ |
-| Class Objects    |   2,784 |      33.6 KB | ▏                |
+| Instances        | 201,988 |      4.1 MiB | ██████████████▏  |
+| Object Arrays    |   5,834 |      3.0 MiB | ██████████▍      |
+| Primitive Arrays |  25,851 |      4.6 MiB | ████████████████ |
+| Class Objects    |   2,784 |     33.6 KiB | ▏                |
 
 ### Dump Completeness
 
@@ -162,11 +214,11 @@ _Heap consumed by `Integer`, `Long`, `Double`, and other boxed wrapper types. Ea
 
 |  # | Class                 | Instances | Total Shallow | % of Heap | Avg Size |
 | -: | --------------------- | --------: | ------------: | --------: | -------: |
-|  1 | `java.lang.Long`      |       256 |        6.0 KB |      0.1% |     24 B |
-|  2 | `java.lang.Integer`   |       301 |        4.7 KB |     <0.1% |     16 B |
-|  3 | `java.lang.Byte`      |       256 |        4.0 KB |     <0.1% |     16 B |
-|  4 | `java.lang.Short`     |       256 |        4.0 KB |     <0.1% |     16 B |
-|  5 | `java.lang.Character` |       128 |        2.0 KB |     <0.1% |     16 B |
+|  1 | `java.lang.Long`      |       256 |       6.0 KiB |      0.1% |     24 B |
+|  2 | `java.lang.Integer`   |       301 |       4.7 KiB |     <0.1% |     16 B |
+|  3 | `java.lang.Byte`      |       256 |       4.0 KiB |     <0.1% |     16 B |
+|  4 | `java.lang.Short`     |       256 |       4.0 KiB |     <0.1% |     16 B |
+|  5 | `java.lang.Character` |       128 |       2.0 KiB |     <0.1% |     16 B |
 |  6 | `java.lang.Boolean`   |         2 |          32 B |      0.0% |     16 B |
 |  7 | `java.lang.Double`    |         1 |          24 B |      0.0% |     24 B |
 |  8 | `java.lang.Float`     |         1 |          16 B |      0.0% |     16 B |
@@ -177,202 +229,204 @@ _Classes where object headers (12 bytes with compressed OOPs, 16 without) consum
 
 |  # | Class                                                 | Instances | Header / Obj | Total Headers | % of Shallow | Avg Size |
 | -: | ----------------------------------------------------- | --------: | -----------: | ------------: | -----------: | -------: |
-|  1 | `java.lang.Object`                                    |   134,275 |         12 B |        1.5 MB |        75.0% |     16 B |
-|  2 | `java.lang.String`                                    |    23,331 |         12 B |      273.4 KB |        50.0% |     24 B |
-|  3 | `java.util.HashMap$Node`                              |     9,876 |         12 B |      115.7 KB |        37.5% |     32 B |
-|  4 | `java.util.concurrent.ConcurrentHashMap$Node`         |     7,160 |         12 B |       83.9 KB |        37.5% |     32 B |
-|  5 | `java.util.jar.Attributes`                            |     5,477 |         12 B |       64.2 KB |        75.0% |     16 B |
-|  6 | `java.lang.Class`                                     |     2,793 |         12 B |       32.7 KB |        95.5% |     12 B |
-|  7 | `java.util.LinkedHashMap$Entry`                       |     1,199 |         12 B |       14.1 KB |        30.0% |     40 B |
-|  8 | `scala.concurrent.stm.skel.CallbackList`              |       774 |         12 B |        9.1 KB |        50.0% |     24 B |
-|  9 | `java.lang.invoke.MemberName`                         |       763 |         12 B |        8.9 KB |        30.0% |     40 B |
-| 10 | `jdk.internal.util.WeakReferenceKey`                  |       669 |         12 B |        7.8 KB |        37.5% |     32 B |
-| 11 | `java.lang.invoke.MethodType`                         |       666 |         12 B |        7.8 KB |        30.0% |     40 B |
-| 12 | `java.lang.invoke.ResolvedMethodName`                 |       578 |         12 B |        6.8 KB |        75.0% |     16 B |
-| 13 | `java.lang.Class[]`                                   |       523 |         12 B |        6.1 KB |        41.0% |     29 B |
-| 14 | `java.lang.String[]`                                  |       450 |         12 B |        5.3 KB |        31.0% |     38 B |
-| 15 | `java.lang.invoke.LambdaForm$Name`                    |       367 |         12 B |        4.3 KB |        37.5% |     32 B |
-| 16 | `java.lang.module.ModuleDescriptor$Exports`           |       367 |         12 B |        4.3 KB |        50.0% |     24 B |
-| 17 | `jdk.internal.math.FDBigInteger`                      |       341 |         12 B |        4.0 KB |        37.5% |     32 B |
-| 18 | `java.lang.Integer`                                   |       301 |         12 B |        3.5 KB |        75.0% |     16 B |
-| 19 | `sun.security.util.KnownOIDs`                         |       264 |         12 B |        3.1 KB |        30.0% |     40 B |
-| 20 | `java.lang.ThreadLocal$ThreadLocalMap$Entry`          |       261 |         12 B |        3.1 KB |        37.5% |     32 B |
-| 21 | `java.lang.Long`                                      |       256 |         12 B |        3.0 KB |        50.0% |     24 B |
-| 22 | `java.lang.Byte`                                      |       256 |         12 B |        3.0 KB |        75.0% |     16 B |
-| 23 | `java.lang.Short`                                     |       256 |         12 B |        3.0 KB |        75.0% |     16 B |
-| 24 | `java.util.ImmutableCollections$Set12`                |       245 |         12 B |        2.9 KB |        50.0% |     24 B |
-| 25 | `java.util.HashSet`                                   |       212 |         12 B |        2.5 KB |        75.0% |     16 B |
-| 26 | `java.lang.invoke.DirectMethodHandle`                 |       196 |         12 B |        2.3 KB |        30.0% |     40 B |
-| 27 | `jdk.internal.module.ServicesCatalog$ServiceProvider` |       190 |         12 B |        2.2 KB |        50.0% |     24 B |
-| 28 | `java.security.AccessControlContext`                  |       162 |         12 B |        1.9 KB |        30.0% |     40 B |
-| 29 | `java.lang.Thread$FieldHolder`                        |       160 |         12 B |        1.9 KB |        30.0% |     40 B |
-| 30 | `java.lang.invoke.MethodTypeForm`                     |       159 |         12 B |        1.9 KB |        37.5% |     32 B |
+|  1 | `java.lang.Object`                                    |   134,275 |         12 B |       1.5 MiB |        75.0% |     16 B |
+|  2 | `java.lang.String`                                    |    23,331 |         12 B |     273.4 KiB |        50.0% |     24 B |
+|  3 | `java.util.HashMap$Node`                              |     9,876 |         12 B |     115.7 KiB |        37.5% |     32 B |
+|  4 | `java.util.concurrent.ConcurrentHashMap$Node`         |     7,160 |         12 B |      83.9 KiB |        37.5% |     32 B |
+|  5 | `java.util.jar.Attributes`                            |     5,477 |         12 B |      64.2 KiB |        75.0% |     16 B |
+|  6 | `java.lang.Class`                                     |     2,793 |         12 B |      32.7 KiB |        95.5% |     12 B |
+|  7 | `java.util.LinkedHashMap$Entry`                       |     1,199 |         12 B |      14.1 KiB |        30.0% |     40 B |
+|  8 | `scala.concurrent.stm.skel.CallbackList`              |       774 |         12 B |       9.1 KiB |        50.0% |     24 B |
+|  9 | `java.lang.invoke.MemberName`                         |       763 |         12 B |       8.9 KiB |        30.0% |     40 B |
+| 10 | `jdk.internal.util.WeakReferenceKey`                  |       669 |         12 B |       7.8 KiB |        37.5% |     32 B |
+| 11 | `java.lang.invoke.MethodType`                         |       666 |         12 B |       7.8 KiB |        30.0% |     40 B |
+| 12 | `java.lang.invoke.ResolvedMethodName`                 |       578 |         12 B |       6.8 KiB |        75.0% |     16 B |
+| 13 | `java.lang.Class[]`                                   |       523 |         12 B |       6.1 KiB |        41.0% |     29 B |
+| 14 | `java.lang.String[]`                                  |       450 |         12 B |       5.3 KiB |        31.0% |     38 B |
+| 15 | `java.lang.invoke.LambdaForm$Name`                    |       367 |         12 B |       4.3 KiB |        37.5% |     32 B |
+| 16 | `java.lang.module.ModuleDescriptor$Exports`           |       367 |         12 B |       4.3 KiB |        50.0% |     24 B |
+| 17 | `jdk.internal.math.FDBigInteger`                      |       341 |         12 B |       4.0 KiB |        37.5% |     32 B |
+| 18 | `java.lang.Integer`                                   |       301 |         12 B |       3.5 KiB |        75.0% |     16 B |
+| 19 | `sun.security.util.KnownOIDs`                         |       264 |         12 B |       3.1 KiB |        30.0% |     40 B |
+| 20 | `java.lang.ThreadLocal$ThreadLocalMap$Entry`          |       261 |         12 B |       3.1 KiB |        37.5% |     32 B |
+| 21 | `java.lang.Long`                                      |       256 |         12 B |       3.0 KiB |        50.0% |     24 B |
+| 22 | `java.lang.Byte`                                      |       256 |         12 B |       3.0 KiB |        75.0% |     16 B |
+| 23 | `java.lang.Short`                                     |       256 |         12 B |       3.0 KiB |        75.0% |     16 B |
+| 24 | `java.util.ImmutableCollections$Set12`                |       245 |         12 B |       2.9 KiB |        50.0% |     24 B |
+| 25 | `java.util.HashSet`                                   |       212 |         12 B |       2.5 KiB |        75.0% |     16 B |
+| 26 | `java.lang.invoke.DirectMethodHandle`                 |       196 |         12 B |       2.3 KiB |        30.0% |     40 B |
+| 27 | `jdk.internal.module.ServicesCatalog$ServiceProvider` |       190 |         12 B |       2.2 KiB |        50.0% |     24 B |
+| 28 | `java.security.AccessControlContext`                  |       162 |         12 B |       1.9 KiB |        30.0% |     40 B |
+| 29 | `java.lang.Thread$FieldHolder`                        |       160 |         12 B |       1.9 KiB |        30.0% |     40 B |
+| 30 | `java.lang.invoke.MethodTypeForm`                     |       159 |         12 B |       1.9 KiB |        37.5% |     32 B |
 
 ### Class Histogram (by Retained Heap)
 
 _Every loaded class with its instance count, shallow heap (own bytes), and retained heap (bytes freed when all instances become unreachable). Top 50 shown._
 
-|  # | Class                                                                 | Instances |  Shallow |  Largest | Retained | % Heap |
-| -: | --------------------------------------------------------------------- | --------: | -------: | -------: | -------: | -----: |
-|  1 | `java.lang.Object[]`                                                  |     2,237 |   1.3 MB | 512.0 KB |   3.7 MB |  31.9% |
-|  2 | `scala.concurrent.stm.ccstm.InTxnImpl`                                |       129 |  18.1 KB |    144 B |   3.7 MB |  31.4% |
-|  3 | `java.lang.Class`                                                     |     2,793 |  34.3 KB |   1.1 KB |   3.6 MB |  30.6% |
-|  4 | `byte[]`                                                              |    24,078 |   2.6 MB | 255.1 KB |   2.6 MB |  21.9% |
-|  5 | `scala.runtime.LazyVals$`                                             |         1 |     16 B |     16 B |   2.5 MB |  21.5% |
-|  6 | `java.lang.Object`                                                    |   134,275 |   2.0 MB |     16 B |   2.0 MB |  17.6% |
-|  7 | `java.lang.String`                                                    |    23,331 | 546.8 KB |     24 B |   1.8 MB |  15.2% |
-|  8 | `java.util.HashMap`                                                   |       361 |  16.9 KB |     48 B |   1.5 MB |  13.2% |
-|  9 | `java.util.HashMap$Node[]`                                            |       395 |  96.7 KB |  16.0 KB |   1.5 MB |  13.2% |
-| 10 | `java.util.HashMap$Node`                                              |     9,876 | 308.6 KB |     32 B |   1.5 MB |  12.5% |
-| 11 | `java.util.zip.ZipFile$Source`                                        |        19 |   1.5 KB |     80 B |   1.3 MB |  11.1% |
-| 12 | `java.lang.ref.SoftReference`                                         |       151 |   5.9 KB |     40 B |   1.1 MB |   9.5% |
-| 13 | `long[]`                                                              |       173 |   1.1 MB |  64.0 KB |   1.1 MB |   9.4% |
-| 14 | `java.util.jar.JarFile`                                               |        19 |   1.2 KB |     64 B |   1.1 MB |   9.4% |
-| 15 | `java.util.jar.Manifest`                                              |         8 |    192 B |     24 B |   1.1 MB |   9.3% |
-| 16 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread` |       128 |  16.0 KB |    128 B |   1.0 MB |   9.0% |
-| 17 | `scala.concurrent.stm.ccstm.Handle[]`                                 |       283 |   1.0 MB |   4.0 KB |   1.0 MB |   8.7% |
-| 18 | `int[]`                                                               |     1,346 | 875.9 KB |  34.3 KB | 875.9 KB |   7.4% |
-| 19 | `java.util.concurrent.ConcurrentHashMap`                              |       117 |   7.3 KB |     64 B | 611.6 KB |   5.1% |
-| 20 | `java.util.concurrent.ConcurrentHashMap$Node[]`                       |        93 |  65.9 KB |   8.0 KB | 604.7 KB |   5.1% |
-| 21 | `java.util.LinkedHashMap`                                             |     5,517 | 344.8 KB |     64 B | 507.4 KB |   4.3% |
-| 22 | `java.util.concurrent.ConcurrentHashMap$Node`                         |     7,160 | 223.8 KB |     32 B | 463.1 KB |   3.9% |
-| 23 | `java.util.jar.Attributes`                                            |     5,477 |  85.6 KB |     16 B | 448.0 KB |   3.8% |
-| 24 | `scala.concurrent.stm.skel.CallbackList`                              |       774 |  18.1 KB |     24 B | 417.2 KB |   3.5% |
-| 25 | `scala.Function1[]`                                                   |       774 | 399.1 KB |    528 B | 399.1 KB |   3.4% |
-| 26 | `java.lang.Thread`                                                    |        27 |   2.7 KB |    104 B | 309.2 KB |   2.6% |
-| 27 | `java.net.URLClassLoader`                                             |         2 |    176 B |     88 B | 243.7 KB |   2.0% |
-| 28 | `java.time.zone.ZoneRulesProvider`                                    |         0 |      0 B |      0 B | 198.4 KB |   1.7% |
-| 29 | `org.renaissance.scala.stm.RealityShowPhilosophers$CameraThread`      |         1 |    120 B |    120 B | 157.5 KB |   1.3% |
-| 30 | `java.util.LinkedHashMap$Entry`                                       |     1,199 |  46.8 KB |     40 B | 152.7 KB |   1.3% |
-| 31 | `java.util.ArrayList`                                                 |       102 |   2.4 KB |     24 B | 150.9 KB |   1.3% |
-| 32 | `org.renaissance.core.ModuleLoader`                                   |         2 |     48 B |     24 B | 149.8 KB |   1.3% |
-| 33 | `sun.util.calendar.ZoneInfoFile`                                      |         0 |      0 B |      0 B | 145.4 KB |   1.2% |
-| 34 | `java.util.LinkedHashSet`                                             |        38 |    608 B |     16 B | 144.6 KB |   1.2% |
-| 35 | `java.lang.invoke.MethodType`                                         |       666 |  26.0 KB |     40 B | 134.6 KB |   1.1% |
-| 36 | `scala.collection.mutable.ArrayBuffer`                                |         1 |     24 B |     24 B | 126.1 KB |   1.1% |
-| 37 | `java.time.zone.TzdbZoneRulesProvider`                                |         1 |     24 B |     24 B | 118.2 KB |   1.0% |
-| 38 | `byte[][]`                                                            |         1 |   1.4 KB |   1.4 KB |  94.1 KB |   0.8% |
-| 39 | `java.util.ImmutableCollections$SetN`                                 |       149 |   3.5 KB |     24 B |  91.5 KB |   0.8% |
-| 40 | `sun.security.util.KnownOIDs`                                         |       264 |  10.3 KB |     40 B |  88.5 KB |   0.7% |
-| 41 | `org.renaissance.core.BenchmarkSuite`                                 |         1 |     32 B |     32 B |  77.0 KB |   0.6% |
-| 42 | `java.util.Optional`                                                  |         4 |     64 B |     16 B |  73.9 KB |   0.6% |
-| 43 | `char[]`                                                              |       225 |  71.8 KB |  16.0 KB |  71.8 KB |   0.6% |
-| 44 | `java.util.HashSet`                                                   |       212 |   3.3 KB |     16 B |  66.7 KB |   0.6% |
-| 45 | `jdk.internal.loader.ClassLoaders$AppClassLoader`                     |         1 |     96 B |     96 B |  66.0 KB |   0.6% |
-| 46 | `java.lang.Module`                                                    |        70 |   3.3 KB |     48 B |  65.5 KB |   0.6% |
-| 47 | `scala.concurrent.stm.skel.SimpleRandom$`                             |         1 |     24 B |     24 B |  64.5 KB |   0.5% |
-| 48 | `sun.util.cldr.CLDRLocaleProviderAdapter`                             |         1 |     80 B |     80 B |  62.6 KB |   0.5% |
-| 49 | `sun.util.locale.provider.LocaleProviderAdapter`                      |         0 |      0 B |      0 B |  62.3 KB |   0.5% |
-| 50 | `java.lang.invoke.MemberName`                                         |       763 |  29.8 KB |     40 B |  55.7 KB |   0.5% |
-_… 3,021 more classes, 450.5 KB shallow / 2.2 MB retained (see HTML report for full list)._
+_`Instances (heap)` counts **every instance of the class in the reachable heap** — this is the class total, and it is the number to quote when asked "how many of X are there?". The other instance counts in this report measure different things: [Biggest Classes by Retained Heap](#biggest-classes-by-retained-heap) counts only **top-level dominators** of the class, and a leak suspect's [Accumulated objects by class](#leak-suspects) counts only instances **inside that suspect's dominated subtree**. The three numbers are all correct and will not agree._
+
+|  # | Class                                                                 | Instances (heap) |   Shallow |   Largest |  Retained | % Heap |
+| -: | --------------------------------------------------------------------- | ---------------: | --------: | --------: | --------: | -----: |
+|  1 | `java.lang.Object[]`                                                  |            2,237 |   1.3 MiB | 512.0 KiB |   3.7 MiB |  31.9% |
+|  2 | `scala.concurrent.stm.ccstm.InTxnImpl`                                |              129 |  18.1 KiB |     144 B |   3.7 MiB |  31.4% |
+|  3 | `java.lang.Class`                                                     |            2,793 |  34.3 KiB |   1.1 KiB |   3.6 MiB |  30.6% |
+|  4 | `byte[]`                                                              |           24,078 |   2.6 MiB | 255.1 KiB |   2.6 MiB |  21.9% |
+|  5 | `scala.runtime.LazyVals$`                                             |                1 |      16 B |      16 B |   2.5 MiB |  21.5% |
+|  6 | `java.lang.Object`                                                    |          134,275 |   2.0 MiB |      16 B |   2.0 MiB |  17.6% |
+|  7 | `java.lang.String`                                                    |           23,331 | 546.8 KiB |      24 B |   1.8 MiB |  15.2% |
+|  8 | `java.util.HashMap`                                                   |              361 |  16.9 KiB |      48 B |   1.5 MiB |  13.2% |
+|  9 | `java.util.HashMap$Node[]`                                            |              395 |  96.7 KiB |  16.0 KiB |   1.5 MiB |  13.2% |
+| 10 | `java.util.HashMap$Node`                                              |            9,876 | 308.6 KiB |      32 B |   1.5 MiB |  12.5% |
+| 11 | `java.util.zip.ZipFile$Source`                                        |               19 |   1.5 KiB |      80 B |   1.3 MiB |  11.1% |
+| 12 | `java.lang.ref.SoftReference`                                         |              151 |   5.9 KiB |      40 B |   1.1 MiB |   9.5% |
+| 13 | `long[]`                                                              |              173 |   1.1 MiB |  64.0 KiB |   1.1 MiB |   9.4% |
+| 14 | `java.util.jar.JarFile`                                               |               19 |   1.2 KiB |      64 B |   1.1 MiB |   9.4% |
+| 15 | `java.util.jar.Manifest`                                              |                8 |     192 B |      24 B |   1.1 MiB |   9.3% |
+| 16 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread` |              128 |  16.0 KiB |     128 B |   1.0 MiB |   9.0% |
+| 17 | `scala.concurrent.stm.ccstm.Handle[]`                                 |              283 |   1.0 MiB |   4.0 KiB |   1.0 MiB |   8.7% |
+| 18 | `int[]`                                                               |            1,346 | 875.9 KiB |  34.3 KiB | 875.9 KiB |   7.4% |
+| 19 | `java.util.concurrent.ConcurrentHashMap`                              |              117 |   7.3 KiB |      64 B | 611.6 KiB |   5.1% |
+| 20 | `java.util.concurrent.ConcurrentHashMap$Node[]`                       |               93 |  65.9 KiB |   8.0 KiB | 604.7 KiB |   5.1% |
+| 21 | `java.util.LinkedHashMap`                                             |            5,517 | 344.8 KiB |      64 B | 507.4 KiB |   4.3% |
+| 22 | `java.util.concurrent.ConcurrentHashMap$Node`                         |            7,160 | 223.8 KiB |      32 B | 463.1 KiB |   3.9% |
+| 23 | `java.util.jar.Attributes`                                            |            5,477 |  85.6 KiB |      16 B | 448.0 KiB |   3.8% |
+| 24 | `scala.concurrent.stm.skel.CallbackList`                              |              774 |  18.1 KiB |      24 B | 417.2 KiB |   3.5% |
+| 25 | `scala.Function1[]`                                                   |              774 | 399.1 KiB |     528 B | 399.1 KiB |   3.4% |
+| 26 | `java.lang.Thread`                                                    |               27 |   2.7 KiB |     104 B | 309.2 KiB |   2.6% |
+| 27 | `java.net.URLClassLoader`                                             |                2 |     176 B |      88 B | 243.7 KiB |   2.0% |
+| 28 | `java.time.zone.ZoneRulesProvider`                                    |                0 |       0 B |       0 B | 198.4 KiB |   1.7% |
+| 29 | `org.renaissance.scala.stm.RealityShowPhilosophers$CameraThread`      |                1 |     120 B |     120 B | 157.5 KiB |   1.3% |
+| 30 | `java.util.LinkedHashMap$Entry`                                       |            1,199 |  46.8 KiB |      40 B | 152.7 KiB |   1.3% |
+| 31 | `java.util.ArrayList`                                                 |              102 |   2.4 KiB |      24 B | 150.9 KiB |   1.3% |
+| 32 | `org.renaissance.core.ModuleLoader`                                   |                2 |      48 B |      24 B | 149.8 KiB |   1.3% |
+| 33 | `sun.util.calendar.ZoneInfoFile`                                      |                0 |       0 B |       0 B | 145.4 KiB |   1.2% |
+| 34 | `java.util.LinkedHashSet`                                             |               38 |     608 B |      16 B | 144.6 KiB |   1.2% |
+| 35 | `java.lang.invoke.MethodType`                                         |              666 |  26.0 KiB |      40 B | 134.6 KiB |   1.1% |
+| 36 | `scala.collection.mutable.ArrayBuffer`                                |                1 |      24 B |      24 B | 126.1 KiB |   1.1% |
+| 37 | `java.time.zone.TzdbZoneRulesProvider`                                |                1 |      24 B |      24 B | 118.2 KiB |   1.0% |
+| 38 | `byte[][]`                                                            |                1 |   1.4 KiB |   1.4 KiB |  94.1 KiB |   0.8% |
+| 39 | `java.util.ImmutableCollections$SetN`                                 |              149 |   3.5 KiB |      24 B |  91.5 KiB |   0.8% |
+| 40 | `sun.security.util.KnownOIDs`                                         |              264 |  10.3 KiB |      40 B |  88.5 KiB |   0.7% |
+| 41 | `org.renaissance.core.BenchmarkSuite`                                 |                1 |      32 B |      32 B |  77.0 KiB |   0.6% |
+| 42 | `java.util.Optional`                                                  |                4 |      64 B |      16 B |  73.9 KiB |   0.6% |
+| 43 | `char[]`                                                              |              225 |  71.8 KiB |  16.0 KiB |  71.8 KiB |   0.6% |
+| 44 | `java.util.HashSet`                                                   |              212 |   3.3 KiB |      16 B |  66.7 KiB |   0.6% |
+| 45 | `jdk.internal.loader.ClassLoaders$AppClassLoader`                     |                1 |      96 B |      96 B |  66.0 KiB |   0.6% |
+| 46 | `java.lang.Module`                                                    |               70 |   3.3 KiB |      48 B |  65.5 KiB |   0.6% |
+| 47 | `scala.concurrent.stm.skel.SimpleRandom$`                             |                1 |      24 B |      24 B |  64.5 KiB |   0.5% |
+| 48 | `sun.util.cldr.CLDRLocaleProviderAdapter`                             |                1 |      80 B |      80 B |  62.6 KiB |   0.5% |
+| 49 | `sun.util.locale.provider.LocaleProviderAdapter`                      |                0 |       0 B |       0 B |  62.3 KiB |   0.5% |
+| 50 | `java.lang.invoke.MemberName`                                         |              763 |  29.8 KiB |      40 B |  55.7 KiB |   0.5% |
+_… 3,021 more classes, 450.5 KiB shallow / 2.2 MiB retained (see HTML report for full list)._
 
 ### Class Loaders
 
 _Classes grouped by the loader that defined them. Growing loaders (e.g. web-app or plugin loaders redeployed multiple times) are a common source of metaspace and heap leaks. The **Loader** column shows the loader's class (e.g. `java/net/URLClassLoader`), not an instance name — the hprof format does not record loader names. Multiple rows with the same loader class are distinct loader instances; many such instances each holding significant heap can signal a class-loader leak. The **Address** column distinguishes them._
 
-| Loader                                               | Address    | Classes | Instances | Shallow | Retained |
-| ---------------------------------------------------- | ---------- | ------: | --------: | ------: | -------: |
-| <boot>                                               | <boot>     |   1,705 |   232,740 | 10.1 MB |  31.4 MB |
-| java/net/URLClassLoader                              | 0x80300d20 |     709 |     3,322 |  1.5 MB |   7.1 MB |
-| java/net/URLClassLoader                              | 0x8e800048 |     575 |       330 | 18.0 KB |   2.6 MB |
-| jdk/internal/loader/ClassLoaders$AppClassLoader      | 0xffeecf48 |      81 |        64 |  1.3 KB | 236.2 KB |
-| jdk/internal/loader/ClassLoaders$PlatformClassLoader | 0xffeec828 |       1 |         1 |    16 B |   7.4 KB |
+| Loader                                               | Address    | Classes | Instances |  Shallow |  Retained |
+| ---------------------------------------------------- | ---------- | ------: | --------: | -------: | --------: |
+| <boot>                                               | <boot>     |   1,705 |   232,740 | 10.1 MiB |  31.4 MiB |
+| java/net/URLClassLoader                              | 0x80300d20 |     709 |     3,322 |  1.5 MiB |   7.1 MiB |
+| java/net/URLClassLoader                              | 0x8e800048 |     575 |       330 | 18.0 KiB |   2.6 MiB |
+| jdk/internal/loader/ClassLoaders$AppClassLoader      | 0xffeecf48 |      81 |        64 |  1.3 KiB | 236.2 KiB |
+| jdk/internal/loader/ClassLoaders$PlatformClassLoader | 0xffeec828 |       1 |         1 |     16 B |   7.4 KiB |
 
 ### Duplicate Classes
 
 _Class names loaded by more than one class loader. The same class loaded N times means N separate copies of its static state and N times the metaspace cost — a typical symptom of class-loader leaks (e.g. each web-app reload or plugin load creates a new loader that never gets GC'd). Check the per-loader breakdown: if one loader holds almost all the instances, the others are likely leaked copies._
 
-| Class                                     | # Loaders | Instances | Retained |
-| ----------------------------------------- | --------: | --------: | -------: |
-| `scala.collection.mutable.ArrayBuffer`    |         2 |         4 | 126.9 KB |
-| `scala.math.BigInt$`                      |         2 |         2 |  16.2 KB |
-| `scala.math.BigInt[]`                     |         2 |         2 |  16.0 KB |
-| `scala.collection.immutable.$colon$colon` |         2 |        30 |   5.8 KB |
-| `scala.collection.immutable.Range`        |         2 |       128 |   5.5 KB |
-| `scala.collection.mutable.Buffer`         |         2 |         0 |   3.5 KB |
-| `scala.Some`                              |         2 |       110 |   2.1 KB |
-| `scala.collection.mutable.IndexedSeq`     |         2 |         0 |   2.1 KB |
-| `scala.collection.IndexedSeq`             |         2 |         0 |   1.7 KB |
-| `scala.collection.Iterable`               |         2 |         0 |   1.3 KB |
-| `scala.collection.immutable.Vector`       |         2 |         2 |   1.1 KB |
-| `scala.Array$`                            |         2 |         2 |    912 B |
-| `scala.collection.immutable.Map`          |         2 |         0 |    784 B |
-| `scala.collection.mutable.AbstractSeq`    |         2 |         0 |    744 B |
-| `scala.collection.mutable.HashMap`        |         2 |         3 |    744 B |
-| `scala.Function1`                         |         2 |         0 |    616 B |
-| `scala.Predef$`                           |         2 |         2 |    608 B |
-| `scala.collection.AbstractSeq`            |         2 |         0 |    568 B |
-| `scala.collection.immutable.Vector$`      |         2 |         2 |    472 B |
-| `scala.runtime.ScalaRunTime$`             |         2 |         2 |    408 B |
+| Class                                     | # Loaders | Instances |  Retained |
+| ----------------------------------------- | --------: | --------: | --------: |
+| `scala.collection.mutable.ArrayBuffer`    |         2 |         4 | 126.9 KiB |
+| `scala.math.BigInt$`                      |         2 |         2 |  16.2 KiB |
+| `scala.math.BigInt[]`                     |         2 |         2 |  16.0 KiB |
+| `scala.collection.immutable.$colon$colon` |         2 |        30 |   5.8 KiB |
+| `scala.collection.immutable.Range`        |         2 |       128 |   5.5 KiB |
+| `scala.collection.mutable.Buffer`         |         2 |         0 |   3.5 KiB |
+| `scala.Some`                              |         2 |       110 |   2.1 KiB |
+| `scala.collection.mutable.IndexedSeq`     |         2 |         0 |   2.1 KiB |
+| `scala.collection.IndexedSeq`             |         2 |         0 |   1.7 KiB |
+| `scala.collection.Iterable`               |         2 |         0 |   1.3 KiB |
+| `scala.collection.immutable.Vector`       |         2 |         2 |   1.1 KiB |
+| `scala.Array$`                            |         2 |         2 |     912 B |
+| `scala.collection.immutable.Map`          |         2 |         0 |     784 B |
+| `scala.collection.mutable.AbstractSeq`    |         2 |         0 |     744 B |
+| `scala.collection.mutable.HashMap`        |         2 |         3 |     744 B |
+| `scala.Function1`                         |         2 |         0 |     616 B |
+| `scala.Predef$`                           |         2 |         2 |     608 B |
+| `scala.collection.AbstractSeq`            |         2 |         0 |     568 B |
+| `scala.collection.immutable.Vector$`      |         2 |         2 |     472 B |
+| `scala.runtime.ScalaRunTime$`             |         2 |         2 |     408 B |
 
 **`scala.collection.mutable.ArrayBuffer`** — per loader:
 
-| Loader                                | Instances | Shallow | Retained |
-| ------------------------------------- | --------: | ------: | -------: |
-| `java/net/URLClassLoader` @0x80300d20 |         1 |    24 B | 126.1 KB |
-| `java/net/URLClassLoader` @0x8e800048 |         3 |    72 B |    784 B |
+| Loader                                | Instances | Shallow |  Retained |
+| ------------------------------------- | --------: | ------: | --------: |
+| `java/net/URLClassLoader` @0x80300d20 |         1 |    24 B | 126.1 KiB |
+| `java/net/URLClassLoader` @0x8e800048 |         3 |    72 B |     784 B |
 
 **`scala.math.BigInt$`** — per loader:
 
 | Loader                                | Instances | Shallow | Retained |
 | ------------------------------------- | --------: | ------: | -------: |
-| `java/net/URLClassLoader` @0x8e800048 |         1 |    16 B |   8.2 KB |
-| `java/net/URLClassLoader` @0x80300d20 |         1 |    32 B |   8.1 KB |
+| `java/net/URLClassLoader` @0x8e800048 |         1 |    16 B |  8.2 KiB |
+| `java/net/URLClassLoader` @0x80300d20 |         1 |    32 B |  8.1 KiB |
 
 **`scala.math.BigInt[]`** — per loader:
 
 | Loader                                | Instances | Shallow | Retained |
 | ------------------------------------- | --------: | ------: | -------: |
-| `java/net/URLClassLoader` @0x80300d20 |         1 |  8.0 KB |   8.0 KB |
-| `java/net/URLClassLoader` @0x8e800048 |         1 |  8.0 KB |   8.0 KB |
+| `java/net/URLClassLoader` @0x80300d20 |         1 | 8.0 KiB |  8.0 KiB |
+| `java/net/URLClassLoader` @0x8e800048 |         1 | 8.0 KiB |  8.0 KiB |
 
 **`scala.collection.immutable.$colon$colon`** — per loader:
 
 | Loader                                | Instances | Shallow | Retained |
 | ------------------------------------- | --------: | ------: | -------: |
-| `java/net/URLClassLoader` @0x8e800048 |        30 |   720 B |   5.8 KB |
+| `java/net/URLClassLoader` @0x8e800048 |        30 |   720 B |  5.8 KiB |
 | `java/net/URLClassLoader` @0x80300d20 |         0 |     0 B |     40 B |
 
 **`scala.collection.immutable.Range`** — per loader:
 
 | Loader                                | Instances | Shallow | Retained |
 | ------------------------------------- | --------: | ------: | -------: |
-| `java/net/URLClassLoader` @0x80300d20 |       128 |  5.0 KB |   5.5 KB |
+| `java/net/URLClassLoader` @0x80300d20 |       128 | 5.0 KiB |  5.5 KiB |
 | `java/net/URLClassLoader` @0x8e800048 |         0 |     0 B |     32 B |
 
 **`scala.collection.mutable.Buffer`** — per loader:
 
 | Loader                                | Instances | Shallow | Retained |
 | ------------------------------------- | --------: | ------: | -------: |
-| `java/net/URLClassLoader` @0x80300d20 |         0 |     0 B |   3.3 KB |
+| `java/net/URLClassLoader` @0x80300d20 |         0 |     0 B |  3.3 KiB |
 | `java/net/URLClassLoader` @0x8e800048 |         0 |     0 B |    192 B |
 
 **`scala.Some`** — per loader:
 
 | Loader                                | Instances | Shallow | Retained |
 | ------------------------------------- | --------: | ------: | -------: |
-| `java/net/URLClassLoader` @0x80300d20 |        92 |  1.4 KB |   1.5 KB |
+| `java/net/URLClassLoader` @0x80300d20 |        92 | 1.4 KiB |  1.5 KiB |
 | `java/net/URLClassLoader` @0x8e800048 |        18 |   288 B |    568 B |
 
 **`scala.collection.mutable.IndexedSeq`** — per loader:
 
 | Loader                                | Instances | Shallow | Retained |
 | ------------------------------------- | --------: | ------: | -------: |
-| `java/net/URLClassLoader` @0x80300d20 |         0 |     0 B |   1.9 KB |
+| `java/net/URLClassLoader` @0x80300d20 |         0 |     0 B |  1.9 KiB |
 | `java/net/URLClassLoader` @0x8e800048 |         0 |     0 B |    152 B |
 
 **`scala.collection.IndexedSeq`** — per loader:
 
 | Loader                                | Instances | Shallow | Retained |
 | ------------------------------------- | --------: | ------: | -------: |
-| `java/net/URLClassLoader` @0x80300d20 |         0 |     0 B |   1.5 KB |
+| `java/net/URLClassLoader` @0x80300d20 |         0 |     0 B |  1.5 KiB |
 | `java/net/URLClassLoader` @0x8e800048 |         0 |     0 B |    152 B |
 
 **`scala.collection.Iterable`** — per loader:
 
 | Loader                                | Instances | Shallow | Retained |
 | ------------------------------------- | --------: | ------: | -------: |
-| `java/net/URLClassLoader` @0x80300d20 |         0 |     0 B |   1.2 KB |
+| `java/net/URLClassLoader` @0x80300d20 |         0 |     0 B |  1.2 KiB |
 | `java/net/URLClassLoader` @0x8e800048 |         0 |     0 B |    136 B |
 
 **`scala.collection.immutable.Vector`** — per loader:
@@ -449,51 +503,53 @@ _Class names loaded by more than one class loader. The same class loaded N times
 
 _Objects and class groups retaining the most heap, ranked by retained size — the most likely accumulation points for excessive memory usage. To fix: follow the dominator chain to the nearest object you control and drop or null out the reference that keeps it alive. GC root paths are shown for each suspect below._
 
-### 1. `scala.concurrent.stm.ccstm.InTxnImpl` — retains 2.7 MB (22.9% of reachable heap)
+### 1. `scala.concurrent.stm.ccstm.InTxnImpl` — retains 2.7 MiB (22.9% of reachable heap)
 
-94 instances of `scala.concurrent.stm.ccstm.InTxnImpl` together retain this heap (combined shallow 13.2 KB).
+94 instances of `scala.concurrent.stm.ccstm.InTxnImpl` together retain this heap (combined shallow 13.2 KiB).
 
 #### Merged Paths to GC Roots
 
-- `scala.concurrent.stm.ccstm.InTxnImpl` (94 objects, retained 2.7 MB)
-  - `scala.concurrent.stm.ccstm.InTxnImpl` (94 objects, retained 2.7 MB)
+- `scala.concurrent.stm.ccstm.InTxnImpl` (94 objects, retained 2.7 MiB)
+  - `scala.concurrent.stm.ccstm.InTxnImpl` (94 objects, retained 2.7 MiB)
 
-### 2. `scala.runtime.LazyVals$` — retains 2.5 MB (21.5% of reachable heap)
+### 2. `scala.runtime.LazyVals$` — retains 2.5 MiB (21.5% of reachable heap)
 
 One `scala.runtime.LazyVals$` object (shallow 32 B) dominates this retained heap.
 
-Retained heap accumulates at `java.lang.Object[]` (retained 2.5 MB).
+Retained heap accumulates at `java.lang.Object[]` (retained 2.5 MiB).
 
 _Directly dominates 131,072 objects (showing top 1 classes by retained heap)._
 
 **Accumulated objects by class:**
 
-| Class              | Instances | Shallow | Retained | % of Suspect |
-| ------------------ | --------: | ------: | -------: | -----------: |
-| `java.lang.Object` |   131,072 |  2.0 MB |   2.0 MB |        80.0% |
+_`In Subtree` counts instances **dominated by this suspect only** — it is a subset of the class's total instance count (see the [Class Histogram](#class-histogram-by-retained-heap)), and the two will not agree._
+
+| Class              | In Subtree | Shallow | Retained | % of Suspect |
+| ------------------ | ---------: | ------: | -------: | -----------: |
+| `java.lang.Object` |    131,072 | 2.0 MiB |  2.0 MiB |        80.0% |
 
 **Dominator chain to GC root:**
 
-1. `scala.runtime.LazyVals$` (2.5 MB)
+1. `scala.runtime.LazyVals$` (2.5 MiB)
 
 <details>
 <summary>Dominator subtree</summary>
 
 **Dominator subtree:**
 
-- `java.lang.Object[]` (shallow 512.0 KB, retained 2.5 MB)
+- `java.lang.Object[]` (shallow 512.0 KiB, retained 2.5 MiB)
   - `java.lang.Object` ×4999 (shallow 16 B, retained 16 B each)
 
 </details>
 
-### 3. `java.util.zip.ZipFile$Source` — retains 1.3 MB (11.1% of reachable heap)
+### 3. `java.util.zip.ZipFile$Source` — retains 1.3 MiB (11.1% of reachable heap)
 
-19 instances of `java.util.zip.ZipFile$Source` together retain this heap (combined shallow 1.5 KB).
+19 instances of `java.util.zip.ZipFile$Source` together retain this heap (combined shallow 1.5 KiB).
 
 #### Merged Paths to GC Roots
 
-- `java.util.zip.ZipFile$Source` (19 objects, retained 1.3 MB)
-  - `java.util.zip.ZipFile$Source` (19 objects, retained 1.3 MB)
+- `java.util.zip.ZipFile$Source` (19 objects, retained 1.3 MiB)
+  - `java.util.zip.ZipFile$Source` (19 objects, retained 1.3 MiB)
 
 ## Top Consumers
 
@@ -503,119 +559,121 @@ _Biggest objects, classes, and packages by retained heap. Unlike Leak Suspects, 
 
 _All top-level dominators ranked by retained heap — every object directly held by a GC root, sorted largest first._
 
-|  # | Class                                                            | Shallow | Retained | % Heap |
-| -: | ---------------------------------------------------------------- | ------: | -------: | -----: |
-|  1 | `scala.runtime.LazyVals$`                                        |    32 B |   2.5 MB |  21.5% |
-|  2 | `java.util.jar.JarFile`                                          |    64 B | 584.6 KB |   4.9% |
-|  3 | `java.util.jar.JarFile`                                          |    64 B | 522.1 KB |   4.4% |
-|  4 | `java.lang.Thread`                                               |   104 B | 302.4 KB |   2.5% |
-|  5 | `java.util.zip.ZipFile$Source`                                   |    80 B | 295.2 KB |   2.5% |
-|  6 | `java.util.zip.ZipFile$Source`                                   |    80 B | 267.9 KB |   2.3% |
-|  7 | `java.util.zip.ZipFile$Source`                                   |    80 B | 260.6 KB |   2.2% |
-|  8 | `java.time.zone.ZoneRulesProvider`                               |    16 B | 198.4 KB |   1.7% |
-|  9 | `java.net.URLClassLoader`                                        |    88 B | 170.4 KB |   1.4% |
-| 10 | `java.util.zip.ZipFile$Source`                                   |    80 B | 160.8 KB |   1.4% |
-| 11 | `org.renaissance.scala.stm.RealityShowPhilosophers$CameraThread` |   120 B | 155.3 KB |   1.3% |
-| 12 | `sun.util.calendar.ZoneInfoFile`                                 |   120 B | 145.4 KB |   1.2% |
-| 13 | `sun.security.util.KnownOIDs`                                    |  1.1 KB |  88.5 KB |   0.7% |
-| 14 | `java.lang.Object[]`                                             |  8.9 KB |  75.5 KB |   0.6% |
-| 15 | `java.net.URLClassLoader`                                        |    88 B |  73.0 KB |   0.6% |
-| 16 | `java.util.zip.ZipFile$Source`                                   |    80 B |  68.2 KB |   0.6% |
-| 17 | `jdk.internal.loader.ClassLoaders$AppClassLoader`                |    96 B |  65.9 KB |   0.6% |
-| 18 | `scala.concurrent.stm.skel.SimpleRandom$`                        |    24 B |  64.0 KB |   0.5% |
-| 19 | `sun.util.locale.provider.LocaleProviderAdapter`                 |    24 B |  62.3 KB |   0.5% |
-| 20 | `sun.security.provider.Sun`                                      |   104 B |  53.7 KB |   0.5% |
+|  # | Class                                                            | Shallow |  Retained | % Heap |
+| -: | ---------------------------------------------------------------- | ------: | --------: | -----: |
+|  1 | `scala.runtime.LazyVals$`                                        |    32 B |   2.5 MiB |  21.5% |
+|  2 | `java.util.jar.JarFile`                                          |    64 B | 584.6 KiB |   4.9% |
+|  3 | `java.util.jar.JarFile`                                          |    64 B | 522.1 KiB |   4.4% |
+|  4 | `java.lang.Thread`                                               |   104 B | 302.4 KiB |   2.5% |
+|  5 | `java.util.zip.ZipFile$Source`                                   |    80 B | 295.2 KiB |   2.5% |
+|  6 | `java.util.zip.ZipFile$Source`                                   |    80 B | 267.9 KiB |   2.3% |
+|  7 | `java.util.zip.ZipFile$Source`                                   |    80 B | 260.6 KiB |   2.2% |
+|  8 | `java.time.zone.ZoneRulesProvider`                               |    16 B | 198.4 KiB |   1.7% |
+|  9 | `java.net.URLClassLoader`                                        |    88 B | 170.4 KiB |   1.4% |
+| 10 | `java.util.zip.ZipFile$Source`                                   |    80 B | 160.8 KiB |   1.4% |
+| 11 | `org.renaissance.scala.stm.RealityShowPhilosophers$CameraThread` |   120 B | 155.3 KiB |   1.3% |
+| 12 | `sun.util.calendar.ZoneInfoFile`                                 |   120 B | 145.4 KiB |   1.2% |
+| 13 | `sun.security.util.KnownOIDs`                                    | 1.1 KiB |  88.5 KiB |   0.7% |
+| 14 | `java.lang.Object[]`                                             | 8.9 KiB |  75.5 KiB |   0.6% |
+| 15 | `java.net.URLClassLoader`                                        |    88 B |  73.0 KiB |   0.6% |
+| 16 | `java.util.zip.ZipFile$Source`                                   |    80 B |  68.2 KiB |   0.6% |
+| 17 | `jdk.internal.loader.ClassLoaders$AppClassLoader`                |    96 B |  65.9 KiB |   0.6% |
+| 18 | `scala.concurrent.stm.skel.SimpleRandom$`                        |    24 B |  64.0 KiB |   0.5% |
+| 19 | `sun.util.locale.provider.LocaleProviderAdapter`                 |    24 B |  62.3 KiB |   0.5% |
+| 20 | `sun.security.provider.Sun`                                      |   104 B |  53.7 KiB |   0.5% |
 
 ### Biggest Classes by Retained Heap
 
 _Classes ranked by total retained heap. High retained with low shallow means the class is keeping many other objects alive — investigate it in Dominator Analysis._
 
-|  # | Class                                                                 | Instances | Retained |
-| -: | --------------------------------------------------------------------- | --------: | -------: |
-|  1 | `java.lang.Class`                                                     |     1,697 |   3.4 MB |
-|  2 | `scala.concurrent.stm.ccstm.InTxnImpl`                                |        94 |   2.7 MB |
-|  3 | `java.util.zip.ZipFile$Source`                                        |        19 |   1.3 MB |
-|  4 | `java.util.jar.JarFile`                                               |        19 |   1.1 MB |
-|  5 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread` |       128 |   1.0 MB |
-|  6 | `java.lang.String`                                                    |     9,412 | 626.9 KB |
-|  7 | `java.lang.Thread`                                                    |        25 | 308.5 KB |
-|  8 | `java.net.URLClassLoader`                                             |         2 | 243.5 KB |
-|  9 | `org.renaissance.scala.stm.RealityShowPhilosophers$CameraThread`      |         1 | 155.3 KB |
-| 10 | `java.lang.Object[]`                                                  |         4 | 106.6 KB |
-| 11 | `java.lang.invoke.MethodType`                                         |       660 |  84.0 KB |
-| 12 | `jdk.internal.loader.ClassLoaders$AppClassLoader`                     |         1 |  65.9 KB |
-| 13 | `scala.concurrent.stm.skel.SimpleRandom$`                             |         1 |  64.0 KB |
-| 14 | `java.lang.Module`                                                    |        61 |  63.1 KB |
-| 15 | `sun.security.provider.Sun`                                           |         1 |  53.7 KB |
-| 16 | `jdk.internal.loader.ClassLoaders$PlatformClassLoader`                |         1 |  51.4 KB |
-| 17 | `java.lang.module.ModuleDescriptor`                                   |        62 |  40.0 KB |
-| 18 | `java.lang.invoke.LambdaForm`                                         |        93 |  35.1 KB |
-| 19 | `java.io.PrintStream`                                                 |         2 |  34.6 KB |
-| 20 | `java.util.concurrent.ConcurrentHashMap`                              |         1 |  34.0 KB |
+_`Top Dominators` is the number of objects of this class whose **immediate dominator is a GC root** (i.e. this class's top-level dominator nodes) — **not** the class's total instance count. A class can have millions of instances and only a handful of top-level dominators. For the total, see the [Class Histogram](#class-histogram-by-retained-heap)._
+
+|  # | Class                                                                 | Top Dominators |  Retained |
+| -: | --------------------------------------------------------------------- | -------------: | --------: |
+|  1 | `java.lang.Class`                                                     |          1,697 |   3.4 MiB |
+|  2 | `scala.concurrent.stm.ccstm.InTxnImpl`                                |             94 |   2.7 MiB |
+|  3 | `java.util.zip.ZipFile$Source`                                        |             19 |   1.3 MiB |
+|  4 | `java.util.jar.JarFile`                                               |             19 |   1.1 MiB |
+|  5 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread` |            128 |   1.0 MiB |
+|  6 | `java.lang.String`                                                    |          9,412 | 626.9 KiB |
+|  7 | `java.lang.Thread`                                                    |             25 | 308.5 KiB |
+|  8 | `java.net.URLClassLoader`                                             |              2 | 243.5 KiB |
+|  9 | `org.renaissance.scala.stm.RealityShowPhilosophers$CameraThread`      |              1 | 155.3 KiB |
+| 10 | `java.lang.Object[]`                                                  |              4 | 106.6 KiB |
+| 11 | `java.lang.invoke.MethodType`                                         |            660 |  84.0 KiB |
+| 12 | `jdk.internal.loader.ClassLoaders$AppClassLoader`                     |              1 |  65.9 KiB |
+| 13 | `scala.concurrent.stm.skel.SimpleRandom$`                             |              1 |  64.0 KiB |
+| 14 | `java.lang.Module`                                                    |             61 |  63.1 KiB |
+| 15 | `sun.security.provider.Sun`                                           |              1 |  53.7 KiB |
+| 16 | `jdk.internal.loader.ClassLoaders$PlatformClassLoader`                |              1 |  51.4 KiB |
+| 17 | `java.lang.module.ModuleDescriptor`                                   |             62 |  40.0 KiB |
+| 18 | `java.lang.invoke.LambdaForm`                                         |             93 |  35.1 KiB |
+| 19 | `java.io.PrintStream`                                                 |              2 |  34.6 KiB |
+| 20 | `java.util.concurrent.ConcurrentHashMap`                              |              1 |  34.0 KiB |
 
 ### Retained Size Distribution
 
 _Retained heap distributed across all 13,945 top-level dominators. The shape reveals whether a handful of large objects dominate the heap or memory is scattered across many small ones._
 
 - Dominators: 13,945
-- Smallest / largest retained: 0 B / 2.5 MB
+- Smallest / largest retained: 0 B / 2.5 MiB
 - Median retained: 64 B
-- Total retained (top-level): 11.6 MB
+- Total retained (top-level): 11.6 MiB
 
-|   Size ≤ | Count | % of Dominators |
-| -------: | ----: | --------------: |
-|      1 B |   456 |            3.3% |
-|      8 B |   101 |            0.7% |
-|     16 B |   275 |            2.0% |
-|     32 B |   850 |            6.1% |
-|     64 B | 7,077 |           50.7% |
-|    128 B | 3,741 |           26.8% |
-|    256 B |   629 |            4.5% |
-|    512 B |   317 |            2.3% |
-|   1.0 KB |   220 |            1.6% |
-|   2.0 KB |    53 |            0.4% |
-|   4.0 KB |    29 |            0.2% |
-|   8.0 KB |    20 |            0.1% |
-|  16.0 KB |    11 |            0.1% |
-|  32.0 KB |   140 |            1.0% |
-|  64.0 KB |     8 |            0.1% |
-| 128.0 KB |     6 |           <0.1% |
-| 256.0 KB |     5 |           <0.1% |
-| 512.0 KB |     4 |           <0.1% |
-|   1.0 MB |     2 |           <0.1% |
-|   4.0 MB |     1 |           <0.1% |
+|    Size ≤ | Count | % of Dominators |
+| --------: | ----: | --------------: |
+|       1 B |   456 |            3.3% |
+|       8 B |   101 |            0.7% |
+|      16 B |   275 |            2.0% |
+|      32 B |   850 |            6.1% |
+|      64 B | 7,077 |           50.7% |
+|     128 B | 3,741 |           26.8% |
+|     256 B |   629 |            4.5% |
+|     512 B |   317 |            2.3% |
+|   1.0 KiB |   220 |            1.6% |
+|   2.0 KiB |    53 |            0.4% |
+|   4.0 KiB |    29 |            0.2% |
+|   8.0 KiB |    20 |            0.1% |
+|  16.0 KiB |    11 |            0.1% |
+|  32.0 KiB |   140 |            1.0% |
+|  64.0 KiB |     8 |            0.1% |
+| 128.0 KiB |     6 |           <0.1% |
+| 256.0 KiB |     5 |           <0.1% |
+| 512.0 KiB |     4 |           <0.1% |
+|   1.0 MiB |     2 |           <0.1% |
+|   4.0 MiB |     1 |           <0.1% |
 
 ### Biggest Packages by Retained Heap
 
 _Retained heap aggregated by package prefix — only packages retaining ≥1% of the heap are shown._
 
-| Package                      | # Objects |  Shallow | Retained |
-| ---------------------------- | --------: | -------: | -------: |
-| `scala`                      |       493 |  28.7 KB |   5.3 MB |
-| `scala.concurrent`           |       381 |  27.5 KB |   2.8 MB |
-| `scala.concurrent.stm`       |       378 |  27.5 KB |   2.8 MB |
-| `scala.concurrent.stm.ccstm` |       360 |  27.4 KB |   2.7 MB |
-| `scala.runtime`              |        18 |    160 B |   2.5 MB |
-| `java`                       |    12,366 | 351.4 KB |   4.5 MB |
-| `java.util`                  |       663 |  13.4 KB |   2.5 MB |
-| `java.util.zip`              |       126 |   4.9 KB |   1.3 MB |
-| `java.util.jar`              |        42 |   1.7 KB |   1.1 MB |
-| `java.lang`                  |    11,173 | 321.4 KB |   1.4 MB |
-| `java.lang.invoke`           |     1,177 |  42.6 KB | 233.5 KB |
-| `java.net`                   |        89 |   6.1 KB | 258.7 KB |
-| `java.time`                  |       153 |   3.8 KB | 230.7 KB |
-| `java.time.zone`             |        11 |    208 B | 205.6 KB |
-| `org`                        |       326 |  19.9 KB |   1.2 MB |
-| `org.renaissance`            |       326 |  19.9 KB |   1.2 MB |
-| `org.renaissance.scala`      |       270 |  19.2 KB |   1.2 MB |
-| `org.renaissance.scala.stm`  |       270 |  19.2 KB |   1.2 MB |
-| `sun`                        |       268 |   6.9 KB | 465.9 KB |
-| `sun.util`                   |        87 |   1.9 KB | 288.3 KB |
-| `sun.util.calendar`          |         5 |    176 B | 145.5 KB |
-| `sun.security`               |        54 |   1.9 KB | 157.9 KB |
-| `jdk`                        |       347 |  10.3 KB | 170.1 KB |
-| `jdk.internal`               |       344 |  10.3 KB | 170.0 KB |
-| `jdk.internal.loader`        |        39 |    576 B | 124.3 KB |
+| Package                      | # Objects |   Shallow |  Retained |
+| ---------------------------- | --------: | --------: | --------: |
+| `scala`                      |       493 |  28.7 KiB |   5.3 MiB |
+| `scala.concurrent`           |       381 |  27.5 KiB |   2.8 MiB |
+| `scala.concurrent.stm`       |       378 |  27.5 KiB |   2.8 MiB |
+| `scala.concurrent.stm.ccstm` |       360 |  27.4 KiB |   2.7 MiB |
+| `scala.runtime`              |        18 |     160 B |   2.5 MiB |
+| `java`                       |    12,366 | 351.4 KiB |   4.5 MiB |
+| `java.util`                  |       663 |  13.4 KiB |   2.5 MiB |
+| `java.util.zip`              |       126 |   4.9 KiB |   1.3 MiB |
+| `java.util.jar`              |        42 |   1.7 KiB |   1.1 MiB |
+| `java.lang`                  |    11,173 | 321.4 KiB |   1.4 MiB |
+| `java.lang.invoke`           |     1,177 |  42.6 KiB | 233.5 KiB |
+| `java.net`                   |        89 |   6.1 KiB | 258.7 KiB |
+| `java.time`                  |       153 |   3.8 KiB | 230.7 KiB |
+| `java.time.zone`             |        11 |     208 B | 205.6 KiB |
+| `org`                        |       326 |  19.9 KiB |   1.2 MiB |
+| `org.renaissance`            |       326 |  19.9 KiB |   1.2 MiB |
+| `org.renaissance.scala`      |       270 |  19.2 KiB |   1.2 MiB |
+| `org.renaissance.scala.stm`  |       270 |  19.2 KiB |   1.2 MiB |
+| `sun`                        |       268 |   6.9 KiB | 465.9 KiB |
+| `sun.util`                   |        87 |   1.9 KiB | 288.3 KiB |
+| `sun.util.calendar`          |         5 |     176 B | 145.5 KiB |
+| `sun.security`               |        54 |   1.9 KiB | 157.9 KiB |
+| `jdk`                        |       347 |  10.3 KiB | 170.1 KiB |
+| `jdk.internal`               |       344 |  10.3 KiB | 170.0 KiB |
+| `jdk.internal.loader`        |        39 |     576 B | 124.3 KiB |
 
 ## Dominator Analysis
 
@@ -623,36 +681,36 @@ _An object **dominates** another if every path from a GC root passes through it 
 
 ### Big Drops
 
-_Objects retaining far more than their largest single child — memory held directly in the object or spread across many small dominated children. Drop = object retained − largest child retained; the memory freed by dropping just this object, not counting what its largest dominated child already retains. Threshold 0.1 MB (1% of reachable heap). Multiple rows with the same class are distinct objects._
+_Objects retaining far more than their largest single child — memory held directly in the object or spread across many small dominated children. Drop = object retained − largest child retained; the memory freed by dropping just this object, not counting what its largest dominated child already retains. Threshold 0.1 MiB (1% of reachable heap). Multiple rows with the same class are distinct objects._
 
-| Object                                                           |      # |    Retained | Largest Child                          | Child Retained |       Drop |
-| ---------------------------------------------------------------- | -----: | ----------: | -------------------------------------- | -------------: | ---------: |
-| `java.lang.Object[]`                                             |      1 |      2.5 MB | `java.lang.Object`                     |           16 B |     2.5 MB |
-| `java.util.HashMap$Node[]`                                       |  39348 |    577.2 KB | `java.util.HashMap$Node`               |         1000 B |   576.2 KB |
-| `java.util.HashMap$Node[]`                                       |  76135 |    513.6 KB | `java.util.HashMap$Node`               |         1.1 KB |   512.5 KB |
-| `byte[]`                                                         |  99101 |    255.1 KB | —                                      |            0 B |   255.1 KB |
-| `byte[]`                                                         |  70491 |    232.6 KB | —                                      |            0 B |   232.6 KB |
-| `byte[]`                                                         |  73387 |    224.6 KB | —                                      |            0 B |   224.6 KB |
-| `java.lang.Thread`                                               | 182024 |    302.4 KB | `java.util.HashMap`                    |       137.1 KB |   165.2 KB |
-| `byte[]`                                                         |  72656 |    141.0 KB | —                                      |            0 B |   141.0 KB |
-| `java.util.HashMap$Node[]`                                       |  62772 |    137.1 KB | `java.util.HashMap$Node`               |          824 B |   136.2 KB |
-| `java.lang.Object[]`                                             |  98083 |    125.8 KB | `java.lang.String`                     |         8.0 KB |   117.8 KB |
-| `java.lang.Class`                                                |  32971 |    198.4 KB | `java.time.zone.TzdbZoneRulesProvider` |       118.2 KB |    80.2 KB |
-| `java.net.URLClassLoader`                                        |  60393 |    170.4 KB | `java.util.ArrayList`                  |       110.0 KB |    60.4 KB |
-| `java.lang.Class`                                                | 235715 |    145.4 KB | `byte[][]`                             |        94.1 KB |    51.2 KB |
-| `java.util.zip.ZipFile$Source`                                   | 182101 |    295.2 KB | `byte[]`                               |       255.1 KB |    40.1 KB |
-| `java.util.zip.ZipFile$Source`                                   |  73254 |    260.6 KB | `byte[]`                               |       224.6 KB |    36.0 KB |
-| `java.util.zip.ZipFile$Source`                                   |  73266 |    267.9 KB | `byte[]`                               |       232.6 KB |    35.3 KB |
-| `org.renaissance.scala.stm.RealityShowPhilosophers$CameraThread` |  96323 |    155.3 KB | `scala.collection.mutable.ArrayBuffer` |       125.8 KB |    29.5 KB |
-| `java.util.zip.ZipFile$Source`                                   |  72629 |    160.8 KB | `byte[]`                               |       141.0 KB |    19.8 KB |
-| `java.util.jar.Manifest`                                         |  75398 |    521.7 KB | `java.util.HashMap`                    |       513.7 KB |     8.0 KB |
-| `java.util.jar.Manifest`                                         |  39279 |    584.2 KB | `java.util.HashMap`                    |       577.2 KB |     6.9 KB |
-| `java.lang.Class`                                                | 146448 |      2.5 MB | `java.lang.Object[]`                   |         2.5 MB |      920 B |
-| `java.util.jar.JarFile`                                          |  39276 |    584.6 KB | `java.lang.ref.SoftReference`          |       584.2 KB |      352 B |
-| `java.util.jar.JarFile`                                          |  73228 |    522.1 KB | `java.lang.ref.SoftReference`          |       521.8 KB |      312 B |
-| `java.util.HashMap`                                              |  62002 |    137.1 KB | `java.util.HashMap$Node[]`             |       137.1 KB |       80 B |
-| `java.util.HashMap`                                              |  39347 |    577.2 KB | `java.util.HashMap$Node[]`             |       577.2 KB |       48 B |
-| **Total**                                                        |        | **11.9 MB** |                                        |     **6.8 MB** | **5.2 MB** |
+| Object                                                           |      # |     Retained | Largest Child                          | Child Retained |        Drop |
+| ---------------------------------------------------------------- | -----: | -----------: | -------------------------------------- | -------------: | ----------: |
+| `java.lang.Object[]`                                             |      1 |      2.5 MiB | `java.lang.Object`                     |           16 B |     2.5 MiB |
+| `java.util.HashMap$Node[]`                                       |  39348 |    577.2 KiB | `java.util.HashMap$Node`               |         1000 B |   576.2 KiB |
+| `java.util.HashMap$Node[]`                                       |  76135 |    513.6 KiB | `java.util.HashMap$Node`               |        1.1 KiB |   512.5 KiB |
+| `byte[]`                                                         |  99101 |    255.1 KiB | —                                      |            0 B |   255.1 KiB |
+| `byte[]`                                                         |  70491 |    232.6 KiB | —                                      |            0 B |   232.6 KiB |
+| `byte[]`                                                         |  73387 |    224.6 KiB | —                                      |            0 B |   224.6 KiB |
+| `java.lang.Thread`                                               | 182024 |    302.4 KiB | `java.util.HashMap`                    |      137.1 KiB |   165.2 KiB |
+| `byte[]`                                                         |  72656 |    141.0 KiB | —                                      |            0 B |   141.0 KiB |
+| `java.util.HashMap$Node[]`                                       |  62772 |    137.1 KiB | `java.util.HashMap$Node`               |          824 B |   136.2 KiB |
+| `java.lang.Object[]`                                             |  98083 |    125.8 KiB | `java.lang.String`                     |        8.0 KiB |   117.8 KiB |
+| `java.lang.Class`                                                |  32971 |    198.4 KiB | `java.time.zone.TzdbZoneRulesProvider` |      118.2 KiB |    80.2 KiB |
+| `java.net.URLClassLoader`                                        |  60393 |    170.4 KiB | `java.util.ArrayList`                  |      110.0 KiB |    60.4 KiB |
+| `java.lang.Class`                                                | 235715 |    145.4 KiB | `byte[][]`                             |       94.1 KiB |    51.2 KiB |
+| `java.util.zip.ZipFile$Source`                                   | 182101 |    295.2 KiB | `byte[]`                               |      255.1 KiB |    40.1 KiB |
+| `java.util.zip.ZipFile$Source`                                   |  73254 |    260.6 KiB | `byte[]`                               |      224.6 KiB |    36.0 KiB |
+| `java.util.zip.ZipFile$Source`                                   |  73266 |    267.9 KiB | `byte[]`                               |      232.6 KiB |    35.3 KiB |
+| `org.renaissance.scala.stm.RealityShowPhilosophers$CameraThread` |  96323 |    155.3 KiB | `scala.collection.mutable.ArrayBuffer` |      125.8 KiB |    29.5 KiB |
+| `java.util.zip.ZipFile$Source`                                   |  72629 |    160.8 KiB | `byte[]`                               |      141.0 KiB |    19.8 KiB |
+| `java.util.jar.Manifest`                                         |  75398 |    521.7 KiB | `java.util.HashMap`                    |      513.7 KiB |     8.0 KiB |
+| `java.util.jar.Manifest`                                         |  39279 |    584.2 KiB | `java.util.HashMap`                    |      577.2 KiB |     6.9 KiB |
+| `java.lang.Class`                                                | 146448 |      2.5 MiB | `java.lang.Object[]`                   |        2.5 MiB |       920 B |
+| `java.util.jar.JarFile`                                          |  39276 |    584.6 KiB | `java.lang.ref.SoftReference`          |      584.2 KiB |       352 B |
+| `java.util.jar.JarFile`                                          |  73228 |    522.1 KiB | `java.lang.ref.SoftReference`          |      521.8 KiB |       312 B |
+| `java.util.HashMap`                                              |  62002 |    137.1 KiB | `java.util.HashMap$Node[]`             |      137.1 KiB |        80 B |
+| `java.util.HashMap`                                              |  39347 |    577.2 KiB | `java.util.HashMap$Node[]`             |      577.2 KiB |        48 B |
+| **Total**                                                        |        | **11.9 MiB** |                                        |    **6.8 MiB** | **5.2 MiB** |
 
 ### Immediate Dominators
 
@@ -660,37 +718,37 @@ _Each row shows one dominator class: how many other objects it immediately domin
 
 | Dominator Class                                                       | # Dominators | # Dominated | Dominator Shallow | Dominated Shallow |
 | --------------------------------------------------------------------- | -----------: | ----------: | ----------------: | ----------------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                |          129 |       1,548 |           18.1 KB |            3.2 MB |
-| `java.lang.Object[]`                                                  |          342 |     135,075 |          740.3 KB |            2.1 MB |
-| `java.util.zip.ZipFile$Source`                                        |           19 |          57 |            1.5 KB |            1.3 MB |
-| `java.lang.String`                                                    |       23,215 |      23,215 |          544.1 KB |            1.2 MB |
-| `java.lang.Class`                                                     |        1,877 |       4,844 |           31.3 KB |          758.3 KB |
-| `scala.concurrent.stm.skel.CallbackList`                              |          774 |         774 |           18.1 KB |          399.1 KB |
-| `java.util.jar.Attributes`                                            |        5,477 |       5,477 |           85.6 KB |          342.3 KB |
-| `java.util.HashMap$Node`                                              |        7,380 |      15,368 |          230.6 KB |          337.6 KB |
-| `java.util.HashMap$Node[]`                                            |          348 |       7,542 |           86.9 KB |          235.9 KB |
-| `java.util.concurrent.ConcurrentHashMap$Node[]`                       |           91 |       5,916 |           65.7 KB |          215.3 KB |
-| `java.util.concurrent.ConcurrentHashMap$Node`                         |        5,245 |       6,642 |          163.9 KB |          206.2 KB |
-| `byte[][]`                                                            |            1 |         346 |            1.4 KB |           92.8 KB |
-| `java.util.HashMap`                                                   |          348 |         400 |           16.3 KB |           87.7 KB |
-| `java.util.concurrent.ConcurrentHashMap`                              |           93 |         103 |            5.8 KB |           66.1 KB |
-| `scala.concurrent.stm.skel.SimpleRandom$`                             |            1 |           1 |              24 B |           64.0 KB |
-| `java.util.LinkedHashMap`                                             |           47 |       1,250 |            2.9 KB |           56.7 KB |
-| `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread` |          128 |       1,209 |           16.0 KB |           36.2 KB |
-| `java.io.BufferedWriter`                                              |            2 |           4 |              80 B |           32.1 KB |
-| `java.util.LinkedHashMap$Entry`                                       |        1,139 |       1,166 |           44.5 KB |           27.3 KB |
-| `jdk.internal.math.FDBigInteger`                                      |          341 |         341 |           10.7 KB |           24.2 KB |
-| `java.util.ImmutableCollections$SetN`                                 |          149 |         149 |            3.5 KB |           23.3 KB |
-| `java.lang.invoke.MethodType`                                         |          546 |         784 |           21.3 KB |           21.2 KB |
-| `java.lang.invoke.MethodTypeForm`                                     |          125 |         250 |            3.9 KB |           18.6 KB |
-| `java.io.BufferedReader`                                              |            1 |           3 |              48 B |           16.1 KB |
-| `java.lang.invoke.MemberName`                                         |          466 |         773 |           18.2 KB |           13.8 KB |
-| `java.util.concurrent.atomic.AtomicReferenceArray`                    |            2 |           2 |              32 B |           12.0 KB |
-| `java.lang.invoke.DirectMethodHandle$Constructor`                     |          123 |         432 |            5.8 KB |           11.7 KB |
-| `java.lang.invoke.LambdaForm`                                         |          128 |         272 |            6.0 KB |           10.9 KB |
-| `jdk.internal.math.FDBigInteger[]`                                    |            1 |         341 |            1.3 KB |           10.6 KB |
-| `java.lang.invoke.LambdaForm$Name[]`                                  |          126 |         330 |            5.3 KB |           10.3 KB |
-| **Total**                                                             |   **48,664** | **214,614** |        **2.1 MB** |       **10.9 MB** |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                |          129 |       1,548 |          18.1 KiB |           3.2 MiB |
+| `java.lang.Object[]`                                                  |          342 |     135,075 |         740.3 KiB |           2.1 MiB |
+| `java.util.zip.ZipFile$Source`                                        |           19 |          57 |           1.5 KiB |           1.3 MiB |
+| `java.lang.String`                                                    |       23,215 |      23,215 |         544.1 KiB |           1.2 MiB |
+| `java.lang.Class`                                                     |        1,877 |       4,844 |          31.3 KiB |         758.3 KiB |
+| `scala.concurrent.stm.skel.CallbackList`                              |          774 |         774 |          18.1 KiB |         399.1 KiB |
+| `java.util.jar.Attributes`                                            |        5,477 |       5,477 |          85.6 KiB |         342.3 KiB |
+| `java.util.HashMap$Node`                                              |        7,380 |      15,368 |         230.6 KiB |         337.6 KiB |
+| `java.util.HashMap$Node[]`                                            |          348 |       7,542 |          86.9 KiB |         235.9 KiB |
+| `java.util.concurrent.ConcurrentHashMap$Node[]`                       |           91 |       5,916 |          65.7 KiB |         215.3 KiB |
+| `java.util.concurrent.ConcurrentHashMap$Node`                         |        5,245 |       6,642 |         163.9 KiB |         206.2 KiB |
+| `byte[][]`                                                            |            1 |         346 |           1.4 KiB |          92.8 KiB |
+| `java.util.HashMap`                                                   |          348 |         400 |          16.3 KiB |          87.7 KiB |
+| `java.util.concurrent.ConcurrentHashMap`                              |           93 |         103 |           5.8 KiB |          66.1 KiB |
+| `scala.concurrent.stm.skel.SimpleRandom$`                             |            1 |           1 |              24 B |          64.0 KiB |
+| `java.util.LinkedHashMap`                                             |           47 |       1,250 |           2.9 KiB |          56.7 KiB |
+| `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread` |          128 |       1,209 |          16.0 KiB |          36.2 KiB |
+| `java.io.BufferedWriter`                                              |            2 |           4 |              80 B |          32.1 KiB |
+| `java.util.LinkedHashMap$Entry`                                       |        1,139 |       1,166 |          44.5 KiB |          27.3 KiB |
+| `jdk.internal.math.FDBigInteger`                                      |          341 |         341 |          10.7 KiB |          24.2 KiB |
+| `java.util.ImmutableCollections$SetN`                                 |          149 |         149 |           3.5 KiB |          23.3 KiB |
+| `java.lang.invoke.MethodType`                                         |          546 |         784 |          21.3 KiB |          21.2 KiB |
+| `java.lang.invoke.MethodTypeForm`                                     |          125 |         250 |           3.9 KiB |          18.6 KiB |
+| `java.io.BufferedReader`                                              |            1 |           3 |              48 B |          16.1 KiB |
+| `java.lang.invoke.MemberName`                                         |          466 |         773 |          18.2 KiB |          13.8 KiB |
+| `java.util.concurrent.atomic.AtomicReferenceArray`                    |            2 |           2 |              32 B |          12.0 KiB |
+| `java.lang.invoke.DirectMethodHandle$Constructor`                     |          123 |         432 |           5.8 KiB |          11.7 KiB |
+| `java.lang.invoke.LambdaForm`                                         |          128 |         272 |           6.0 KiB |          10.9 KiB |
+| `jdk.internal.math.FDBigInteger[]`                                    |            1 |         341 |           1.3 KiB |          10.6 KiB |
+| `java.lang.invoke.LambdaForm$Name[]`                                  |          126 |         330 |           5.3 KiB |          10.3 KiB |
+| **Total**                                                             |   **48,664** | **214,614** |       **2.1 MiB** |      **10.9 MiB** |
 
 ## Threads
 
@@ -700,141 +758,141 @@ _Per-thread call stacks and retained heap. A thread keeps everything on its stac
 
 _Name, shallow/retained heap, max single-local retained, context class loader, daemon flag, priority, and thread state for every recorded thread._
 
-| Name                           | Shallow | Retained | Max Local Retained | Context Class Loader                   | Daemon | Priority | State                                                  |
-| ------------------------------ | ------: | -------: | -----------------: | -------------------------------------- | ------ | -------: | ------------------------------------------------------ |
-| [main](#thread-1)              |   104 B | 302.4 KB |           155.3 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, waiting, waiting indefinitely, in Object.wait] |
-| [Reference Handler](#thread-2) |   104 B |    200 B |                0 B | `—`                                    | Yes    |       10 | [alive, runnable]                                      |
-| [Finalizer](#thread-3)         |   112 B |    208 B |               40 B | `—`                                    | Yes    |        8 | [alive, waiting, waiting indefinitely, in Object.wait] |
-| [Common-Cleaner](#thread-6)    |   112 B |    168 B |              128 B | `—`                                    | Yes    |        8 | [alive, waiting, waiting with timeout, parked]         |
-| [Thread-259](#thread-7)        |   120 B | 155.3 KB |                0 B | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, waiting, waiting with timeout, sleeping]       |
-| [Thread-131](#thread-8)        |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-132](#thread-9)        |   128 B |  29.8 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-133](#thread-10)       |   128 B |  29.8 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-134](#thread-11)       |   128 B |    560 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-135](#thread-12)       |   128 B |  29.8 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-136](#thread-13)       |   128 B |  29.8 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-137](#thread-14)       |   128 B |  29.7 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-138](#thread-15)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-139](#thread-16)       |   128 B |  29.8 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-140](#thread-17)       |   128 B |    560 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-141](#thread-18)       |   128 B |  29.8 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, waiting, waiting indefinitely, parked]         |
-| [Thread-142](#thread-19)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-143](#thread-20)       |   128 B |    600 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-144](#thread-21)       |   128 B |  29.8 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-145](#thread-22)       |   128 B |    560 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-146](#thread-23)       |   128 B |  29.8 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-147](#thread-24)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-148](#thread-25)       |   128 B |  29.7 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-149](#thread-26)       |   128 B |  29.8 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-150](#thread-27)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-151](#thread-28)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-152](#thread-29)       |   128 B |  29.8 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-153](#thread-30)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-154](#thread-31)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-155](#thread-32)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-156](#thread-33)       |   128 B |  29.8 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-157](#thread-34)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-158](#thread-35)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-159](#thread-36)       |   128 B |  29.7 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-160](#thread-37)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-161](#thread-38)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-162](#thread-39)       |   128 B |    560 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-163](#thread-40)       |   128 B |  29.8 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-164](#thread-41)       |   128 B |  29.7 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-165](#thread-42)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-166](#thread-43)       |   128 B |    560 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-167](#thread-44)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-168](#thread-45)       |   128 B |    560 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-169](#thread-46)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-170](#thread-47)       |   128 B |    560 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-171](#thread-48)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-172](#thread-49)       |   128 B |  29.9 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, waiting, waiting indefinitely, parked]         |
-| [Thread-173](#thread-50)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-174](#thread-51)       |   128 B |  29.8 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-175](#thread-52)       |   128 B |  29.8 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-176](#thread-53)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-177](#thread-54)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-178](#thread-55)       |   128 B |  29.7 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-179](#thread-56)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-180](#thread-57)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-181](#thread-58)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-182](#thread-59)       |   128 B |    560 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-183](#thread-60)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-184](#thread-61)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-185](#thread-62)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-186](#thread-63)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-187](#thread-64)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-188](#thread-65)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-189](#thread-66)       |   128 B |  29.8 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-190](#thread-67)       |   128 B |    560 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-191](#thread-68)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-192](#thread-69)       |   128 B |    560 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-193](#thread-70)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-194](#thread-71)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-195](#thread-72)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-196](#thread-73)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-197](#thread-74)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, blocked on monitor]                            |
-| [Thread-198](#thread-75)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-199](#thread-76)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-200](#thread-77)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-201](#thread-78)       |   128 B |  29.8 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-202](#thread-79)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-203](#thread-80)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-204](#thread-81)       |   128 B |    560 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-205](#thread-82)       |   128 B |  29.8 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, waiting, waiting indefinitely, parked]         |
-| [Thread-206](#thread-83)       |   128 B |    560 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-207](#thread-84)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-208](#thread-85)       |   128 B |    560 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-209](#thread-86)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-210](#thread-87)       |   128 B |    560 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-211](#thread-88)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-212](#thread-89)       |   128 B |    560 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-213](#thread-90)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, blocked on monitor]                            |
-| [Thread-214](#thread-91)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-215](#thread-92)       |   128 B |    600 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-216](#thread-93)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-217](#thread-94)       |   128 B |    560 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-218](#thread-95)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-219](#thread-96)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-220](#thread-97)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-221](#thread-98)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-222](#thread-99)       |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-223](#thread-100)      |   128 B |  29.9 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, waiting, waiting indefinitely, parked]         |
-| [Thread-224](#thread-101)      |   128 B |  29.8 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-225](#thread-102)      |   128 B |    560 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-226](#thread-103)      |   128 B |  29.7 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-227](#thread-104)      |   128 B |    560 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-228](#thread-105)      |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-229](#thread-106)      |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-230](#thread-107)      |   128 B |  29.9 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, waiting, waiting indefinitely, parked]         |
-| [Thread-231](#thread-108)      |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-232](#thread-109)      |   128 B |  29.7 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-233](#thread-110)      |   128 B |  29.8 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-234](#thread-111)      |   128 B |    560 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-235](#thread-112)      |   128 B |  29.8 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, waiting, waiting indefinitely, parked]         |
-| [Thread-236](#thread-113)      |   128 B |  29.8 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, waiting, waiting indefinitely, parked]         |
-| [Thread-237](#thread-114)      |   128 B |    560 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-238](#thread-115)      |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-239](#thread-116)      |   128 B |  29.7 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-240](#thread-117)      |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-241](#thread-118)      |   128 B |  29.7 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-242](#thread-119)      |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-243](#thread-120)      |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-244](#thread-121)      |   128 B |    560 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-245](#thread-122)      |   128 B |  29.8 KB |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-246](#thread-123)      |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-247](#thread-124)      |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-248](#thread-125)      |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-249](#thread-126)      |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-250](#thread-127)      |   128 B |    560 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-251](#thread-128)      |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, blocked on monitor]                            |
-| [Thread-252](#thread-129)      |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-253](#thread-130)      |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-254](#thread-131)      |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-255](#thread-132)      |   128 B |    560 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-256](#thread-133)      |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-257](#thread-134)      |   128 B |    560 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
-| [Thread-258](#thread-135)      |   128 B |    584 B |            29.0 KB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| Name                           | Shallow |  Retained | Max Local Retained | Context Class Loader                   | Daemon | Priority | State                                                  |
+| ------------------------------ | ------: | --------: | -----------------: | -------------------------------------- | ------ | -------: | ------------------------------------------------------ |
+| [main](#thread-1)              |   104 B | 302.4 KiB |          155.3 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, waiting, waiting indefinitely, in Object.wait] |
+| [Reference Handler](#thread-2) |   104 B |     200 B |                0 B | `—`                                    | Yes    |       10 | [alive, runnable]                                      |
+| [Finalizer](#thread-3)         |   112 B |     208 B |               40 B | `—`                                    | Yes    |        8 | [alive, waiting, waiting indefinitely, in Object.wait] |
+| [Common-Cleaner](#thread-6)    |   112 B |     168 B |              128 B | `—`                                    | Yes    |        8 | [alive, waiting, waiting with timeout, parked]         |
+| [Thread-259](#thread-7)        |   120 B | 155.3 KiB |                0 B | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, waiting, waiting with timeout, sleeping]       |
+| [Thread-131](#thread-8)        |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-132](#thread-9)        |   128 B |  29.8 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-133](#thread-10)       |   128 B |  29.8 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-134](#thread-11)       |   128 B |     560 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-135](#thread-12)       |   128 B |  29.8 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-136](#thread-13)       |   128 B |  29.8 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-137](#thread-14)       |   128 B |  29.7 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-138](#thread-15)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-139](#thread-16)       |   128 B |  29.8 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-140](#thread-17)       |   128 B |     560 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-141](#thread-18)       |   128 B |  29.8 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, waiting, waiting indefinitely, parked]         |
+| [Thread-142](#thread-19)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-143](#thread-20)       |   128 B |     600 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-144](#thread-21)       |   128 B |  29.8 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-145](#thread-22)       |   128 B |     560 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-146](#thread-23)       |   128 B |  29.8 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-147](#thread-24)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-148](#thread-25)       |   128 B |  29.7 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-149](#thread-26)       |   128 B |  29.8 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-150](#thread-27)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-151](#thread-28)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-152](#thread-29)       |   128 B |  29.8 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-153](#thread-30)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-154](#thread-31)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-155](#thread-32)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-156](#thread-33)       |   128 B |  29.8 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-157](#thread-34)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-158](#thread-35)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-159](#thread-36)       |   128 B |  29.7 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-160](#thread-37)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-161](#thread-38)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-162](#thread-39)       |   128 B |     560 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-163](#thread-40)       |   128 B |  29.8 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-164](#thread-41)       |   128 B |  29.7 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-165](#thread-42)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-166](#thread-43)       |   128 B |     560 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-167](#thread-44)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-168](#thread-45)       |   128 B |     560 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-169](#thread-46)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-170](#thread-47)       |   128 B |     560 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-171](#thread-48)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-172](#thread-49)       |   128 B |  29.9 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, waiting, waiting indefinitely, parked]         |
+| [Thread-173](#thread-50)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-174](#thread-51)       |   128 B |  29.8 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-175](#thread-52)       |   128 B |  29.8 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-176](#thread-53)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-177](#thread-54)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-178](#thread-55)       |   128 B |  29.7 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-179](#thread-56)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-180](#thread-57)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-181](#thread-58)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-182](#thread-59)       |   128 B |     560 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-183](#thread-60)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-184](#thread-61)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-185](#thread-62)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-186](#thread-63)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-187](#thread-64)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-188](#thread-65)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-189](#thread-66)       |   128 B |  29.8 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-190](#thread-67)       |   128 B |     560 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-191](#thread-68)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-192](#thread-69)       |   128 B |     560 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-193](#thread-70)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-194](#thread-71)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-195](#thread-72)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-196](#thread-73)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-197](#thread-74)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, blocked on monitor]                            |
+| [Thread-198](#thread-75)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-199](#thread-76)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-200](#thread-77)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-201](#thread-78)       |   128 B |  29.8 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-202](#thread-79)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-203](#thread-80)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-204](#thread-81)       |   128 B |     560 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-205](#thread-82)       |   128 B |  29.8 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, waiting, waiting indefinitely, parked]         |
+| [Thread-206](#thread-83)       |   128 B |     560 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-207](#thread-84)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-208](#thread-85)       |   128 B |     560 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-209](#thread-86)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-210](#thread-87)       |   128 B |     560 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-211](#thread-88)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-212](#thread-89)       |   128 B |     560 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-213](#thread-90)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, blocked on monitor]                            |
+| [Thread-214](#thread-91)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-215](#thread-92)       |   128 B |     600 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-216](#thread-93)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-217](#thread-94)       |   128 B |     560 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-218](#thread-95)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-219](#thread-96)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-220](#thread-97)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-221](#thread-98)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-222](#thread-99)       |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-223](#thread-100)      |   128 B |  29.9 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, waiting, waiting indefinitely, parked]         |
+| [Thread-224](#thread-101)      |   128 B |  29.8 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-225](#thread-102)      |   128 B |     560 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-226](#thread-103)      |   128 B |  29.7 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-227](#thread-104)      |   128 B |     560 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-228](#thread-105)      |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-229](#thread-106)      |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-230](#thread-107)      |   128 B |  29.9 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, waiting, waiting indefinitely, parked]         |
+| [Thread-231](#thread-108)      |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-232](#thread-109)      |   128 B |  29.7 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-233](#thread-110)      |   128 B |  29.8 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-234](#thread-111)      |   128 B |     560 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-235](#thread-112)      |   128 B |  29.8 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, waiting, waiting indefinitely, parked]         |
+| [Thread-236](#thread-113)      |   128 B |  29.8 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, waiting, waiting indefinitely, parked]         |
+| [Thread-237](#thread-114)      |   128 B |     560 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-238](#thread-115)      |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-239](#thread-116)      |   128 B |  29.7 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-240](#thread-117)      |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-241](#thread-118)      |   128 B |  29.7 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-242](#thread-119)      |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-243](#thread-120)      |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-244](#thread-121)      |   128 B |     560 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-245](#thread-122)      |   128 B |  29.8 KiB |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-246](#thread-123)      |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-247](#thread-124)      |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-248](#thread-125)      |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-249](#thread-126)      |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-250](#thread-127)      |   128 B |     560 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-251](#thread-128)      |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, blocked on monitor]                            |
+| [Thread-252](#thread-129)      |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-253](#thread-130)      |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-254](#thread-131)      |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-255](#thread-132)      |   128 B |     560 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-256](#thread-133)      |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-257](#thread-134)      |   128 B |     560 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
+| [Thread-258](#thread-135)      |   128 B |     584 B |           29.0 KiB | `java/net/URLClassLoader @ 0x80300d20` | No     |        5 | [alive, runnable]                                      |
 
 <a id="thread-1"></a>
 
@@ -846,57 +904,83 @@ _Showing top 20 of 97 by retained heap; retained sizes overlap, so totals may ex
 
 **Local root objects:**
 
-| Object                                                                          | Count | Shallow | Retained |
-| ------------------------------------------------------------------------------- | ----: | ------: | -------: |
-| `org.renaissance.scala.stm.RealityShowPhilosophers$CameraThread`                |     1 |   120 B | 155.3 KB |
-| `scala.collection.immutable.Vector`                                             |     1 |    56 B |    776 B |
-| `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread`           |    ×7 |   128 B |    584 B |
-| `org.renaissance.scala.stm.RealityShowPhilosophers$Fork[]`                      |     1 |   528 B |    528 B |
-| `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread[]`         |     1 |   528 B |    528 B |
-| `org.renaissance.core.BenchmarkSuite$SuiteBenchmarkContext`                     |     1 |    24 B |    296 B |
-| `org.renaissance.scala.stm.RealityShowPhilosophers$$$Lambda+0x00007e41c01c5608` |    ×3 |    16 B |     64 B |
-| `org.renaissance.scala.stm.Philosophers`                                        |     1 |    24 B |     24 B |
-| `org.renaissance.scala.stm.RealityShowPhilosophers$`                            |    ×2 |    16 B |     16 B |
-| `scala.collection.mutable.ArrayOps$ofRef`                                       |    ×2 |    16 B |     16 B |
+| Object                                                                          | Count | Shallow |  Retained |
+| ------------------------------------------------------------------------------- | ----: | ------: | --------: |
+| `org.renaissance.scala.stm.RealityShowPhilosophers$CameraThread`                |     1 |   120 B | 155.3 KiB |
+| `scala.collection.immutable.Vector`                                             |     1 |    56 B |     776 B |
+| `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread`           |    ×7 |   128 B |     584 B |
+| `org.renaissance.scala.stm.RealityShowPhilosophers$Fork[]`                      |     1 |   528 B |     528 B |
+| `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread[]`         |     1 |   528 B |     528 B |
+| `org.renaissance.core.BenchmarkSuite$SuiteBenchmarkContext`                     |     1 |    24 B |     296 B |
+| `org.renaissance.scala.stm.RealityShowPhilosophers$$$Lambda+0x00007e41c01c5608` |    ×3 |    16 B |      64 B |
+| `org.renaissance.scala.stm.Philosophers`                                        |     1 |    24 B |      24 B |
+| `org.renaissance.scala.stm.RealityShowPhilosophers$`                            |    ×2 |    16 B |      16 B |
+| `scala.collection.mutable.ArrayOps$ofRef`                                       |    ×2 |    16 B |      16 B |
 
-_Frame percentages are of this thread's 302.4 KB retained heap._
+_Complete stack: 32 frames as recorded in the dump._
 
-- `java.lang.Thread.join (Thread.java:2079)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 302.4 KiB retained heap._
+
+- `java.lang.Object.wait0 (Native Method)`
+- `java.lang.Object.wait (Object.java:366)`
+- ✦ `java.lang.Thread.join (Thread.java:2079)`
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread` retains 584 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread` retains 584 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread` retains 584 B (<0.1% of thread retained)
-- `java.lang.Thread.join (Thread.java:2155)`
+- ✦ `java.lang.Thread.join (Thread.java:2155)`
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread` retains 584 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$.$anonfun$time$5 (RealityShowPhilosophers.scala:102)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$.$anonfun$time$5 (RealityShowPhilosophers.scala:102)`
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread` retains 584 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$.$anonfun$time$5$adapted (RealityShowPhilosophers.scala:102)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$.$anonfun$time$5$adapted (RealityShowPhilosophers.scala:102)`
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread` retains 584 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$$$Lambda+0x00007e41c01c5608.apply (Unknown Source)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$$$Lambda+0x00007e41c01c5608.apply (Unknown Source)`
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread` retains 584 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$$$Lambda+0x00007e41c01c5608` retains 64 B (<0.1% of thread retained)
-- `scala.collection.IndexedSeqOptimized.foreach (IndexedSeqOptimized.scala:36)`
+- ✦ `scala.collection.IndexedSeqOptimized.foreach (IndexedSeqOptimized.scala:36)`
   - `org.renaissance.scala.stm.RealityShowPhilosophers$$$Lambda+0x00007e41c01c5608` retains 64 B (<0.1% of thread retained)
   - `scala.collection.mutable.ArrayOps$ofRef` retains 16 B (<0.1% of thread retained)
-- `scala.collection.mutable.ArrayOps$ofRef.foreach (ArrayOps.scala:198)`
+- `scala.collection.IndexedSeqOptimized.foreach$ (IndexedSeqOptimized.scala:33)`
+- ✦ `scala.collection.mutable.ArrayOps$ofRef.foreach (ArrayOps.scala:198)`
   - `org.renaissance.scala.stm.RealityShowPhilosophers$$$Lambda+0x00007e41c01c5608` retains 64 B (<0.1% of thread retained)
   - `scala.collection.mutable.ArrayOps$ofRef` retains 16 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$.time (RealityShowPhilosophers.scala:102)`
-  - `org.renaissance.scala.stm.RealityShowPhilosophers$CameraThread` retains 155.3 KB (1.3% of thread retained)
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$.time (RealityShowPhilosophers.scala:102)`
+  - `org.renaissance.scala.stm.RealityShowPhilosophers$CameraThread` retains 155.3 KiB (1.3% of thread retained)
   - `scala.collection.immutable.Vector` retains 776 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$Fork[]` retains 528 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread[]` retains 528 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$` retains 16 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$.run (RealityShowPhilosophers.scala:109)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$.run (RealityShowPhilosophers.scala:109)`
   - `org.renaissance.scala.stm.RealityShowPhilosophers$` retains 16 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.Philosophers.run (Philosophers.scala:43)`
+- ✦ `org.renaissance.scala.stm.Philosophers.run (Philosophers.scala:43)`
   - `org.renaissance.core.BenchmarkSuite$SuiteBenchmarkContext` retains 296 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.Philosophers` retains 24 B (<0.1% of thread retained)
+- `org.renaissance.harness.ExecutionDriver.executeOperation (ExecutionDriver.java:137)`
+- `org.renaissance.harness.ExecutionDriver.executeBenchmark (ExecutionDriver.java:93)`
+- `org.renaissance.harness.RenaissanceSuite$.runBenchmarks$$anonfun$1 (RenaissanceSuite.scala:172)`
+- `org.renaissance.harness.RenaissanceSuite$$$Lambda+0x00007e41c01205b8.applyVoid (Unknown Source)`
+- `scala.runtime.function.JProcedure1.apply (JProcedure1.java:15)`
+- `scala.runtime.function.JProcedure1.apply (JProcedure1.java:10)`
+- `scala.collection.immutable.List.foreach (List.scala:333)`
+- `org.renaissance.harness.RenaissanceSuite$.runBenchmarks (RenaissanceSuite.scala:205)`
+- `org.renaissance.harness.RenaissanceSuite$.main (RenaissanceSuite.scala:130)`
+- `org.renaissance.harness.RenaissanceSuite.main (RenaissanceSuite.scala)`
+- `java.lang.invoke.LambdaForm$DMH+0x00007e41c0004800.invokeStatic (LambdaForm$DMH)`
+- `java.lang.invoke.LambdaForm$MH+0x00007e41c0009800.invoke (LambdaForm$MH)`
+- `java.lang.invoke.Invokers$Holder.invokeExact_MT (Invokers$Holder)`
+- `jdk.internal.reflect.DirectMethodHandleAccessor.invokeImpl (DirectMethodHandleAccessor.java:154)`
+- `jdk.internal.reflect.DirectMethodHandleAccessor.invoke (DirectMethodHandleAccessor.java:103)`
+- `java.lang.reflect.Method.invoke (Method.java:580)`
+- `org.renaissance.core.Launcher.loadAndInvokeHarnessClass (Launcher.java:129)`
+- `org.renaissance.core.Launcher.launchHarnessClass (Launcher.java:78)`
+- `org.renaissance.core.Launcher.main (Launcher.java:43)`
 
 <a id="thread-2"></a>
 
 ### Thread 2 "Reference Handler" (java/lang/ref/Reference$ReferenceHandler)
 
 _Local roots: 0._
+
+_Complete stack: 3 frames as recorded in the dump._
 
 - `java.lang.ref.Reference.waitForReferencePendingList (Native Method)`
 - `java.lang.ref.Reference.processPendingReferences (Reference.java:246)`
@@ -916,20 +1000,23 @@ _Local roots: 7._
 | `java.lang.ref.NativeReferenceQueue$Lock` |    ×3 |    16 B |     16 B |
 | `java.lang.System$2`                      |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 208 B retained heap._
+_Complete stack: 7 frames as recorded in the dump._
 
-- `java.lang.Object.wait (Object.java:366)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 208 B retained heap._
+
+- `java.lang.Object.wait0 (Native Method)`
+- ✦ `java.lang.Object.wait (Object.java:366)`
   - `java.lang.ref.NativeReferenceQueue$Lock` retains 16 B (<0.1% of thread retained)
-- `java.lang.Object.wait (Object.java:339)`
+- ✦ `java.lang.Object.wait (Object.java:339)`
   - `java.lang.ref.NativeReferenceQueue$Lock` retains 16 B (<0.1% of thread retained)
-- `java.lang.ref.NativeReferenceQueue.await (NativeReferenceQueue.java:48)`
+- ✦ `java.lang.ref.NativeReferenceQueue.await (NativeReferenceQueue.java:48)`
   - `java.lang.ref.NativeReferenceQueue` retains 40 B (<0.1% of thread retained)
-- `java.lang.ref.ReferenceQueue.remove0 (ReferenceQueue.java:158)`
+- ✦ `java.lang.ref.ReferenceQueue.remove0 (ReferenceQueue.java:158)`
   - `java.lang.ref.NativeReferenceQueue` retains 40 B (<0.1% of thread retained)
-- `java.lang.ref.NativeReferenceQueue.remove (NativeReferenceQueue.java:89)`
+- ✦ `java.lang.ref.NativeReferenceQueue.remove (NativeReferenceQueue.java:89)`
   - `java.lang.ref.NativeReferenceQueue` retains 40 B (<0.1% of thread retained)
   - `java.lang.ref.NativeReferenceQueue$Lock` retains 16 B (<0.1% of thread retained)
-- `java.lang.ref.Finalizer$FinalizerThread.run (Finalizer.java:173)`
+- ✦ `java.lang.ref.Finalizer$FinalizerThread.run (Finalizer.java:173)`
   - `java.lang.System$2` retains 16 B (<0.1% of thread retained)
 
 <a id="thread-6"></a>
@@ -949,34 +1036,40 @@ _Local roots: 12._
 | `java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject` |    ×2 |    24 B |     24 B |
 | `jdk.internal.ref.CleanerImpl`                                          |    ×3 |    24 B |     24 B |
 
-_Frame percentages are of this thread's 168 B retained heap._
+_Complete stack: 10 frames as recorded in the dump._
 
-- `java.util.concurrent.locks.LockSupport.parkNanos (LockSupport.java:269)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 168 B retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- ✦ `java.util.concurrent.locks.LockSupport.parkNanos (LockSupport.java:269)`
   - `java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject` retains 24 B (<0.1% of thread retained)
-- `java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject.await (AbstractQueuedSynchronizer.java:1886)`
+- ✦ `java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject.await (AbstractQueuedSynchronizer.java:1886)`
   - `java.util.concurrent.TimeUnit` retains 80 B (<0.1% of thread retained)
   - `java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionNode` retains 32 B (<0.1% of thread retained)
   - `java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject` retains 24 B (<0.1% of thread retained)
-- `java.lang.ref.ReferenceQueue.await (ReferenceQueue.java:71)`
+- ✦ `java.lang.ref.ReferenceQueue.await (ReferenceQueue.java:71)`
   - `java.lang.ref.ReferenceQueue` retains 48 B (<0.1% of thread retained)
-- `java.lang.ref.ReferenceQueue.remove0 (ReferenceQueue.java:143)`
+- ✦ `java.lang.ref.ReferenceQueue.remove0 (ReferenceQueue.java:143)`
   - `java.lang.ref.ReferenceQueue` retains 48 B (<0.1% of thread retained)
-- `java.lang.ref.ReferenceQueue.remove (ReferenceQueue.java:218)`
+- ✦ `java.lang.ref.ReferenceQueue.remove (ReferenceQueue.java:218)`
   - `java.lang.ref.ReferenceQueue` retains 48 B (<0.1% of thread retained)
-- `jdk.internal.ref.CleanerImpl.run (CleanerImpl.java:140)`
+- ✦ `jdk.internal.ref.CleanerImpl.run (CleanerImpl.java:140)`
   - `jdk.internal.ref.CleanerImpl` retains 24 B (<0.1% of thread retained)
-- `java.lang.Thread.runWith (Thread.java:1596)`
+- ✦ `java.lang.Thread.runWith (Thread.java:1596)`
   - `java.lang.Class` retains 128 B (<0.1% of thread retained)
   - `jdk.internal.ref.CleanerImpl` retains 24 B (<0.1% of thread retained)
-- `java.lang.Thread.run (Thread.java:1583)`
+- ✦ `java.lang.Thread.run (Thread.java:1583)`
   - `java.lang.Class` retains 128 B (<0.1% of thread retained)
   - `jdk.internal.ref.CleanerImpl` retains 24 B (<0.1% of thread retained)
+- `jdk.internal.misc.InnocuousThread.run (InnocuousThread.java:186)`
 
 <a id="thread-7"></a>
 
 ### Thread 7 "Thread-259" (org/renaissance/scala/stm/RealityShowPhilosophers$CameraThread)
 
 _Local roots: 0._
+
+_Complete stack: 3 frames as recorded in the dump._
 
 - `java.lang.Thread.sleep0 (Native Method)`
 - `java.lang.Thread.sleep (Thread.java:509)`
@@ -992,8 +1085,8 @@ _Local roots: 12._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B |  29.0 KB |
-| `scala.concurrent.stm.ccstm.TxnSlotManager`                                                      |     1 |    24 B |   8.3 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B | 29.0 KiB |
+| `scala.concurrent.stm.ccstm.TxnSlotManager`                                                      |     1 |    24 B |  8.3 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |    ×2 |    24 B |     24 B |
@@ -1001,26 +1094,34 @@ _Local roots: 12._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 12 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.TxnSlotManager.release (TxnSlotManager.scala:88)`
-  - `scala.concurrent.stm.ccstm.TxnSlotManager` retains 8.3 KB (0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.detach (InTxnImpl.scala:677)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.finishTopLevelCommit (InTxnImpl.scala:636)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.TxnSlotManager.release (TxnSlotManager.scala:88)`
+  - `scala.concurrent.stm.ccstm.TxnSlotManager` retains 8.3 KiB (0.1% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.detach (InTxnImpl.scala:677)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.finishTopLevelCommit (InTxnImpl.scala:636)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:619)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-9"></a>
 
@@ -1032,28 +1133,37 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.RetrySet`                                                            |    ×2 |    24 B |    216 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.8 KB retained heap._
+_Complete stack: 12 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:53)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.8 KiB retained heap._
+
+- `java.lang.Thread.yield0 (Native Method)`
+- `java.lang.Thread.yield (Thread.java:445)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:53)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-10"></a>
 
@@ -1065,28 +1175,37 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.RetrySet`                                                            |    ×2 |    24 B |    216 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.8 KB retained heap._
+_Complete stack: 12 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:53)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.8 KiB retained heap._
+
+- `java.lang.Thread.yield0 (Native Method)`
+- `java.lang.Thread.yield (Thread.java:445)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:53)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-11"></a>
 
@@ -1098,29 +1217,41 @@ _Local roots: 9._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 560 B retained heap._
+_Complete stack: 15 frames as recorded in the dump._
 
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$3 (RealityShowPhilosophers.scala:37)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 560 B retained heap._
+
+- `scala.concurrent.stm.RefLike.$plus$eq (RefLike.scala:76)`
+- `scala.concurrent.stm.RefLike.$plus$eq$ (RefLike.scala:76)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.$plus$eq (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$3 (RealityShowPhilosophers.scala:37)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$3$adapted (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-12"></a>
 
@@ -1132,30 +1263,37 @@ _Local roots: 9._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.RetrySet`                                                            |    ×3 |    24 B |    216 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.8 KB retained heap._
+_Complete stack: 11 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.RetrySet.changed (RetrySet.scala:98)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.8 KiB retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.changed (RetrySet.scala:98)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:49)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:49)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-13"></a>
 
@@ -1167,28 +1305,37 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.RetrySet`                                                            |    ×2 |    24 B |    216 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.8 KB retained heap._
+_Complete stack: 12 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:53)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.8 KiB retained heap._
+
+- `java.lang.Thread.yield0 (Native Method)`
+- `java.lang.Thread.yield (Thread.java:445)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:53)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-14"></a>
 
@@ -1200,34 +1347,41 @@ _Local roots: 13._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B |  29.0 KB |
-| `scala.concurrent.stm.ccstm.TxnSlotManager`                                                      |     1 |    24 B |   8.3 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B | 29.0 KiB |
+| `scala.concurrent.stm.ccstm.TxnSlotManager`                                                      |     1 |    24 B |  8.3 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |    ×3 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |    ×2 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.7 KB retained heap._
+_Complete stack: 10 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.TxnSlotManager.assign (TxnSlotManager.scala:41)`
-  - `scala.concurrent.stm.ccstm.TxnSlotManager` retains 8.3 KB (0.1% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.7 KiB retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.TxnSlotManager.assign (TxnSlotManager.scala:41)`
+  - `scala.concurrent.stm.ccstm.TxnSlotManager` retains 8.3 KiB (0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelBegin (InTxnImpl.scala:562)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelBegin (InTxnImpl.scala:562)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:524)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:524)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-15"></a>
 
@@ -1239,7 +1393,7 @@ _Local roots: 12._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |    ×2 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -1247,26 +1401,33 @@ _Local roots: 12._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 11 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.revalidateImpl (InTxnImpl.scala:826)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.revalidateImpl (InTxnImpl.scala:826)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-16"></a>
 
@@ -1278,26 +1439,34 @@ _Local roots: 7._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.RetrySet`                                                            |     1 |    24 B |    216 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.8 KB retained heap._
+_Complete stack: 10 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.8 KiB retained heap._
+
+- `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:59)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-17"></a>
 
@@ -1309,8 +1478,8 @@ _Local roots: 13._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×3 |   144 B |  29.0 KB |
-| `scala.concurrent.stm.ccstm.WakeupManager`                                                       |    ×2 |    32 B |   8.7 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×3 |   144 B | 29.0 KiB |
+| `scala.concurrent.stm.ccstm.WakeupManager`                                                       |    ×2 |    32 B |  8.7 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |    ×2 |   112 B |    112 B |
 | `scala.concurrent.stm.ccstm.WakeupManager$EventImpl`                                             |     1 |    40 B |     40 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
@@ -1319,28 +1488,41 @@ _Local roots: 13._
 | `scala.runtime.BoxedUnit`                                                                        |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 560 B retained heap._
+_Complete stack: 18 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.WakeupManager.trigger (WakeupManager.scala:113)`
-  - `scala.concurrent.stm.ccstm.WakeupManager` retains 8.7 KB (0.1% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 560 B retained heap._
+
+- `jdk.internal.misc.Unsafe.unpark (Native Method)`
+- `java.util.concurrent.locks.LockSupport.unpark (LockSupport.java:181)`
+- `java.util.concurrent.locks.AbstractQueuedSynchronizer.signalNext (AbstractQueuedSynchronizer.java:645)`
+- `java.util.concurrent.locks.AbstractQueuedSynchronizer.releaseShared (AbstractQueuedSynchronizer.java:1181)`
+- `scala.concurrent.stm.ccstm.WakeupManager$EventImpl.scala$concurrent$stm$ccstm$WakeupManager$$trigger (WakeupManager.scala:189)`
+- ✦ `scala.concurrent.stm.ccstm.WakeupManager.trigger (WakeupManager.scala:113)`
+  - `scala.concurrent.stm.ccstm.WakeupManager` retains 8.7 KiB (0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.WakeupManager$EventImpl` retains 40 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.WakeupManager.trigger (WakeupManager.scala:103)`
-  - `scala.concurrent.stm.ccstm.WakeupManager` retains 8.7 KB (0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:722)`
+- ✦ `scala.concurrent.stm.ccstm.WakeupManager.trigger (WakeupManager.scala:103)`
+  - `scala.concurrent.stm.ccstm.WakeupManager` retains 8.7 KiB (0.1% of thread retained)
+- `scala.concurrent.stm.ccstm.InTxnImpl.commitWrites (InTxnImpl.scala:816)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:722)`
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-18"></a>
 
@@ -1352,7 +1534,7 @@ _Local roots: 12._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `jdk.internal.reflect.DirectMethodHandleAccessor`                                                |     1 |    32 B |    400 B |
 | `scala.concurrent.stm.ccstm.RetrySet`                                                            |    ×2 |    24 B |    216 B |
 | `scala.concurrent.stm.ccstm.WakeupManager$EventImpl`                                             |     1 |    40 B |     40 B |
@@ -1363,27 +1545,51 @@ _Local roots: 12._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.8 KB retained heap._
+_Complete stack: 29 frames as recorded in the dump._
 
-- `java.util.concurrent.locks.AbstractQueuedSynchronizer.acquire (AbstractQueuedSynchronizer.java:788)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.8 KiB retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:221)`
+- ✦ `java.util.concurrent.locks.AbstractQueuedSynchronizer.acquire (AbstractQueuedSynchronizer.java:788)`
   - `scala.concurrent.stm.ccstm.WakeupManager$EventImpl` retains 40 B (<0.1% of thread retained)
   - `java.util.concurrent.locks.AbstractQueuedSynchronizer$ExclusiveNode` retains 32 B (<0.1% of thread retained)
   - `java.util.concurrent.locks.AbstractQueuedSynchronizer$SharedNode` retains 32 B (<0.1% of thread retained)
-- `jdk.internal.reflect.DirectMethodHandleAccessor.invoke (DirectMethodHandleAccessor.java:103)`
+- `java.util.concurrent.locks.AbstractQueuedSynchronizer.acquireSharedInterruptibly (AbstractQueuedSynchronizer.java:1133)`
+- `scala.concurrent.stm.ccstm.WakeupManager$EventImpl.$anonfun$tryAwaitUntil$1 (WakeupManager.scala:181)`
+- `scala.concurrent.stm.ccstm.WakeupManager$EventImpl$$Lambda+0x00007e41c02202f0.apply$mcV$sp (Unknown Source)`
+- `scala.runtime.java8.JFunction0$mcV$sp.apply (JFunction0$mcV$sp.java:23)`
+- `scala.concurrent.BlockContext$DefaultBlockContext$.blockOn (BlockContext.scala:57)`
+- `scala.concurrent.package$.blocking (package.scala:146)`
+- `scala.concurrent.package.blocking (package.scala)`
+- `java.lang.invoke.DirectMethodHandle$Holder.invokeStatic (DirectMethodHandle$Holder)`
+- `java.lang.invoke.LambdaForm$MH+0x00007e41c023b800.invoke (LambdaForm$MH)`
+- `java.lang.invoke.Invokers$Holder.invokeExact_MT (Invokers$Holder)`
+- `jdk.internal.reflect.DirectMethodHandleAccessor.invokeImpl (DirectMethodHandleAccessor.java:154)`
+- ✦ `jdk.internal.reflect.DirectMethodHandleAccessor.invoke (DirectMethodHandleAccessor.java:103)`
   - `jdk.internal.reflect.DirectMethodHandleAccessor` retains 400 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.RetrySet.blockingAttemptAwait (RetrySet.scala:69)`
+- `java.lang.reflect.Method.invoke (Method.java:580)`
+- `scala.concurrent.stm.ccstm.WakeupManager$.blocking (WakeupManager.scala:44)`
+- `scala.concurrent.stm.ccstm.WakeupManager$EventImpl.tryAwaitUntil (WakeupManager.scala:181)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.blockingAttemptAwait (RetrySet.scala:69)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
+- `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:59)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-19"></a>
 
@@ -1395,7 +1601,7 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -1403,19 +1609,27 @@ _Local roots: 8._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 9 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:619)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-20"></a>
 
@@ -1427,8 +1641,8 @@ _Local roots: 15._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×6 |   144 B |  29.0 KB |
-| `scala.concurrent.stm.ccstm.TxnSlotManager`                                                      |     1 |    24 B |   8.3 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×6 |   144 B | 29.0 KiB |
+| `scala.concurrent.stm.ccstm.TxnSlotManager`                                                      |     1 |    24 B |  8.3 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef`                                                |    ×2 |    24 B |     40 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
@@ -1437,31 +1651,48 @@ _Local roots: 15._
 | `scala.Some`                                                                                     |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 600 B retained heap._
+_Complete stack: 23 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.TxnSlotManager.release (TxnSlotManager.scala:88)`
-  - `scala.concurrent.stm.ccstm.TxnSlotManager` retains 8.3 KB (0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnRefOps.acquireOwnership (InTxnRefOps.scala:45)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 600 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.TxnSlotManager.release (TxnSlotManager.scala:88)`
+  - `scala.concurrent.stm.ccstm.TxnSlotManager` retains 8.3 KiB (0.1% of thread retained)
+- `scala.concurrent.stm.ccstm.TxnSlotManager.endLookup (TxnSlotManager.scala:83)`
+- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitTxnUnowned (CCSTM.scala:256)`
+- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitUnowned (CCSTM.scala:176)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.weakAwaitUnowned (InTxnImpl.scala:912)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.acquireOwnership (InTxnRefOps.scala:45)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 40 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnRefOps.set (InTxnRefOps.scala:254)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.set (InTxnRefOps.scala:254)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 40 B (<0.1% of thread retained)
   - `scala.Some` retains 16 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:32)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.update (RefOps.scala:24)`
+- `scala.concurrent.stm.ccstm.RefOps.update$ (RefOps.scala:24)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.update (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.update (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:32)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-21"></a>
 
@@ -1473,28 +1704,37 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.RetrySet`                                                            |    ×2 |    24 B |    216 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.8 KB retained heap._
+_Complete stack: 12 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:53)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.8 KiB retained heap._
+
+- `java.lang.Thread.yield0 (Native Method)`
+- `java.lang.Thread.yield (Thread.java:445)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:53)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-22"></a>
 
@@ -1506,29 +1746,41 @@ _Local roots: 9._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 560 B retained heap._
+_Complete stack: 15 frames as recorded in the dump._
 
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$3 (RealityShowPhilosophers.scala:37)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 560 B retained heap._
+
+- `scala.concurrent.stm.RefLike.$plus$eq (RefLike.scala:76)`
+- `scala.concurrent.stm.RefLike.$plus$eq$ (RefLike.scala:76)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.$plus$eq (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$3 (RealityShowPhilosophers.scala:37)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$3$adapted (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-23"></a>
 
@@ -1540,7 +1792,7 @@ _Local roots: 9._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.RetrySet`                                                            |    ×2 |    24 B |    216 B |
 | `scala.concurrent.stm.ccstm.WakeupManager$EventImpl`                                             |     1 |    40 B |     40 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
@@ -1548,22 +1800,30 @@ _Local roots: 9._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.8 KB retained heap._
+_Complete stack: 11 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.RetrySet.blockingAttemptAwait (RetrySet.scala:81)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.8 KiB retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.blockingAttemptAwait (RetrySet.scala:81)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.WakeupManager$EventImpl` retains 40 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
+- `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:59)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-24"></a>
 
@@ -1575,7 +1835,7 @@ _Local roots: 12._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |    ×2 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -1583,26 +1843,33 @@ _Local roots: 12._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 11 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.revalidateImpl (InTxnImpl.scala:826)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.revalidateImpl (InTxnImpl.scala:826)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-25"></a>
 
@@ -1614,7 +1881,7 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -1622,19 +1889,27 @@ _Local roots: 8._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.7 KB retained heap._
+_Complete stack: 9 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.7 KiB retained heap._
+
+- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:619)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-26"></a>
 
@@ -1646,28 +1921,37 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.RetrySet`                                                            |    ×2 |    24 B |    216 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.8 KB retained heap._
+_Complete stack: 12 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:53)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.8 KiB retained heap._
+
+- `java.lang.Thread.yield0 (Native Method)`
+- `java.lang.Thread.yield (Thread.java:445)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:53)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-27"></a>
 
@@ -1679,7 +1963,7 @@ _Local roots: 15._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |    ×3 |   112 B |    112 B |
 | `scala.concurrent.stm.ccstm.CCSTM$`                                                              |     1 |    72 B |     96 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
@@ -1688,30 +1972,45 @@ _Local roots: 15._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 20 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitTxnUnowned (CCSTM.scala:229)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitTxnUnowned (CCSTM.scala:229)`
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM$` retains 96 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 24 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitUnowned (CCSTM.scala:176)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.weakAwaitUnowned (InTxnImpl.scala:912)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 24 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-28"></a>
 
@@ -1723,7 +2022,7 @@ _Local roots: 12._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |    ×2 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -1731,26 +2030,33 @@ _Local roots: 12._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 11 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.revalidateImpl (InTxnImpl.scala:826)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.revalidateImpl (InTxnImpl.scala:826)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-29"></a>
 
@@ -1762,28 +2068,37 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.RetrySet`                                                            |    ×2 |    24 B |    216 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.8 KB retained heap._
+_Complete stack: 12 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:53)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.8 KiB retained heap._
+
+- `java.lang.Thread.yield0 (Native Method)`
+- `java.lang.Thread.yield (Thread.java:445)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:53)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-30"></a>
 
@@ -1795,7 +2110,7 @@ _Local roots: 12._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |    ×2 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -1803,26 +2118,33 @@ _Local roots: 12._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 11 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.revalidateImpl (InTxnImpl.scala:826)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.revalidateImpl (InTxnImpl.scala:826)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-31"></a>
 
@@ -1834,7 +2156,7 @@ _Local roots: 15._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |    ×3 |   112 B |    112 B |
 | `scala.concurrent.stm.ccstm.CCSTM$`                                                              |     1 |    72 B |     96 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
@@ -1843,30 +2165,45 @@ _Local roots: 15._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 20 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitTxnUnowned (CCSTM.scala:229)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitTxnUnowned (CCSTM.scala:229)`
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM$` retains 96 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 24 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitUnowned (CCSTM.scala:176)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.weakAwaitUnowned (InTxnImpl.scala:912)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 24 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-32"></a>
 
@@ -1878,7 +2215,7 @@ _Local roots: 11._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -1886,25 +2223,38 @@ _Local roots: 11._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 17 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:80)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:80)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 24 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-33"></a>
 
@@ -1916,28 +2266,37 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.RetrySet`                                                            |    ×2 |    24 B |    216 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.8 KB retained heap._
+_Complete stack: 12 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:53)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.8 KiB retained heap._
+
+- `java.lang.Thread.yield0 (Native Method)`
+- `java.lang.Thread.yield (Thread.java:445)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:53)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-34"></a>
 
@@ -1949,7 +2308,7 @@ _Local roots: 12._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |    ×2 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -1957,26 +2316,33 @@ _Local roots: 12._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 11 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.revalidateImpl (InTxnImpl.scala:826)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.revalidateImpl (InTxnImpl.scala:826)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-35"></a>
 
@@ -1988,27 +2354,37 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×3 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×3 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    144 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 12 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:31)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 144 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-36"></a>
 
@@ -2020,7 +2396,7 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -2028,19 +2404,27 @@ _Local roots: 8._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.7 KB retained heap._
+_Complete stack: 9 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.7 KiB retained heap._
+
+- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:619)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-37"></a>
 
@@ -2052,29 +2436,42 @@ _Local roots: 9._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    168 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 16 frames as recorded in the dump._
 
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 168 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-38"></a>
 
@@ -2086,27 +2483,34 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×3 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×3 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    144 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 9 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 144 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-39"></a>
 
@@ -2118,29 +2522,41 @@ _Local roots: 9._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 560 B retained heap._
+_Complete stack: 15 frames as recorded in the dump._
 
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$3 (RealityShowPhilosophers.scala:37)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 560 B retained heap._
+
+- `scala.concurrent.stm.RefLike.$plus$eq (RefLike.scala:76)`
+- `scala.concurrent.stm.RefLike.$plus$eq$ (RefLike.scala:76)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.$plus$eq (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$3 (RealityShowPhilosophers.scala:37)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$3$adapted (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-40"></a>
 
@@ -2152,28 +2568,37 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.RetrySet`                                                            |    ×2 |    24 B |    216 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.8 KB retained heap._
+_Complete stack: 12 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:53)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.8 KiB retained heap._
+
+- `java.lang.Thread.yield0 (Native Method)`
+- `java.lang.Thread.yield (Thread.java:445)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:53)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-41"></a>
 
@@ -2185,7 +2610,7 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -2193,19 +2618,27 @@ _Local roots: 8._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.7 KB retained heap._
+_Complete stack: 9 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.7 KiB retained heap._
+
+- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:619)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-42"></a>
 
@@ -2217,7 +2650,7 @@ _Local roots: 11._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -2225,25 +2658,38 @@ _Local roots: 11._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 17 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:80)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:80)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 24 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-43"></a>
 
@@ -2255,7 +2701,7 @@ _Local roots: 11._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |    ×2 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -2263,25 +2709,32 @@ _Local roots: 11._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 560 B retained heap._
+_Complete stack: 11 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.commitWrites (InTxnImpl.scala:766)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:722)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 560 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.commitWrites (InTxnImpl.scala:766)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:722)`
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-44"></a>
 
@@ -2293,7 +2746,7 @@ _Local roots: 11._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -2301,25 +2754,38 @@ _Local roots: 11._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 17 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:80)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:80)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 24 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-45"></a>
 
@@ -2331,7 +2797,7 @@ _Local roots: 11._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |    ×2 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -2339,25 +2805,32 @@ _Local roots: 11._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 560 B retained heap._
+_Complete stack: 11 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.commitWrites (InTxnImpl.scala:766)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:722)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 560 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.commitWrites (InTxnImpl.scala:766)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:722)`
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-46"></a>
 
@@ -2369,7 +2842,7 @@ _Local roots: 11._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -2377,25 +2850,38 @@ _Local roots: 11._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 17 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:80)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:80)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 24 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-47"></a>
 
@@ -2407,7 +2893,7 @@ _Local roots: 11._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |    ×2 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -2415,24 +2901,31 @@ _Local roots: 11._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 560 B retained heap._
+_Complete stack: 10 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 560 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-48"></a>
 
@@ -2444,27 +2937,37 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×3 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×3 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    144 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 12 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:31)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 144 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-49"></a>
 
@@ -2476,7 +2979,7 @@ _Local roots: 12._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `jdk.internal.reflect.DirectMethodHandleAccessor`                                                |     1 |    32 B |    400 B |
 | `scala.concurrent.stm.ccstm.RetrySet`                                                            |    ×2 |    24 B |    216 B |
 | `scala.concurrent.stm.ccstm.WakeupManager$EventImpl`                                             |     1 |    40 B |     40 B |
@@ -2487,27 +2990,51 @@ _Local roots: 12._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.9 KB retained heap._
+_Complete stack: 29 frames as recorded in the dump._
 
-- `java.util.concurrent.locks.AbstractQueuedSynchronizer.acquire (AbstractQueuedSynchronizer.java:788)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.9 KiB retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:221)`
+- ✦ `java.util.concurrent.locks.AbstractQueuedSynchronizer.acquire (AbstractQueuedSynchronizer.java:788)`
   - `scala.concurrent.stm.ccstm.WakeupManager$EventImpl` retains 40 B (<0.1% of thread retained)
   - `java.util.concurrent.locks.AbstractQueuedSynchronizer$ExclusiveNode` retains 32 B (<0.1% of thread retained)
   - `java.util.concurrent.locks.AbstractQueuedSynchronizer$SharedNode` retains 32 B (<0.1% of thread retained)
-- `jdk.internal.reflect.DirectMethodHandleAccessor.invoke (DirectMethodHandleAccessor.java:103)`
+- `java.util.concurrent.locks.AbstractQueuedSynchronizer.acquireSharedInterruptibly (AbstractQueuedSynchronizer.java:1133)`
+- `scala.concurrent.stm.ccstm.WakeupManager$EventImpl.$anonfun$tryAwaitUntil$1 (WakeupManager.scala:181)`
+- `scala.concurrent.stm.ccstm.WakeupManager$EventImpl$$Lambda+0x00007e41c02202f0.apply$mcV$sp (Unknown Source)`
+- `scala.runtime.java8.JFunction0$mcV$sp.apply (JFunction0$mcV$sp.java:23)`
+- `scala.concurrent.BlockContext$DefaultBlockContext$.blockOn (BlockContext.scala:57)`
+- `scala.concurrent.package$.blocking (package.scala:146)`
+- `scala.concurrent.package.blocking (package.scala)`
+- `java.lang.invoke.DirectMethodHandle$Holder.invokeStatic (DirectMethodHandle$Holder)`
+- `java.lang.invoke.LambdaForm$MH+0x00007e41c023b800.invoke (LambdaForm$MH)`
+- `java.lang.invoke.Invokers$Holder.invokeExact_MT (Invokers$Holder)`
+- `jdk.internal.reflect.DirectMethodHandleAccessor.invokeImpl (DirectMethodHandleAccessor.java:154)`
+- ✦ `jdk.internal.reflect.DirectMethodHandleAccessor.invoke (DirectMethodHandleAccessor.java:103)`
   - `jdk.internal.reflect.DirectMethodHandleAccessor` retains 400 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.RetrySet.blockingAttemptAwait (RetrySet.scala:69)`
+- `java.lang.reflect.Method.invoke (Method.java:580)`
+- `scala.concurrent.stm.ccstm.WakeupManager$.blocking (WakeupManager.scala:44)`
+- `scala.concurrent.stm.ccstm.WakeupManager$EventImpl.tryAwaitUntil (WakeupManager.scala:181)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.blockingAttemptAwait (RetrySet.scala:69)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
+- `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:59)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-50"></a>
 
@@ -2519,7 +3046,7 @@ _Local roots: 11._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -2527,25 +3054,38 @@ _Local roots: 11._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 17 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:80)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:80)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 24 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-51"></a>
 
@@ -2557,26 +3097,34 @@ _Local roots: 7._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.RetrySet`                                                            |     1 |    24 B |    216 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.8 KB retained heap._
+_Complete stack: 10 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.8 KiB retained heap._
+
+- `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:59)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-52"></a>
 
@@ -2588,28 +3136,37 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.RetrySet`                                                            |    ×2 |    24 B |    216 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.8 KB retained heap._
+_Complete stack: 12 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:53)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.8 KiB retained heap._
+
+- `java.lang.Thread.yield0 (Native Method)`
+- `java.lang.Thread.yield (Thread.java:445)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:53)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-53"></a>
 
@@ -2621,7 +3178,7 @@ _Local roots: 11._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -2629,25 +3186,38 @@ _Local roots: 11._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 17 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:80)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:80)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 24 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-54"></a>
 
@@ -2659,7 +3229,7 @@ _Local roots: 11._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -2667,25 +3237,41 @@ _Local roots: 11._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 20 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitTxnUnowned (CCSTM.scala:256)`
+- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitUnowned (CCSTM.scala:176)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.weakAwaitUnowned (InTxnImpl.scala:912)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 24 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-55"></a>
 
@@ -2697,7 +3283,7 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -2705,19 +3291,27 @@ _Local roots: 8._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.7 KB retained heap._
+_Complete stack: 9 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.7 KiB retained heap._
+
+- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:619)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-56"></a>
 
@@ -2729,7 +3323,7 @@ _Local roots: 11._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef`                                                |     1 |    24 B |     40 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
@@ -2737,25 +3331,38 @@ _Local roots: 11._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 17 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 40 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-57"></a>
 
@@ -2767,8 +3374,8 @@ _Local roots: 12._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B |  29.0 KB |
-| `scala.concurrent.stm.ccstm.TxnSlotManager`                                                      |     1 |    24 B |   8.3 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B | 29.0 KiB |
+| `scala.concurrent.stm.ccstm.TxnSlotManager`                                                      |     1 |    24 B |  8.3 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |    ×2 |    24 B |     24 B |
@@ -2776,26 +3383,34 @@ _Local roots: 12._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 12 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.TxnSlotManager.release (TxnSlotManager.scala:88)`
-  - `scala.concurrent.stm.ccstm.TxnSlotManager` retains 8.3 KB (0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.detach (InTxnImpl.scala:677)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.finishTopLevelCommit (InTxnImpl.scala:636)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.TxnSlotManager.release (TxnSlotManager.scala:88)`
+  - `scala.concurrent.stm.ccstm.TxnSlotManager` retains 8.3 KiB (0.1% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.detach (InTxnImpl.scala:677)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.finishTopLevelCommit (InTxnImpl.scala:636)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:619)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-58"></a>
 
@@ -2807,7 +3422,7 @@ _Local roots: 11._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef`                                                |     1 |    24 B |     40 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
@@ -2815,25 +3430,38 @@ _Local roots: 11._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 17 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:80)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:80)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 40 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-59"></a>
 
@@ -2845,29 +3473,41 @@ _Local roots: 9._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 560 B retained heap._
+_Complete stack: 15 frames as recorded in the dump._
 
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$3 (RealityShowPhilosophers.scala:37)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 560 B retained heap._
+
+- `scala.concurrent.stm.RefLike.$plus$eq (RefLike.scala:76)`
+- `scala.concurrent.stm.RefLike.$plus$eq$ (RefLike.scala:76)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.$plus$eq (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$3 (RealityShowPhilosophers.scala:37)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$3$adapted (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-60"></a>
 
@@ -2879,27 +3519,37 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×3 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×3 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    144 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 12 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:31)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 144 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-61"></a>
 
@@ -2911,7 +3561,7 @@ _Local roots: 12._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |    ×2 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -2919,26 +3569,33 @@ _Local roots: 12._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 11 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.revalidateImpl (InTxnImpl.scala:826)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.revalidateImpl (InTxnImpl.scala:826)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-62"></a>
 
@@ -2950,8 +3607,8 @@ _Local roots: 12._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
-| `scala.concurrent.stm.ccstm.TxnSlotManager`                                                      |     1 |    24 B |   8.3 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
+| `scala.concurrent.stm.ccstm.TxnSlotManager`                                                      |     1 |    24 B |  8.3 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef`                                                |     1 |    24 B |     40 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
@@ -2959,27 +3616,44 @@ _Local roots: 12._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 22 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.TxnSlotManager.release (TxnSlotManager.scala:88)`
-  - `scala.concurrent.stm.ccstm.TxnSlotManager` retains 8.3 KB (0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.TxnSlotManager.release (TxnSlotManager.scala:88)`
+  - `scala.concurrent.stm.ccstm.TxnSlotManager` retains 8.3 KiB (0.1% of thread retained)
+- `scala.concurrent.stm.ccstm.TxnSlotManager.endLookup (TxnSlotManager.scala:83)`
+- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitTxnUnowned (CCSTM.scala:256)`
+- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitUnowned (CCSTM.scala:176)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.weakAwaitUnowned (InTxnImpl.scala:912)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 40 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-63"></a>
 
@@ -2991,7 +3665,7 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -2999,19 +3673,27 @@ _Local roots: 8._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 9 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:619)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-64"></a>
 
@@ -3023,8 +3705,8 @@ _Local roots: 12._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
-| `scala.concurrent.stm.ccstm.TxnSlotManager`                                                      |     1 |    24 B |   8.3 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
+| `scala.concurrent.stm.ccstm.TxnSlotManager`                                                      |     1 |    24 B |  8.3 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef`                                                |     1 |    24 B |     40 B |
@@ -3032,27 +3714,44 @@ _Local roots: 12._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 22 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.TxnSlotManager.release (TxnSlotManager.scala:88)`
-  - `scala.concurrent.stm.ccstm.TxnSlotManager` retains 8.3 KB (0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.TxnSlotManager.release (TxnSlotManager.scala:88)`
+  - `scala.concurrent.stm.ccstm.TxnSlotManager` retains 8.3 KiB (0.1% of thread retained)
+- `scala.concurrent.stm.ccstm.TxnSlotManager.endLookup (TxnSlotManager.scala:83)`
+- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitTxnUnowned (CCSTM.scala:256)`
+- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitUnowned (CCSTM.scala:176)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.weakAwaitUnowned (InTxnImpl.scala:912)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 40 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-65"></a>
 
@@ -3064,7 +3763,7 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -3072,19 +3771,27 @@ _Local roots: 8._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 9 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:619)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-66"></a>
 
@@ -3096,28 +3803,37 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.RetrySet`                                                            |    ×2 |    24 B |    216 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.8 KB retained heap._
+_Complete stack: 12 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:53)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.8 KiB retained heap._
+
+- `java.lang.Thread.yield0 (Native Method)`
+- `java.lang.Thread.yield (Thread.java:445)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:53)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-67"></a>
 
@@ -3129,7 +3845,7 @@ _Local roots: 11._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |    ×2 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -3137,24 +3853,31 @@ _Local roots: 11._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 560 B retained heap._
+_Complete stack: 10 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 560 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-68"></a>
 
@@ -3166,8 +3889,8 @@ _Local roots: 16._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×7 |   144 B |  29.0 KB |
-| `scala.concurrent.stm.ccstm.TxnSlotManager`                                                      |     1 |    24 B |   8.3 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×7 |   144 B | 29.0 KiB |
+| `scala.concurrent.stm.ccstm.TxnSlotManager`                                                      |     1 |    24 B |  8.3 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef`                                                |    ×3 |    24 B |     40 B |
@@ -3175,33 +3898,48 @@ _Local roots: 16._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 22 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.TxnSlotManager.lookup (TxnSlotManager.scala:55)`
-  - `scala.concurrent.stm.ccstm.TxnSlotManager` retains 8.3 KB (0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.checkRead (InTxnImpl.scala:867)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.TxnSlotManager.lookup (TxnSlotManager.scala:55)`
+  - `scala.concurrent.stm.ccstm.TxnSlotManager` retains 8.3 KiB (0.1% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.checkRead (InTxnImpl.scala:867)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 40 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.revalidateImpl (InTxnImpl.scala:828)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.revalidateImpl (InTxnImpl.scala:828)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 40 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:80)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.InTxnImpl.revalidate (InTxnImpl.scala:902)`
+- `scala.concurrent.stm.ccstm.InTxnRefOps.revalidateIfRequired (InTxnRefOps.scala:34)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:80)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 40 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-69"></a>
 
@@ -3213,29 +3951,41 @@ _Local roots: 9._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 560 B retained heap._
+_Complete stack: 15 frames as recorded in the dump._
 
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$3 (RealityShowPhilosophers.scala:37)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 560 B retained heap._
+
+- `scala.concurrent.stm.RefLike.$plus$eq (RefLike.scala:76)`
+- `scala.concurrent.stm.RefLike.$plus$eq$ (RefLike.scala:76)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.$plus$eq (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$3 (RealityShowPhilosophers.scala:37)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$3$adapted (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-70"></a>
 
@@ -3247,29 +3997,42 @@ _Local roots: 9._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    168 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 16 frames as recorded in the dump._
 
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 168 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-71"></a>
 
@@ -3281,7 +4044,7 @@ _Local roots: 11._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -3289,25 +4052,38 @@ _Local roots: 11._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 17 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:80)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:80)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 24 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-72"></a>
 
@@ -3319,7 +4095,7 @@ _Local roots: 12._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |    ×2 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -3327,26 +4103,33 @@ _Local roots: 12._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 11 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.revalidateImpl (InTxnImpl.scala:826)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.revalidateImpl (InTxnImpl.scala:826)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-73"></a>
 
@@ -3358,7 +4141,7 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -3366,19 +4149,27 @@ _Local roots: 8._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 9 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:619)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-74"></a>
 
@@ -3392,7 +4183,7 @@ _Showing top 20 of 21 by retained heap; retained sizes overlap, so totals may ex
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `jdk.internal.reflect.DirectMethodHandleAccessor`                                                |     1 |    32 B |    400 B |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |    ×7 |   112 B |    112 B |
 | `scala.concurrent.stm.ccstm.CCSTM$`                                                              |     1 |    72 B |     96 B |
@@ -3401,38 +4192,67 @@ _Showing top 20 of 21 by retained heap; retained sizes overlap, so totals may ex
 | `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef`                                                |    ×3 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 37 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.TxnLevelImpl.$anonfun$awaitCompleted$1 (TxnLevelImpl.scala:195)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- `java.lang.Object.wait0 (Native Method)`
+- `java.lang.Object.wait (Object.java:366)`
+- `java.lang.Object.wait (Object.java:339)`
+- ✦ `scala.concurrent.stm.ccstm.TxnLevelImpl.$anonfun$awaitCompleted$1 (TxnLevelImpl.scala:195)`
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 24 B (<0.1% of thread retained)
-- `jdk.internal.reflect.DirectMethodHandleAccessor.invoke (DirectMethodHandleAccessor.java:103)`
+- `scala.concurrent.stm.ccstm.TxnLevelImpl$$Lambda+0x00007e41c021c4a0.apply$mcV$sp (Unknown Source)`
+- `scala.runtime.java8.JFunction0$mcV$sp.apply (JFunction0$mcV$sp.java:23)`
+- `scala.concurrent.BlockContext$DefaultBlockContext$.blockOn (BlockContext.scala:57)`
+- `scala.concurrent.package$.blocking (package.scala:146)`
+- `scala.concurrent.package.blocking (package.scala)`
+- `java.lang.invoke.DirectMethodHandle$Holder.invokeStatic (DirectMethodHandle$Holder)`
+- `java.lang.invoke.LambdaForm$MH+0x00007e41c023b800.invoke (LambdaForm$MH)`
+- `java.lang.invoke.Invokers$Holder.invokeExact_MT (Invokers$Holder)`
+- `jdk.internal.reflect.DirectMethodHandleAccessor.invokeImpl (DirectMethodHandleAccessor.java:154)`
+- ✦ `jdk.internal.reflect.DirectMethodHandleAccessor.invoke (DirectMethodHandleAccessor.java:103)`
   - `jdk.internal.reflect.DirectMethodHandleAccessor` retains 400 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.TxnLevelImpl.awaitCompleted (TxnLevelImpl.scala:192)`
+- `java.lang.reflect.Method.invoke (Method.java:580)`
+- `scala.concurrent.stm.ccstm.WakeupManager$.blocking (WakeupManager.scala:44)`
+- ✦ `scala.concurrent.stm.ccstm.TxnLevelImpl.awaitCompleted (TxnLevelImpl.scala:192)`
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitTxnUnowned (CCSTM.scala:240)`
+- ✦ `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitTxnUnowned (CCSTM.scala:240)`
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM$` retains 96 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 24 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitUnowned (CCSTM.scala:176)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.weakAwaitUnowned (InTxnImpl.scala:912)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 24 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-75"></a>
 
@@ -3444,7 +4264,7 @@ _Local roots: 11._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef`                                                |     1 |    24 B |     40 B |
@@ -3452,25 +4272,38 @@ _Local roots: 11._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 17 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 40 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-76"></a>
 
@@ -3482,8 +4315,8 @@ _Local roots: 12._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B |  29.0 KB |
-| `scala.concurrent.stm.ccstm.TxnSlotManager`                                                      |     1 |    24 B |   8.3 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B | 29.0 KiB |
+| `scala.concurrent.stm.ccstm.TxnSlotManager`                                                      |     1 |    24 B |  8.3 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |    ×2 |    24 B |     24 B |
@@ -3491,26 +4324,34 @@ _Local roots: 12._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 12 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.TxnSlotManager.release (TxnSlotManager.scala:88)`
-  - `scala.concurrent.stm.ccstm.TxnSlotManager` retains 8.3 KB (0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.detach (InTxnImpl.scala:677)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.finishTopLevelCommit (InTxnImpl.scala:636)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.TxnSlotManager.release (TxnSlotManager.scala:88)`
+  - `scala.concurrent.stm.ccstm.TxnSlotManager` retains 8.3 KiB (0.1% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.detach (InTxnImpl.scala:677)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.finishTopLevelCommit (InTxnImpl.scala:636)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:619)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-77"></a>
 
@@ -3522,7 +4363,7 @@ _Local roots: 11._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef`                                                |     1 |    24 B |     40 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
@@ -3530,25 +4371,41 @@ _Local roots: 11._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 20 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitTxnUnowned (CCSTM.scala:256)`
+- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitUnowned (CCSTM.scala:176)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.weakAwaitUnowned (InTxnImpl.scala:912)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 40 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-78"></a>
 
@@ -3560,28 +4417,37 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.RetrySet`                                                            |    ×2 |    24 B |    216 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.8 KB retained heap._
+_Complete stack: 12 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:53)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.8 KiB retained heap._
+
+- `java.lang.Thread.yield0 (Native Method)`
+- `java.lang.Thread.yield (Thread.java:445)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:53)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-79"></a>
 
@@ -3593,7 +4459,7 @@ _Local roots: 11._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -3601,25 +4467,38 @@ _Local roots: 11._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 17 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:80)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:80)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 24 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-80"></a>
 
@@ -3631,27 +4510,37 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×3 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×3 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    144 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 12 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:31)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 144 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-81"></a>
 
@@ -3663,7 +4552,7 @@ _Local roots: 11._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |    ×2 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -3671,24 +4560,31 @@ _Local roots: 11._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 560 B retained heap._
+_Complete stack: 10 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 560 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-82"></a>
 
@@ -3700,7 +4596,7 @@ _Local roots: 12._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `jdk.internal.reflect.DirectMethodHandleAccessor`                                                |     1 |    32 B |    400 B |
 | `scala.concurrent.stm.ccstm.RetrySet`                                                            |    ×2 |    24 B |    216 B |
 | `scala.concurrent.stm.ccstm.WakeupManager$EventImpl`                                             |     1 |    40 B |     40 B |
@@ -3711,27 +4607,51 @@ _Local roots: 12._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.8 KB retained heap._
+_Complete stack: 29 frames as recorded in the dump._
 
-- `java.util.concurrent.locks.AbstractQueuedSynchronizer.acquire (AbstractQueuedSynchronizer.java:788)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.8 KiB retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:221)`
+- ✦ `java.util.concurrent.locks.AbstractQueuedSynchronizer.acquire (AbstractQueuedSynchronizer.java:788)`
   - `scala.concurrent.stm.ccstm.WakeupManager$EventImpl` retains 40 B (<0.1% of thread retained)
   - `java.util.concurrent.locks.AbstractQueuedSynchronizer$ExclusiveNode` retains 32 B (<0.1% of thread retained)
   - `java.util.concurrent.locks.AbstractQueuedSynchronizer$SharedNode` retains 32 B (<0.1% of thread retained)
-- `jdk.internal.reflect.DirectMethodHandleAccessor.invoke (DirectMethodHandleAccessor.java:103)`
+- `java.util.concurrent.locks.AbstractQueuedSynchronizer.acquireSharedInterruptibly (AbstractQueuedSynchronizer.java:1133)`
+- `scala.concurrent.stm.ccstm.WakeupManager$EventImpl.$anonfun$tryAwaitUntil$1 (WakeupManager.scala:181)`
+- `scala.concurrent.stm.ccstm.WakeupManager$EventImpl$$Lambda+0x00007e41c02202f0.apply$mcV$sp (Unknown Source)`
+- `scala.runtime.java8.JFunction0$mcV$sp.apply (JFunction0$mcV$sp.java:23)`
+- `scala.concurrent.BlockContext$DefaultBlockContext$.blockOn (BlockContext.scala:57)`
+- `scala.concurrent.package$.blocking (package.scala:146)`
+- `scala.concurrent.package.blocking (package.scala)`
+- `java.lang.invoke.DirectMethodHandle$Holder.invokeStatic (DirectMethodHandle$Holder)`
+- `java.lang.invoke.LambdaForm$MH+0x00007e41c023b800.invoke (LambdaForm$MH)`
+- `java.lang.invoke.Invokers$Holder.invokeExact_MT (Invokers$Holder)`
+- `jdk.internal.reflect.DirectMethodHandleAccessor.invokeImpl (DirectMethodHandleAccessor.java:154)`
+- ✦ `jdk.internal.reflect.DirectMethodHandleAccessor.invoke (DirectMethodHandleAccessor.java:103)`
   - `jdk.internal.reflect.DirectMethodHandleAccessor` retains 400 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.RetrySet.blockingAttemptAwait (RetrySet.scala:69)`
+- `java.lang.reflect.Method.invoke (Method.java:580)`
+- `scala.concurrent.stm.ccstm.WakeupManager$.blocking (WakeupManager.scala:44)`
+- `scala.concurrent.stm.ccstm.WakeupManager$EventImpl.tryAwaitUntil (WakeupManager.scala:181)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.blockingAttemptAwait (RetrySet.scala:69)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
+- `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:59)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-83"></a>
 
@@ -3743,7 +4663,7 @@ _Local roots: 11._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |    ×2 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -3751,24 +4671,31 @@ _Local roots: 11._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 560 B retained heap._
+_Complete stack: 10 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 560 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-84"></a>
 
@@ -3780,27 +4707,37 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×3 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×3 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    144 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 12 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:31)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 144 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-85"></a>
 
@@ -3812,7 +4749,7 @@ _Local roots: 11._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |    ×2 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -3820,24 +4757,31 @@ _Local roots: 11._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 560 B retained heap._
+_Complete stack: 10 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 560 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-86"></a>
 
@@ -3849,7 +4793,7 @@ _Local roots: 15._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |    ×3 |   112 B |    112 B |
 | `scala.concurrent.stm.ccstm.CCSTM$`                                                              |     1 |    72 B |     96 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
@@ -3858,30 +4802,45 @@ _Local roots: 15._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 20 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitTxnUnowned (CCSTM.scala:229)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitTxnUnowned (CCSTM.scala:229)`
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM$` retains 96 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 40 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitUnowned (CCSTM.scala:176)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.weakAwaitUnowned (InTxnImpl.scala:912)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 40 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-87"></a>
 
@@ -3893,29 +4852,41 @@ _Local roots: 9._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 560 B retained heap._
+_Complete stack: 15 frames as recorded in the dump._
 
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$3 (RealityShowPhilosophers.scala:37)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 560 B retained heap._
+
+- `scala.concurrent.stm.RefLike.$plus$eq (RefLike.scala:76)`
+- `scala.concurrent.stm.RefLike.$plus$eq$ (RefLike.scala:76)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.$plus$eq (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$3 (RealityShowPhilosophers.scala:37)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$3$adapted (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-88"></a>
 
@@ -3927,29 +4898,45 @@ _Local roots: 9._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    168 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 19 frames as recorded in the dump._
 
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:32)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- `scala.concurrent.stm.ccstm.InTxnImpl.revalidate (InTxnImpl.scala:902)`
+- `scala.concurrent.stm.ccstm.InTxnRefOps.revalidateIfRequired (InTxnRefOps.scala:34)`
+- `scala.concurrent.stm.ccstm.InTxnRefOps.set (InTxnRefOps.scala:269)`
+- `scala.concurrent.stm.ccstm.RefOps.update (RefOps.scala:24)`
+- `scala.concurrent.stm.ccstm.RefOps.update$ (RefOps.scala:24)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.update (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.update (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:32)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 168 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-89"></a>
 
@@ -3961,7 +4948,7 @@ _Local roots: 10._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -3969,23 +4956,31 @@ _Local roots: 10._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 560 B retained heap._
+_Complete stack: 11 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.AccessHistory.resetAccessHistory (AccessHistory.scala:194)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.finishTopLevelCommit (InTxnImpl.scala:633)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 560 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.AccessHistory.resetAccessHistory (AccessHistory.scala:194)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.finishTopLevelCommit (InTxnImpl.scala:633)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:619)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-90"></a>
 
@@ -3999,7 +4994,7 @@ _Showing top 20 of 21 by retained heap; retained sizes overlap, so totals may ex
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `jdk.internal.reflect.DirectMethodHandleAccessor`                                                |     1 |    32 B |    400 B |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |    ×7 |   112 B |    112 B |
 | `scala.concurrent.stm.ccstm.CCSTM$`                                                              |     1 |    72 B |     96 B |
@@ -4008,38 +5003,67 @@ _Showing top 20 of 21 by retained heap; retained sizes overlap, so totals may ex
 | `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef`                                                |    ×3 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 37 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.TxnLevelImpl.$anonfun$awaitCompleted$1 (TxnLevelImpl.scala:195)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- `java.lang.Object.wait0 (Native Method)`
+- `java.lang.Object.wait (Object.java:366)`
+- `java.lang.Object.wait (Object.java:339)`
+- ✦ `scala.concurrent.stm.ccstm.TxnLevelImpl.$anonfun$awaitCompleted$1 (TxnLevelImpl.scala:195)`
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 24 B (<0.1% of thread retained)
-- `jdk.internal.reflect.DirectMethodHandleAccessor.invoke (DirectMethodHandleAccessor.java:103)`
+- `scala.concurrent.stm.ccstm.TxnLevelImpl$$Lambda+0x00007e41c021c4a0.apply$mcV$sp (Unknown Source)`
+- `scala.runtime.java8.JFunction0$mcV$sp.apply (JFunction0$mcV$sp.java:23)`
+- `scala.concurrent.BlockContext$DefaultBlockContext$.blockOn (BlockContext.scala:57)`
+- `scala.concurrent.package$.blocking (package.scala:146)`
+- `scala.concurrent.package.blocking (package.scala)`
+- `java.lang.invoke.DirectMethodHandle$Holder.invokeStatic (DirectMethodHandle$Holder)`
+- `java.lang.invoke.LambdaForm$MH+0x00007e41c023b800.invoke (LambdaForm$MH)`
+- `java.lang.invoke.Invokers$Holder.invokeExact_MT (Invokers$Holder)`
+- `jdk.internal.reflect.DirectMethodHandleAccessor.invokeImpl (DirectMethodHandleAccessor.java:154)`
+- ✦ `jdk.internal.reflect.DirectMethodHandleAccessor.invoke (DirectMethodHandleAccessor.java:103)`
   - `jdk.internal.reflect.DirectMethodHandleAccessor` retains 400 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.TxnLevelImpl.awaitCompleted (TxnLevelImpl.scala:192)`
+- `java.lang.reflect.Method.invoke (Method.java:580)`
+- `scala.concurrent.stm.ccstm.WakeupManager$.blocking (WakeupManager.scala:44)`
+- ✦ `scala.concurrent.stm.ccstm.TxnLevelImpl.awaitCompleted (TxnLevelImpl.scala:192)`
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitTxnUnowned (CCSTM.scala:240)`
+- ✦ `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitTxnUnowned (CCSTM.scala:240)`
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM$` retains 96 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 24 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitUnowned (CCSTM.scala:176)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.weakAwaitUnowned (InTxnImpl.scala:912)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 24 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-91"></a>
 
@@ -4051,7 +5075,7 @@ _Local roots: 12._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |    ×2 |   112 B |    168 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -4059,26 +5083,33 @@ _Local roots: 12._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 11 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.revalidateImpl (InTxnImpl.scala:826)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.revalidateImpl (InTxnImpl.scala:826)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 168 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 168 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-92"></a>
 
@@ -4090,7 +5121,7 @@ _Local roots: 14._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×6 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×6 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -4099,29 +5130,42 @@ _Local roots: 14._
 | `scala.Some`                                                                                     |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 600 B retained heap._
+_Complete stack: 18 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnRefOps.acquireOwnership (InTxnRefOps.scala:43)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 600 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.acquireOwnership (InTxnRefOps.scala:43)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 24 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnRefOps.set (InTxnRefOps.scala:254)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.set (InTxnRefOps.scala:254)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 24 B (<0.1% of thread retained)
   - `scala.Some` retains 16 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:32)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.update (RefOps.scala:24)`
+- `scala.concurrent.stm.ccstm.RefOps.update$ (RefOps.scala:24)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.update (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.update (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:32)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-93"></a>
 
@@ -4133,7 +5177,7 @@ _Local roots: 11._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -4141,25 +5185,38 @@ _Local roots: 11._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 17 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:80)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:80)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 24 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-94"></a>
 
@@ -4171,7 +5228,7 @@ _Local roots: 11._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |    ×2 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -4179,24 +5236,31 @@ _Local roots: 11._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 560 B retained heap._
+_Complete stack: 10 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 560 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-95"></a>
 
@@ -4208,7 +5272,7 @@ _Local roots: 15._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |    ×3 |   112 B |    112 B |
 | `scala.concurrent.stm.ccstm.CCSTM$`                                                              |     1 |    72 B |     96 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
@@ -4217,30 +5281,45 @@ _Local roots: 15._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 20 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitTxnUnowned (CCSTM.scala:229)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitTxnUnowned (CCSTM.scala:229)`
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM$` retains 96 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 40 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitUnowned (CCSTM.scala:176)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.weakAwaitUnowned (InTxnImpl.scala:912)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 40 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-96"></a>
 
@@ -4252,7 +5331,7 @@ _Local roots: 11._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -4260,25 +5339,38 @@ _Local roots: 11._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 17 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 24 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-97"></a>
 
@@ -4290,8 +5382,8 @@ _Local roots: 12._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B |  29.0 KB |
-| `scala.concurrent.stm.ccstm.TxnSlotManager`                                                      |     1 |    24 B |   8.3 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B | 29.0 KiB |
+| `scala.concurrent.stm.ccstm.TxnSlotManager`                                                      |     1 |    24 B |  8.3 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |    ×2 |    24 B |     24 B |
@@ -4299,26 +5391,34 @@ _Local roots: 12._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 12 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.TxnSlotManager.release (TxnSlotManager.scala:88)`
-  - `scala.concurrent.stm.ccstm.TxnSlotManager` retains 8.3 KB (0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.detach (InTxnImpl.scala:677)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.finishTopLevelCommit (InTxnImpl.scala:636)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.TxnSlotManager.release (TxnSlotManager.scala:88)`
+  - `scala.concurrent.stm.ccstm.TxnSlotManager` retains 8.3 KiB (0.1% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.detach (InTxnImpl.scala:677)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.finishTopLevelCommit (InTxnImpl.scala:636)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:619)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-98"></a>
 
@@ -4330,7 +5430,7 @@ _Local roots: 13._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×7 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×7 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -4338,28 +5438,44 @@ _Local roots: 13._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 21 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.revalidate (InTxnImpl.scala:901)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:80)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- `scala.concurrent.stm.ccstm.GV6.freshReadVersion$ (GV6.scala:80)`
+- `scala.concurrent.stm.ccstm.CCSTM$.freshReadVersion (CCSTM.scala:8)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.revalidate (InTxnImpl.scala:901)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.InTxnRefOps.revalidateIfRequired (InTxnRefOps.scala:34)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:80)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 24 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-99"></a>
 
@@ -4371,7 +5487,7 @@ _Local roots: 12._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |    ×2 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -4379,26 +5495,33 @@ _Local roots: 12._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 11 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.revalidateImpl (InTxnImpl.scala:826)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.revalidateImpl (InTxnImpl.scala:826)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-100"></a>
 
@@ -4410,7 +5533,7 @@ _Local roots: 12._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `jdk.internal.reflect.DirectMethodHandleAccessor`                                                |     1 |    32 B |    400 B |
 | `scala.concurrent.stm.ccstm.RetrySet`                                                            |    ×2 |    24 B |    216 B |
 | `scala.concurrent.stm.ccstm.WakeupManager$EventImpl`                                             |     1 |    40 B |     40 B |
@@ -4421,27 +5544,51 @@ _Local roots: 12._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.9 KB retained heap._
+_Complete stack: 29 frames as recorded in the dump._
 
-- `java.util.concurrent.locks.AbstractQueuedSynchronizer.acquire (AbstractQueuedSynchronizer.java:788)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.9 KiB retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:221)`
+- ✦ `java.util.concurrent.locks.AbstractQueuedSynchronizer.acquire (AbstractQueuedSynchronizer.java:788)`
   - `scala.concurrent.stm.ccstm.WakeupManager$EventImpl` retains 40 B (<0.1% of thread retained)
   - `java.util.concurrent.locks.AbstractQueuedSynchronizer$ExclusiveNode` retains 32 B (<0.1% of thread retained)
   - `java.util.concurrent.locks.AbstractQueuedSynchronizer$SharedNode` retains 32 B (<0.1% of thread retained)
-- `jdk.internal.reflect.DirectMethodHandleAccessor.invoke (DirectMethodHandleAccessor.java:103)`
+- `java.util.concurrent.locks.AbstractQueuedSynchronizer.acquireSharedInterruptibly (AbstractQueuedSynchronizer.java:1133)`
+- `scala.concurrent.stm.ccstm.WakeupManager$EventImpl.$anonfun$tryAwaitUntil$1 (WakeupManager.scala:181)`
+- `scala.concurrent.stm.ccstm.WakeupManager$EventImpl$$Lambda+0x00007e41c02202f0.apply$mcV$sp (Unknown Source)`
+- `scala.runtime.java8.JFunction0$mcV$sp.apply (JFunction0$mcV$sp.java:23)`
+- `scala.concurrent.BlockContext$DefaultBlockContext$.blockOn (BlockContext.scala:57)`
+- `scala.concurrent.package$.blocking (package.scala:146)`
+- `scala.concurrent.package.blocking (package.scala)`
+- `java.lang.invoke.DirectMethodHandle$Holder.invokeStatic (DirectMethodHandle$Holder)`
+- `java.lang.invoke.LambdaForm$MH+0x00007e41c023b800.invoke (LambdaForm$MH)`
+- `java.lang.invoke.Invokers$Holder.invokeExact_MT (Invokers$Holder)`
+- `jdk.internal.reflect.DirectMethodHandleAccessor.invokeImpl (DirectMethodHandleAccessor.java:154)`
+- ✦ `jdk.internal.reflect.DirectMethodHandleAccessor.invoke (DirectMethodHandleAccessor.java:103)`
   - `jdk.internal.reflect.DirectMethodHandleAccessor` retains 400 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.RetrySet.blockingAttemptAwait (RetrySet.scala:69)`
+- `java.lang.reflect.Method.invoke (Method.java:580)`
+- `scala.concurrent.stm.ccstm.WakeupManager$.blocking (WakeupManager.scala:44)`
+- `scala.concurrent.stm.ccstm.WakeupManager$EventImpl.tryAwaitUntil (WakeupManager.scala:181)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.blockingAttemptAwait (RetrySet.scala:69)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
+- `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:59)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-101"></a>
 
@@ -4453,30 +5600,37 @@ _Local roots: 9._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.RetrySet`                                                            |    ×3 |    24 B |    216 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.8 KB retained heap._
+_Complete stack: 11 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.RetrySet.changed (RetrySet.scala:98)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.8 KiB retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.changed (RetrySet.scala:98)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:49)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:49)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-102"></a>
 
@@ -4488,7 +5642,7 @@ _Local roots: 13._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef`                                                |    ×2 |    24 B |     40 B |
@@ -4497,27 +5651,41 @@ _Local roots: 13._
 | `scala.None$`                                                                                    |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 560 B retained heap._
+_Complete stack: 18 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnRefOps.acquireOwnership (InTxnRefOps.scala:43)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 560 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.acquireOwnership (InTxnRefOps.scala:43)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 40 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnRefOps.set (InTxnRefOps.scala:254)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.set (InTxnRefOps.scala:254)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 40 B (<0.1% of thread retained)
   - `scala.None$` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.update (RefOps.scala:24)`
+- `scala.concurrent.stm.ccstm.RefOps.update$ (RefOps.scala:24)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.update (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.update (CCSTMRefs.scala:42)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$3 (RealityShowPhilosophers.scala:39)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$3$adapted (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-103"></a>
 
@@ -4529,7 +5697,7 @@ _Local roots: 9._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.concurrent.stm.Txn$RolledBack`                                                            |     1 |    16 B |     56 B |
 | `scala.concurrent.stm.skel.RollbackError$`                                                       |     1 |    40 B |     40 B |
@@ -4538,21 +5706,28 @@ _Local roots: 9._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.7 KB retained heap._
+_Complete stack: 9 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:627)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.7 KiB retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:627)`
   - `scala.concurrent.stm.Txn$RolledBack` retains 56 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.skel.RollbackError$` retains 40 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-104"></a>
 
@@ -4564,29 +5739,41 @@ _Local roots: 9._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 560 B retained heap._
+_Complete stack: 15 frames as recorded in the dump._
 
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$3 (RealityShowPhilosophers.scala:37)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 560 B retained heap._
+
+- `scala.concurrent.stm.RefLike.$plus$eq (RefLike.scala:76)`
+- `scala.concurrent.stm.RefLike.$plus$eq$ (RefLike.scala:76)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.$plus$eq (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$3 (RealityShowPhilosophers.scala:37)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$3$adapted (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-105"></a>
 
@@ -4598,27 +5785,37 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×3 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×3 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    144 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 12 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:31)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 144 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-106"></a>
 
@@ -4630,8 +5827,8 @@ _Local roots: 12._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
-| `scala.concurrent.stm.ccstm.TxnSlotManager`                                                      |     1 |    24 B |   8.3 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
+| `scala.concurrent.stm.ccstm.TxnSlotManager`                                                      |     1 |    24 B |  8.3 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -4639,27 +5836,44 @@ _Local roots: 12._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 22 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.TxnSlotManager.release (TxnSlotManager.scala:88)`
-  - `scala.concurrent.stm.ccstm.TxnSlotManager` retains 8.3 KB (0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.TxnSlotManager.release (TxnSlotManager.scala:88)`
+  - `scala.concurrent.stm.ccstm.TxnSlotManager` retains 8.3 KiB (0.1% of thread retained)
+- `scala.concurrent.stm.ccstm.TxnSlotManager.endLookup (TxnSlotManager.scala:83)`
+- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitTxnUnowned (CCSTM.scala:256)`
+- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitUnowned (CCSTM.scala:176)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.weakAwaitUnowned (InTxnImpl.scala:912)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 24 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-107"></a>
 
@@ -4671,7 +5885,7 @@ _Local roots: 12._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `jdk.internal.reflect.DirectMethodHandleAccessor`                                                |     1 |    32 B |    400 B |
 | `scala.concurrent.stm.ccstm.RetrySet`                                                            |    ×2 |    24 B |    216 B |
 | `scala.concurrent.stm.ccstm.WakeupManager$EventImpl`                                             |     1 |    40 B |     40 B |
@@ -4682,27 +5896,51 @@ _Local roots: 12._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.9 KB retained heap._
+_Complete stack: 29 frames as recorded in the dump._
 
-- `java.util.concurrent.locks.AbstractQueuedSynchronizer.acquire (AbstractQueuedSynchronizer.java:788)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.9 KiB retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:221)`
+- ✦ `java.util.concurrent.locks.AbstractQueuedSynchronizer.acquire (AbstractQueuedSynchronizer.java:788)`
   - `scala.concurrent.stm.ccstm.WakeupManager$EventImpl` retains 40 B (<0.1% of thread retained)
   - `java.util.concurrent.locks.AbstractQueuedSynchronizer$ExclusiveNode` retains 32 B (<0.1% of thread retained)
   - `java.util.concurrent.locks.AbstractQueuedSynchronizer$SharedNode` retains 32 B (<0.1% of thread retained)
-- `jdk.internal.reflect.DirectMethodHandleAccessor.invoke (DirectMethodHandleAccessor.java:103)`
+- `java.util.concurrent.locks.AbstractQueuedSynchronizer.acquireSharedInterruptibly (AbstractQueuedSynchronizer.java:1133)`
+- `scala.concurrent.stm.ccstm.WakeupManager$EventImpl.$anonfun$tryAwaitUntil$1 (WakeupManager.scala:181)`
+- `scala.concurrent.stm.ccstm.WakeupManager$EventImpl$$Lambda+0x00007e41c02202f0.apply$mcV$sp (Unknown Source)`
+- `scala.runtime.java8.JFunction0$mcV$sp.apply (JFunction0$mcV$sp.java:23)`
+- `scala.concurrent.BlockContext$DefaultBlockContext$.blockOn (BlockContext.scala:57)`
+- `scala.concurrent.package$.blocking (package.scala:146)`
+- `scala.concurrent.package.blocking (package.scala)`
+- `java.lang.invoke.DirectMethodHandle$Holder.invokeStatic (DirectMethodHandle$Holder)`
+- `java.lang.invoke.LambdaForm$MH+0x00007e41c023b800.invoke (LambdaForm$MH)`
+- `java.lang.invoke.Invokers$Holder.invokeExact_MT (Invokers$Holder)`
+- `jdk.internal.reflect.DirectMethodHandleAccessor.invokeImpl (DirectMethodHandleAccessor.java:154)`
+- ✦ `jdk.internal.reflect.DirectMethodHandleAccessor.invoke (DirectMethodHandleAccessor.java:103)`
   - `jdk.internal.reflect.DirectMethodHandleAccessor` retains 400 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.RetrySet.blockingAttemptAwait (RetrySet.scala:69)`
+- `java.lang.reflect.Method.invoke (Method.java:580)`
+- `scala.concurrent.stm.ccstm.WakeupManager$.blocking (WakeupManager.scala:44)`
+- `scala.concurrent.stm.ccstm.WakeupManager$EventImpl.tryAwaitUntil (WakeupManager.scala:181)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.blockingAttemptAwait (RetrySet.scala:69)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
+- `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:59)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-108"></a>
 
@@ -4714,7 +5952,7 @@ _Local roots: 11._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -4722,25 +5960,38 @@ _Local roots: 11._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 17 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:80)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:80)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 24 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-109"></a>
 
@@ -4752,7 +6003,7 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -4760,19 +6011,27 @@ _Local roots: 8._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.7 KB retained heap._
+_Complete stack: 9 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.7 KiB retained heap._
+
+- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:619)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-110"></a>
 
@@ -4784,28 +6043,37 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.RetrySet`                                                            |    ×2 |    24 B |    216 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.8 KB retained heap._
+_Complete stack: 12 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:53)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.8 KiB retained heap._
+
+- `java.lang.Thread.yield0 (Native Method)`
+- `java.lang.Thread.yield (Thread.java:445)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:53)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-111"></a>
 
@@ -4817,29 +6085,41 @@ _Local roots: 9._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 560 B retained heap._
+_Complete stack: 15 frames as recorded in the dump._
 
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$3 (RealityShowPhilosophers.scala:37)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 560 B retained heap._
+
+- `scala.concurrent.stm.RefLike.$plus$eq (RefLike.scala:76)`
+- `scala.concurrent.stm.RefLike.$plus$eq$ (RefLike.scala:76)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.$plus$eq (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$3 (RealityShowPhilosophers.scala:37)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$3$adapted (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-112"></a>
 
@@ -4851,7 +6131,7 @@ _Local roots: 12._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `jdk.internal.reflect.DirectMethodHandleAccessor`                                                |     1 |    32 B |    400 B |
 | `scala.concurrent.stm.ccstm.RetrySet`                                                            |    ×2 |    24 B |    216 B |
 | `scala.concurrent.stm.ccstm.WakeupManager$EventImpl`                                             |     1 |    40 B |     40 B |
@@ -4862,27 +6142,51 @@ _Local roots: 12._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.8 KB retained heap._
+_Complete stack: 29 frames as recorded in the dump._
 
-- `java.util.concurrent.locks.AbstractQueuedSynchronizer.acquire (AbstractQueuedSynchronizer.java:788)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.8 KiB retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:221)`
+- ✦ `java.util.concurrent.locks.AbstractQueuedSynchronizer.acquire (AbstractQueuedSynchronizer.java:788)`
   - `scala.concurrent.stm.ccstm.WakeupManager$EventImpl` retains 40 B (<0.1% of thread retained)
   - `java.util.concurrent.locks.AbstractQueuedSynchronizer$ExclusiveNode` retains 32 B (<0.1% of thread retained)
   - `java.util.concurrent.locks.AbstractQueuedSynchronizer$SharedNode` retains 32 B (<0.1% of thread retained)
-- `jdk.internal.reflect.DirectMethodHandleAccessor.invoke (DirectMethodHandleAccessor.java:103)`
+- `java.util.concurrent.locks.AbstractQueuedSynchronizer.acquireSharedInterruptibly (AbstractQueuedSynchronizer.java:1133)`
+- `scala.concurrent.stm.ccstm.WakeupManager$EventImpl.$anonfun$tryAwaitUntil$1 (WakeupManager.scala:181)`
+- `scala.concurrent.stm.ccstm.WakeupManager$EventImpl$$Lambda+0x00007e41c02202f0.apply$mcV$sp (Unknown Source)`
+- `scala.runtime.java8.JFunction0$mcV$sp.apply (JFunction0$mcV$sp.java:23)`
+- `scala.concurrent.BlockContext$DefaultBlockContext$.blockOn (BlockContext.scala:57)`
+- `scala.concurrent.package$.blocking (package.scala:146)`
+- `scala.concurrent.package.blocking (package.scala)`
+- `java.lang.invoke.DirectMethodHandle$Holder.invokeStatic (DirectMethodHandle$Holder)`
+- `java.lang.invoke.LambdaForm$MH+0x00007e41c023b800.invoke (LambdaForm$MH)`
+- `java.lang.invoke.Invokers$Holder.invokeExact_MT (Invokers$Holder)`
+- `jdk.internal.reflect.DirectMethodHandleAccessor.invokeImpl (DirectMethodHandleAccessor.java:154)`
+- ✦ `jdk.internal.reflect.DirectMethodHandleAccessor.invoke (DirectMethodHandleAccessor.java:103)`
   - `jdk.internal.reflect.DirectMethodHandleAccessor` retains 400 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.RetrySet.blockingAttemptAwait (RetrySet.scala:69)`
+- `java.lang.reflect.Method.invoke (Method.java:580)`
+- `scala.concurrent.stm.ccstm.WakeupManager$.blocking (WakeupManager.scala:44)`
+- `scala.concurrent.stm.ccstm.WakeupManager$EventImpl.tryAwaitUntil (WakeupManager.scala:181)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.blockingAttemptAwait (RetrySet.scala:69)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
+- `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:59)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-113"></a>
 
@@ -4894,7 +6198,7 @@ _Local roots: 12._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `jdk.internal.reflect.DirectMethodHandleAccessor`                                                |     1 |    32 B |    400 B |
 | `scala.concurrent.stm.ccstm.RetrySet`                                                            |    ×2 |    24 B |    216 B |
 | `scala.concurrent.stm.ccstm.WakeupManager$EventImpl`                                             |     1 |    40 B |     40 B |
@@ -4905,27 +6209,51 @@ _Local roots: 12._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.8 KB retained heap._
+_Complete stack: 29 frames as recorded in the dump._
 
-- `java.util.concurrent.locks.AbstractQueuedSynchronizer.acquire (AbstractQueuedSynchronizer.java:788)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.8 KiB retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:221)`
+- ✦ `java.util.concurrent.locks.AbstractQueuedSynchronizer.acquire (AbstractQueuedSynchronizer.java:788)`
   - `scala.concurrent.stm.ccstm.WakeupManager$EventImpl` retains 40 B (<0.1% of thread retained)
   - `java.util.concurrent.locks.AbstractQueuedSynchronizer$ExclusiveNode` retains 32 B (<0.1% of thread retained)
   - `java.util.concurrent.locks.AbstractQueuedSynchronizer$SharedNode` retains 32 B (<0.1% of thread retained)
-- `jdk.internal.reflect.DirectMethodHandleAccessor.invoke (DirectMethodHandleAccessor.java:103)`
+- `java.util.concurrent.locks.AbstractQueuedSynchronizer.acquireSharedInterruptibly (AbstractQueuedSynchronizer.java:1133)`
+- `scala.concurrent.stm.ccstm.WakeupManager$EventImpl.$anonfun$tryAwaitUntil$1 (WakeupManager.scala:181)`
+- `scala.concurrent.stm.ccstm.WakeupManager$EventImpl$$Lambda+0x00007e41c02202f0.apply$mcV$sp (Unknown Source)`
+- `scala.runtime.java8.JFunction0$mcV$sp.apply (JFunction0$mcV$sp.java:23)`
+- `scala.concurrent.BlockContext$DefaultBlockContext$.blockOn (BlockContext.scala:57)`
+- `scala.concurrent.package$.blocking (package.scala:146)`
+- `scala.concurrent.package.blocking (package.scala)`
+- `java.lang.invoke.DirectMethodHandle$Holder.invokeStatic (DirectMethodHandle$Holder)`
+- `java.lang.invoke.LambdaForm$MH+0x00007e41c023b800.invoke (LambdaForm$MH)`
+- `java.lang.invoke.Invokers$Holder.invokeExact_MT (Invokers$Holder)`
+- `jdk.internal.reflect.DirectMethodHandleAccessor.invokeImpl (DirectMethodHandleAccessor.java:154)`
+- ✦ `jdk.internal.reflect.DirectMethodHandleAccessor.invoke (DirectMethodHandleAccessor.java:103)`
   - `jdk.internal.reflect.DirectMethodHandleAccessor` retains 400 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.RetrySet.blockingAttemptAwait (RetrySet.scala:69)`
+- `java.lang.reflect.Method.invoke (Method.java:580)`
+- `scala.concurrent.stm.ccstm.WakeupManager$.blocking (WakeupManager.scala:44)`
+- `scala.concurrent.stm.ccstm.WakeupManager$EventImpl.tryAwaitUntil (WakeupManager.scala:181)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.blockingAttemptAwait (RetrySet.scala:69)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
+- `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:59)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-114"></a>
 
@@ -4937,8 +6265,8 @@ _Local roots: 13._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×3 |   144 B |  29.0 KB |
-| `scala.concurrent.stm.ccstm.WakeupManager`                                                       |    ×2 |    32 B |   8.7 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×3 |   144 B | 29.0 KiB |
+| `scala.concurrent.stm.ccstm.WakeupManager`                                                       |    ×2 |    32 B |  8.7 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |    ×2 |   112 B |    112 B |
 | `scala.concurrent.stm.ccstm.WakeupManager$EventImpl`                                             |     1 |    40 B |     40 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
@@ -4947,28 +6275,41 @@ _Local roots: 13._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 560 B retained heap._
+_Complete stack: 18 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.WakeupManager.trigger (WakeupManager.scala:113)`
-  - `scala.concurrent.stm.ccstm.WakeupManager` retains 8.7 KB (0.1% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 560 B retained heap._
+
+- `jdk.internal.misc.Unsafe.unpark (Native Method)`
+- `java.util.concurrent.locks.LockSupport.unpark (LockSupport.java:181)`
+- `java.util.concurrent.locks.AbstractQueuedSynchronizer.signalNext (AbstractQueuedSynchronizer.java:645)`
+- `java.util.concurrent.locks.AbstractQueuedSynchronizer.releaseShared (AbstractQueuedSynchronizer.java:1181)`
+- `scala.concurrent.stm.ccstm.WakeupManager$EventImpl.scala$concurrent$stm$ccstm$WakeupManager$$trigger (WakeupManager.scala:189)`
+- ✦ `scala.concurrent.stm.ccstm.WakeupManager.trigger (WakeupManager.scala:113)`
+  - `scala.concurrent.stm.ccstm.WakeupManager` retains 8.7 KiB (0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.WakeupManager$EventImpl` retains 40 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.WakeupManager.trigger (WakeupManager.scala:103)`
-  - `scala.concurrent.stm.ccstm.WakeupManager` retains 8.7 KB (0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:722)`
+- ✦ `scala.concurrent.stm.ccstm.WakeupManager.trigger (WakeupManager.scala:103)`
+  - `scala.concurrent.stm.ccstm.WakeupManager` retains 8.7 KiB (0.1% of thread retained)
+- `scala.concurrent.stm.ccstm.InTxnImpl.commitWrites (InTxnImpl.scala:816)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:722)`
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-115"></a>
 
@@ -4980,7 +6321,7 @@ _Local roots: 11._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -4988,25 +6329,41 @@ _Local roots: 11._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 20 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitTxnUnowned (CCSTM.scala:256)`
+- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitUnowned (CCSTM.scala:176)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.weakAwaitUnowned (InTxnImpl.scala:912)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 24 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-116"></a>
 
@@ -5018,7 +6375,7 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -5026,19 +6383,27 @@ _Local roots: 8._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.7 KB retained heap._
+_Complete stack: 9 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.7 KiB retained heap._
+
+- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:619)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-117"></a>
 
@@ -5050,27 +6415,37 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×3 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×3 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    144 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 12 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:31)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 144 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-118"></a>
 
@@ -5082,7 +6457,7 @@ _Local roots: 9._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.concurrent.stm.Txn$RolledBack`                                                            |     1 |    16 B |     56 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
@@ -5091,21 +6466,28 @@ _Local roots: 9._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.7 KB retained heap._
+_Complete stack: 9 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:627)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.7 KiB retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:627)`
   - `scala.concurrent.stm.Txn$RolledBack` retains 56 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-119"></a>
 
@@ -5117,27 +6499,37 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×3 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×3 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    144 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 12 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:31)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 144 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-120"></a>
 
@@ -5149,29 +6541,46 @@ _Local roots: 9._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 20 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.revalidateImpl (InTxnImpl.scala:826)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.revalidateImpl (InTxnImpl.scala:826)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.InTxnImpl.revalidate (InTxnImpl.scala:902)`
+- `scala.concurrent.stm.ccstm.InTxnRefOps.revalidateIfRequired (InTxnRefOps.scala:34)`
+- `scala.concurrent.stm.ccstm.InTxnRefOps.set (InTxnRefOps.scala:269)`
+- `scala.concurrent.stm.ccstm.RefOps.update (RefOps.scala:24)`
+- `scala.concurrent.stm.ccstm.RefOps.update$ (RefOps.scala:24)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.update (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.update (CCSTMRefs.scala:42)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:33)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-121"></a>
 
@@ -5183,29 +6592,41 @@ _Local roots: 9._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 560 B retained heap._
+_Complete stack: 15 frames as recorded in the dump._
 
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$3 (RealityShowPhilosophers.scala:37)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 560 B retained heap._
+
+- `scala.concurrent.stm.RefLike.$plus$eq (RefLike.scala:76)`
+- `scala.concurrent.stm.RefLike.$plus$eq$ (RefLike.scala:76)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.$plus$eq (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$3 (RealityShowPhilosophers.scala:37)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$3$adapted (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-122"></a>
 
@@ -5217,28 +6638,37 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.RetrySet`                                                            |    ×2 |    24 B |    216 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 29.8 KB retained heap._
+_Complete stack: 12 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:53)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 29.8 KiB retained heap._
+
+- `java.lang.Thread.yield0 (Native Method)`
+- `java.lang.Thread.yield (Thread.java:445)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.attemptAwait (RetrySet.scala:53)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
+- ✦ `scala.concurrent.stm.ccstm.RetrySet.awaitRetry (RetrySet.scala:25)`
   - `scala.concurrent.stm.ccstm.RetrySet` retains 216 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.awaitRetry (InTxnImpl.scala:320)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:406)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-123"></a>
 
@@ -5250,7 +6680,7 @@ _Local roots: 12._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |    ×2 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -5258,26 +6688,33 @@ _Local roots: 12._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 11 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.revalidateImpl (InTxnImpl.scala:826)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.revalidateImpl (InTxnImpl.scala:826)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-124"></a>
 
@@ -5289,8 +6726,8 @@ _Local roots: 12._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
-| `scala.concurrent.stm.ccstm.TxnSlotManager`                                                      |     1 |    24 B |   8.3 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
+| `scala.concurrent.stm.ccstm.TxnSlotManager`                                                      |     1 |    24 B |  8.3 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef`                                                |     1 |    24 B |     40 B |
@@ -5298,27 +6735,44 @@ _Local roots: 12._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 22 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.TxnSlotManager.release (TxnSlotManager.scala:88)`
-  - `scala.concurrent.stm.ccstm.TxnSlotManager` retains 8.3 KB (0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.TxnSlotManager.release (TxnSlotManager.scala:88)`
+  - `scala.concurrent.stm.ccstm.TxnSlotManager` retains 8.3 KiB (0.1% of thread retained)
+- `scala.concurrent.stm.ccstm.TxnSlotManager.endLookup (TxnSlotManager.scala:83)`
+- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitTxnUnowned (CCSTM.scala:256)`
+- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitUnowned (CCSTM.scala:176)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.weakAwaitUnowned (InTxnImpl.scala:912)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 40 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-125"></a>
 
@@ -5330,7 +6784,7 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -5338,19 +6792,27 @@ _Local roots: 8._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 9 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:619)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-126"></a>
 
@@ -5362,8 +6824,8 @@ _Local roots: 15._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
-| `scala.concurrent.stm.ccstm.TxnSlotManager`                                                      |     1 |    24 B |   8.3 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
+| `scala.concurrent.stm.ccstm.TxnSlotManager`                                                      |     1 |    24 B |  8.3 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |    ×2 |   112 B |    112 B |
 | `scala.concurrent.stm.ccstm.CCSTM$`                                                              |     1 |    72 B |     96 B |
 | `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef`                                                |    ×2 |    24 B |     40 B |
@@ -5372,31 +6834,46 @@ _Local roots: 15._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 21 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.TxnSlotManager.beginLookup (TxnSlotManager.scala:69)`
-  - `scala.concurrent.stm.ccstm.TxnSlotManager` retains 8.3 KB (0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitTxnUnowned (CCSTM.scala:226)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.TxnSlotManager.beginLookup (TxnSlotManager.scala:69)`
+  - `scala.concurrent.stm.ccstm.TxnSlotManager` retains 8.3 KiB (0.1% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitTxnUnowned (CCSTM.scala:226)`
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM$` retains 96 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 40 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitUnowned (CCSTM.scala:176)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.weakAwaitUnowned (InTxnImpl.scala:912)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 40 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-127"></a>
 
@@ -5408,29 +6885,41 @@ _Local roots: 9._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 560 B retained heap._
+_Complete stack: 15 frames as recorded in the dump._
 
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$3 (RealityShowPhilosophers.scala:37)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 560 B retained heap._
+
+- `scala.concurrent.stm.RefLike.$plus$eq (RefLike.scala:76)`
+- `scala.concurrent.stm.RefLike.$plus$eq$ (RefLike.scala:76)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.$plus$eq (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$3 (RealityShowPhilosophers.scala:37)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$3$adapted (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-128"></a>
 
@@ -5444,7 +6933,7 @@ _Showing top 20 of 21 by retained heap; retained sizes overlap, so totals may ex
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `jdk.internal.reflect.DirectMethodHandleAccessor`                                                |     1 |    32 B |    400 B |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |    ×7 |   112 B |    112 B |
 | `scala.concurrent.stm.ccstm.CCSTM$`                                                              |     1 |    72 B |     96 B |
@@ -5453,38 +6942,67 @@ _Showing top 20 of 21 by retained heap; retained sizes overlap, so totals may ex
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 37 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.TxnLevelImpl.$anonfun$awaitCompleted$1 (TxnLevelImpl.scala:195)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- `java.lang.Object.wait0 (Native Method)`
+- `java.lang.Object.wait (Object.java:366)`
+- `java.lang.Object.wait (Object.java:339)`
+- ✦ `scala.concurrent.stm.ccstm.TxnLevelImpl.$anonfun$awaitCompleted$1 (TxnLevelImpl.scala:195)`
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 40 B (<0.1% of thread retained)
-- `jdk.internal.reflect.DirectMethodHandleAccessor.invoke (DirectMethodHandleAccessor.java:103)`
+- `scala.concurrent.stm.ccstm.TxnLevelImpl$$Lambda+0x00007e41c021c4a0.apply$mcV$sp (Unknown Source)`
+- `scala.runtime.java8.JFunction0$mcV$sp.apply (JFunction0$mcV$sp.java:23)`
+- `scala.concurrent.BlockContext$DefaultBlockContext$.blockOn (BlockContext.scala:57)`
+- `scala.concurrent.package$.blocking (package.scala:146)`
+- `scala.concurrent.package.blocking (package.scala)`
+- `java.lang.invoke.DirectMethodHandle$Holder.invokeStatic (DirectMethodHandle$Holder)`
+- `java.lang.invoke.LambdaForm$MH+0x00007e41c023b800.invoke (LambdaForm$MH)`
+- `java.lang.invoke.Invokers$Holder.invokeExact_MT (Invokers$Holder)`
+- `jdk.internal.reflect.DirectMethodHandleAccessor.invokeImpl (DirectMethodHandleAccessor.java:154)`
+- ✦ `jdk.internal.reflect.DirectMethodHandleAccessor.invoke (DirectMethodHandleAccessor.java:103)`
   - `jdk.internal.reflect.DirectMethodHandleAccessor` retains 400 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.TxnLevelImpl.awaitCompleted (TxnLevelImpl.scala:192)`
+- `java.lang.reflect.Method.invoke (Method.java:580)`
+- `scala.concurrent.stm.ccstm.WakeupManager$.blocking (WakeupManager.scala:44)`
+- ✦ `scala.concurrent.stm.ccstm.TxnLevelImpl.awaitCompleted (TxnLevelImpl.scala:192)`
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitTxnUnowned (CCSTM.scala:240)`
+- ✦ `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitTxnUnowned (CCSTM.scala:240)`
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM$` retains 96 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 40 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitUnowned (CCSTM.scala:176)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.weakAwaitUnowned (InTxnImpl.scala:912)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 40 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-129"></a>
 
@@ -5496,7 +7014,7 @@ _Local roots: 8._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×2 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -5504,19 +7022,27 @@ _Local roots: 8._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 9 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:619)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-130"></a>
 
@@ -5528,8 +7054,8 @@ _Local roots: 12._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
-| `scala.concurrent.stm.ccstm.TxnSlotManager`                                                      |     1 |    24 B |   8.3 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
+| `scala.concurrent.stm.ccstm.TxnSlotManager`                                                      |     1 |    24 B |  8.3 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef`                                                |     1 |    24 B |     40 B |
@@ -5537,27 +7063,44 @@ _Local roots: 12._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 22 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.TxnSlotManager.release (TxnSlotManager.scala:88)`
-  - `scala.concurrent.stm.ccstm.TxnSlotManager` retains 8.3 KB (0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.TxnSlotManager.release (TxnSlotManager.scala:88)`
+  - `scala.concurrent.stm.ccstm.TxnSlotManager` retains 8.3 KiB (0.1% of thread retained)
+- `scala.concurrent.stm.ccstm.TxnSlotManager.endLookup (TxnSlotManager.scala:83)`
+- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitTxnUnowned (CCSTM.scala:256)`
+- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitUnowned (CCSTM.scala:176)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.weakAwaitUnowned (InTxnImpl.scala:912)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 40 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-131"></a>
 
@@ -5569,7 +7112,7 @@ _Local roots: 11._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -5577,25 +7120,38 @@ _Local roots: 11._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 17 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:80)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:80)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 24 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-132"></a>
 
@@ -5607,7 +7163,7 @@ _Local roots: 11._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |    ×2 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -5615,24 +7171,31 @@ _Local roots: 11._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 560 B retained heap._
+_Complete stack: 10 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 560 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-133"></a>
 
@@ -5644,7 +7207,7 @@ _Local roots: 11._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×5 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    112 B |
 | `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef`                                                |     1 |    24 B |     40 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
@@ -5652,25 +7215,41 @@ _Local roots: 11._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 20 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitTxnUnowned (CCSTM.scala:256)`
+- `scala.concurrent.stm.ccstm.CCSTM$.weakAwaitUnowned (CCSTM.scala:176)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.weakAwaitUnowned (InTxnImpl.scala:912)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnRefOps.get (InTxnRefOps.scala:77)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTMRefs$GenericRef` retains 40 B (<0.1% of thread retained)
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-134"></a>
 
@@ -5682,7 +7261,7 @@ _Local roots: 11._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |    ×2 |   112 B |    112 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
@@ -5690,24 +7269,31 @@ _Local roots: 11._
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 560 B retained heap._
+_Complete stack: 10 frames as recorded in the dump._
 
-- `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 560 B retained heap._
+
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.attemptTopLevelComplete (InTxnImpl.scala:704)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelComplete (InTxnImpl.scala:618)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:529)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.runtime.BoxedUnit` retains 16 B (<0.1% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 112 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01deae0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:36)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 <a id="thread-135"></a>
 
@@ -5719,41 +7305,62 @@ _Local roots: 9._
 
 | Object                                                                                           | Count | Shallow | Retained |
 | ------------------------------------------------------------------------------------------------ | ----: | ------: | -------: |
-| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B |  29.0 KB |
+| `scala.concurrent.stm.ccstm.InTxnImpl`                                                           |    ×4 |   144 B | 29.0 KiB |
 | `scala.concurrent.stm.ccstm.TxnLevelImpl`                                                        |     1 |   112 B |    168 B |
 | `scala.collection.immutable.Range`                                                               |     1 |    40 B |     40 B |
 | `scala.concurrent.stm.ccstm.CCSTM`                                                               |     1 |    24 B |     24 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` |     1 |    16 B |     16 B |
 | `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 584 B retained heap._
+_Complete stack: 16 frames as recorded in the dump._
 
-- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
-- `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
-  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KB (0.2% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 584 B retained heap._
+
+- `scala.concurrent.stm.ccstm.RefOps.apply (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.RefOps.apply$ (RefOps.scala:16)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- `scala.concurrent.stm.ccstm.CCSTMRefs$BaseRef.apply (CCSTMRefs.scala:42)`
+- ✦ `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2 (RealityShowPhilosophers.scala:30)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$2$adapted (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0.apply (Unknown Source)`
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.runBlock (InTxnImpl.scala:571)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAttempt (InTxnImpl.scala:527)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
+- ✦ `scala.concurrent.stm.ccstm.InTxnImpl.topLevelAtomicImpl (InTxnImpl.scala:398)`
+  - `scala.concurrent.stm.ccstm.InTxnImpl` retains 29.0 KiB (0.2% of thread retained)
   - `scala.concurrent.stm.ccstm.TxnLevelImpl` retains 168 B (<0.1% of thread retained)
   - `scala.concurrent.stm.ccstm.CCSTM` retains 24 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b7be0` retains 16 B (<0.1% of thread retained)
-- `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
+- `scala.concurrent.stm.ccstm.InTxnImpl.atomic (InTxnImpl.scala:259)`
+- `scala.concurrent.stm.ccstm.CCSTMExecutor.apply (CCSTMExecutor.scala:24)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.$anonfun$run$1 (RealityShowPhilosophers.scala:29)`
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210.apply$mcVI$sp (Unknown Source)`
+- ✦ `scala.collection.immutable.Range.foreach$mVc$sp (Range.scala:158)`
   - `scala.collection.immutable.Range` retains 40 B (<0.1% of thread retained)
   - `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread$$Lambda+0x00007e41c01b5210` retains 16 B (<0.1% of thread retained)
+- `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread.run (RealityShowPhilosophers.scala:27)`
 
 ## Top Components
 
-_Retained heap grouped by class loader (component). `% Heap` is the share of total reachable heap. Totals can exceed 100% because retained sets overlap — an object held by multiple components is counted in each._
+_Retained heap grouped by class loader (component). `% Heap` is the share of the total per-class retained heap — the same overlapping sum the `Retained` column is drawn from — **not** a share of the reachable heap._
 
-| Component                                              | Retained | % Heap | Top Classes                                                                                                                                                                                                                                                          |
-| ------------------------------------------------------ | -------: | -----: | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `<boot>`                                               |  31.4 MB |  76.0% | `java.lang.Object[]` (3.7 MB), `java.lang.Class` (3.6 MB), `byte[]` (2.6 MB), `java.lang.Object` (2.0 MB), `java.lang.String` (1.8 MB)                                                                                                                               |
-| `java/net/URLClassLoader`                              |   7.1 MB |  17.1% | `scala.concurrent.stm.ccstm.InTxnImpl` (3.7 MB), `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread` (1.0 MB), `scala.concurrent.stm.ccstm.Handle[]` (1.0 MB), `scala.concurrent.stm.skel.CallbackList` (417.2 KB), `scala.Function1[]` (399.1 KB) |
-| `java/net/URLClassLoader`                              |   2.6 MB |   6.3% | `scala.runtime.LazyVals$` (2.5 MB), `org.renaissance.harness.ConfigParser$$anon$1` (13.0 KB), `scala.math.BigInt$` (8.2 KB), `scopt.ORunner$` (8.1 KB), `scala.math.BigInt[]` (8.0 KB)                                                                               |
-| `jdk/internal/loader/ClassLoaders$AppClassLoader`      | 236.2 KB |   0.6% | `org.renaissance.core.ModuleLoader` (149.8 KB), `org.renaissance.core.BenchmarkSuite` (77.0 KB), `org.renaissance.core.BenchmarkDescriptor` (2.3 KB), `org.renaissance.core.Launcher` (1.6 KB), `org.renaissance.core.ResourceUtils` (1.2 KB)                        |
-| `jdk/internal/loader/ClassLoaders$PlatformClassLoader` |   7.4 KB |  <0.1% | `sun.util.resources.cldr.provider.CLDRLocaleDataMetaInfo` (7.4 KB)                                                                                                                                                                                                   |
+> ⚠ **These numbers do not add up, and must not be added up.**
+>
+> The `Retained` column sums, per class loader, the retained heap of every class that loader defined. Those retained sets **overlap**, so the same object is counted under every component that can reach it. The column total here is 41.3 MiB — **3.6× the entire reachable heap** (11.6 MiB).
+>
+> A single component cannot retain more than the whole heap. Use this table to compare components *against each other*; do not compare a row with the heap total, and do not sum rows. For addable, non-overlapping totals use [Heap Composition](#heap-composition) and the [Class Histogram](#class-histogram-by-retained-heap).
+
+> ⚠ Rows marked ✦ individually exceed the reachable heap — an artifact of the overlapping sum described above, not a measurement error in the dump.
+
+| Component                                              |  Retained | % Heap | Top Classes                                                                                                                                                                                                                                                               |
+| ------------------------------------------------------ | --------: | -----: | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `<boot>` ✦                                             |  31.4 MiB |  76.0% | `java.lang.Object[]` (3.7 MiB), `java.lang.Class` (3.6 MiB), `byte[]` (2.6 MiB), `java.lang.Object` (2.0 MiB), `java.lang.String` (1.8 MiB)                                                                                                                               |
+| `java/net/URLClassLoader`                              |   7.1 MiB |  17.1% | `scala.concurrent.stm.ccstm.InTxnImpl` (3.7 MiB), `org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread` (1.0 MiB), `scala.concurrent.stm.ccstm.Handle[]` (1.0 MiB), `scala.concurrent.stm.skel.CallbackList` (417.2 KiB), `scala.Function1[]` (399.1 KiB) |
+| `java/net/URLClassLoader`                              |   2.6 MiB |   6.3% | `scala.runtime.LazyVals$` (2.5 MiB), `org.renaissance.harness.ConfigParser$$anon$1` (13.0 KiB), `scala.math.BigInt$` (8.2 KiB), `scopt.ORunner$` (8.1 KiB), `scala.math.BigInt[]` (8.0 KiB)                                                                               |
+| `jdk/internal/loader/ClassLoaders$AppClassLoader`      | 236.2 KiB |   0.6% | `org.renaissance.core.ModuleLoader` (149.8 KiB), `org.renaissance.core.BenchmarkSuite` (77.0 KiB), `org.renaissance.core.BenchmarkDescriptor` (2.3 KiB), `org.renaissance.core.Launcher` (1.6 KiB), `org.renaissance.core.ResourceUtils` (1.2 KiB)                        |
+| `jdk/internal/loader/ClassLoaders$PlatformClassLoader` |   7.4 KiB |  <0.1% | `sun.util.resources.cldr.provider.CLDRLocaleDataMetaInfo` (7.4 KiB)                                                                                                                                                                                                       |
 
 ## Arrays by Size
 
@@ -5761,49 +7368,49 @@ _Array length distribution bucketed by powers of two — **Max Length** is the i
 
 ### Object Arrays
 
-| Max Length |   Objects |    Shallow |    % Heap |
-| ---------: | --------: | ---------: | --------: |
-|        ≤ 1 |       772 |    18.1 KB |      0.2% |
-|        ≤ 2 |       593 |    13.9 KB |      0.1% |
-|        ≤ 4 |       657 |    20.5 KB |      0.2% |
-|        ≤ 8 |       988 |    40.9 KB |      0.3% |
-|       ≤ 16 |     1,002 |    72.1 KB |      0.6% |
-|       ≤ 32 |       392 |    45.2 KB |      0.4% |
-|       ≤ 64 |       121 |    23.7 KB |      0.2% |
-|      ≤ 128 |       847 |   426.3 KB |      3.6% |
-|      ≤ 256 |        26 |    23.2 KB |      0.2% |
-|      ≤ 512 |        10 |    15.4 KB |      0.1% |
-|    ≤ 1,024 |       276 |     1.1 MB |      9.2% |
-|    ≤ 2,048 |       137 |   641.3 KB |      5.4% |
-|    ≤ 4,096 |         6 |    65.3 KB |      0.5% |
-|    ≤ 8,192 |         1 |    31.0 KB |      0.3% |
-|  ≤ 131,072 |         1 |   512.0 KB |      4.3% |
-|  **Total** | **5,829** | **3.0 MB** | **25.6%** |
+| Max Length |   Objects |     Shallow |    % Heap |
+| ---------: | --------: | ----------: | --------: |
+|        ≤ 1 |       772 |    18.1 KiB |      0.2% |
+|        ≤ 2 |       593 |    13.9 KiB |      0.1% |
+|        ≤ 4 |       657 |    20.5 KiB |      0.2% |
+|        ≤ 8 |       988 |    40.9 KiB |      0.3% |
+|       ≤ 16 |     1,002 |    72.1 KiB |      0.6% |
+|       ≤ 32 |       392 |    45.2 KiB |      0.4% |
+|       ≤ 64 |       121 |    23.7 KiB |      0.2% |
+|      ≤ 128 |       847 |   426.3 KiB |      3.6% |
+|      ≤ 256 |        26 |    23.2 KiB |      0.2% |
+|      ≤ 512 |        10 |    15.4 KiB |      0.1% |
+|    ≤ 1,024 |       276 |     1.1 MiB |      9.2% |
+|    ≤ 2,048 |       137 |   641.3 KiB |      5.4% |
+|    ≤ 4,096 |         6 |    65.3 KiB |      0.5% |
+|    ≤ 8,192 |         1 |    31.0 KiB |      0.3% |
+|  ≤ 131,072 |         1 |   512.0 KiB |      4.3% |
+|  **Total** | **5,829** | **3.0 MiB** | **25.6%** |
 
 ### Primitive Arrays
 
-| Max Length |    Objects |    Shallow |    % Heap |
-| ---------: | ---------: | ---------: | --------: |
-|        ≤ 1 |        336 |     7.9 KB |      0.1% |
-|        ≤ 2 |        705 |    16.5 KB |      0.1% |
-|        ≤ 4 |      1,403 |    34.7 KB |      0.3% |
-|        ≤ 8 |      2,314 |    56.1 KB |      0.5% |
-|       ≤ 16 |      4,707 |   157.0 KB |      1.3% |
-|       ≤ 32 |      6,925 |   319.9 KB |      2.7% |
-|       ≤ 64 |      8,386 |   535.9 KB |      4.5% |
-|      ≤ 128 |      1,485 |   156.5 KB |      1.3% |
-|      ≤ 256 |        231 |    54.7 KB |      0.5% |
-|      ≤ 512 |        421 |   402.1 KB |      3.4% |
-|    ≤ 1,024 |        342 |     1.5 MB |     12.7% |
-|    ≤ 2,048 |         17 |    60.3 KB |      0.5% |
-|    ≤ 4,096 |          3 |     9.6 KB |      0.1% |
-|    ≤ 8,192 |         32 |   387.0 KB |      3.3% |
-|   ≤ 16,384 |          5 |    84.7 KB |      0.7% |
-|   ≤ 32,768 |          6 |   132.7 KB |      1.1% |
-|   ≤ 65,536 |          2 |   104.0 KB |      0.9% |
-|  ≤ 131,072 |          1 |   512.0 KB |      4.3% |
-|  ≤ 262,144 |          4 |   853.3 KB |      7.2% |
-|  **Total** | **27,325** | **5.3 MB** | **45.4%** |
+| Max Length |    Objects |     Shallow |    % Heap |
+| ---------: | ---------: | ----------: | --------: |
+|        ≤ 1 |        336 |     7.9 KiB |      0.1% |
+|        ≤ 2 |        705 |    16.5 KiB |      0.1% |
+|        ≤ 4 |      1,403 |    34.7 KiB |      0.3% |
+|        ≤ 8 |      2,314 |    56.1 KiB |      0.5% |
+|       ≤ 16 |      4,707 |   157.0 KiB |      1.3% |
+|       ≤ 32 |      6,925 |   319.9 KiB |      2.7% |
+|       ≤ 64 |      8,386 |   535.9 KiB |      4.5% |
+|      ≤ 128 |      1,485 |   156.5 KiB |      1.3% |
+|      ≤ 256 |        231 |    54.7 KiB |      0.5% |
+|      ≤ 512 |        421 |   402.1 KiB |      3.4% |
+|    ≤ 1,024 |        342 |     1.5 MiB |     12.7% |
+|    ≤ 2,048 |         17 |    60.3 KiB |      0.5% |
+|    ≤ 4,096 |          3 |     9.6 KiB |      0.1% |
+|    ≤ 8,192 |         32 |   387.0 KiB |      3.3% |
+|   ≤ 16,384 |          5 |    84.7 KiB |      0.7% |
+|   ≤ 32,768 |          6 |   132.7 KiB |      1.1% |
+|   ≤ 65,536 |          2 |   104.0 KiB |      0.9% |
+|  ≤ 131,072 |          1 |   512.0 KiB |      4.3% |
+|  ≤ 262,144 |          4 |   853.3 KiB |      7.2% |
+|  **Total** | **27,325** | **5.3 MiB** | **45.4%** |
 
 Zero-length arrays: 2,419
 
@@ -5815,86 +7422,86 @@ _Collection fill ratios, map load factors, and constant-value primitive array gr
 
 | Kind      |     Count | Total Elements | Max Elements | Total Shallow |
 | --------- | --------: | -------------: | -----------: | ------------: |
-| list      |       106 |          1,300 |          491 |        2.5 KB |
-| map       |     5,892 |         11,095 |        2,889 |      362.5 KB |
-| **Total** | **5,998** |     **12,395** |              |  **365.0 KB** |
+| list      |       106 |          1,300 |          491 |       2.5 KiB |
+| map       |     5,892 |         11,095 |        2,889 |     362.5 KiB |
+| **Total** | **5,998** |     **12,395** |              | **365.0 KiB** |
 
 ### Collection Fill Ratio
 
 _Fraction of each collection's capacity in use — low fill wastes backing-array memory. 5,998 collections analyzed (619 non-empty tracked)._
 
-|      Fill % | Collections |     Shallow |       Wasted |
-| ----------: | ----------: | ----------: | -----------: |
-|       0–10% |         259 |     11.8 KB |      29.8 KB |
-|      10–20% |         139 |      6.4 KB |      16.2 KB |
-|      20–30% |          50 |      2.3 KB |      17.0 KB |
-|      30–40% |          42 |      2.3 KB |      50.3 KB |
-|      40–50% |          40 |      2.1 KB |      36.5 KB |
-|      50–60% |          22 |      1.1 KB |       8.0 KB |
-|      60–70% |          14 |       776 B |      17.7 KB |
-|      70–80% |          11 |       448 B |       9.8 KB |
-|      80–90% |           3 |        72 B |       1.1 KB |
-|     90–100% |           0 |         0 B |          0 B |
-| 100% (full) |          39 |       936 B |          0 B |
-|   **Total** |     **619** | **28.2 KB** | **186.4 KB** |
+|      Fill % | Collections |      Shallow |        Wasted |
+| ----------: | ----------: | -----------: | ------------: |
+|       0–10% |         259 |     11.8 KiB |      29.8 KiB |
+|      10–20% |         139 |      6.4 KiB |      16.2 KiB |
+|      20–30% |          50 |      2.3 KiB |      17.0 KiB |
+|      30–40% |          42 |      2.3 KiB |      50.3 KiB |
+|      40–50% |          40 |      2.1 KiB |      36.5 KiB |
+|      50–60% |          22 |      1.1 KiB |       8.0 KiB |
+|      60–70% |          14 |        776 B |      17.7 KiB |
+|      70–80% |          11 |        448 B |       9.8 KiB |
+|      80–90% |           3 |         72 B |       1.1 KiB |
+|     90–100% |           0 |          0 B |           0 B |
+| 100% (full) |          39 |        936 B |           0 B |
+|   **Total** |     **619** | **28.2 KiB** | **186.4 KiB** |
 
 ### Collections by Size
 
 _Element-count distribution of collections, bucketed by size — 5,998 tracked; 5,497 empty._
 
-|    Size ≤ | Collections |     Shallow |
-| --------: | ----------: | ----------: |
-|       ≤ 1 |         204 |      9.0 KB |
-|       ≤ 2 |          94 |      3.6 KB |
-|       ≤ 4 |          97 |      4.0 KB |
-|       ≤ 8 |          37 |      1.9 KB |
-|      ≤ 16 |          33 |      1.6 KB |
-|      ≤ 32 |          11 |       480 B |
-|      ≤ 64 |           7 |       368 B |
-|     ≤ 128 |           4 |       224 B |
-|     ≤ 256 |           5 |       304 B |
-|     ≤ 512 |           4 |       144 B |
-|   ≤ 1,024 |           3 |       144 B |
-|   ≤ 4,096 |           2 |        96 B |
-| **Total** |     **501** | **21.8 KB** |
+|    Size ≤ | Collections |      Shallow |
+| --------: | ----------: | -----------: |
+|       ≤ 1 |         204 |      9.0 KiB |
+|       ≤ 2 |          94 |      3.6 KiB |
+|       ≤ 4 |          97 |      4.0 KiB |
+|       ≤ 8 |          37 |      1.9 KiB |
+|      ≤ 16 |          33 |      1.6 KiB |
+|      ≤ 32 |          11 |        480 B |
+|      ≤ 64 |           7 |        368 B |
+|     ≤ 128 |           4 |        224 B |
+|     ≤ 256 |           5 |        304 B |
+|     ≤ 512 |           4 |        144 B |
+|   ≤ 1,024 |           3 |        144 B |
+|   ≤ 4,096 |           2 |         96 B |
+| **Total** |     **501** | **21.8 KiB** |
 
 ### Array Fill Ratio
 
 _Non-null element fraction of object arrays — low fill leaves most slots empty. 5,829 tracked._
 
-|      Fill % |    Arrays |    Shallow |     Wasted |
-| ----------: | --------: | ---------: | ---------: |
-|       0–10% |     2,438 |     2.1 MB |     4.1 MB |
-|      10–20% |       339 |    38.3 KB |    55.6 KB |
-|      20–30% |        92 |    16.7 KB |    22.1 KB |
-|      30–40% |       104 |    52.0 KB |    66.8 KB |
-|      40–50% |       246 |    99.9 KB |   101.6 KB |
-|      50–60% |        50 |    11.1 KB |     9.6 KB |
-|      60–70% |        40 |     5.2 KB |     3.1 KB |
-|      70–80% |        34 |     4.4 KB |     2.0 KB |
-|      80–90% |        18 |     6.5 KB |     1.6 KB |
-|     90–100% |        13 |    36.2 KB |     2.1 KB |
-| 100% (full) |     2,455 |   635.5 KB |        0 B |
-|   **Total** | **5,829** | **3.0 MB** | **4.4 MB** |
+|      Fill % |    Arrays |     Shallow |      Wasted |
+| ----------: | --------: | ----------: | ----------: |
+|       0–10% |     2,438 |     2.1 MiB |     4.1 MiB |
+|      10–20% |       339 |    38.3 KiB |    55.6 KiB |
+|      20–30% |        92 |    16.7 KiB |    22.1 KiB |
+|      30–40% |       104 |    52.0 KiB |    66.8 KiB |
+|      40–50% |       246 |    99.9 KiB |   101.6 KiB |
+|      50–60% |        50 |    11.1 KiB |     9.6 KiB |
+|      60–70% |        40 |     5.2 KiB |     3.1 KiB |
+|      70–80% |        34 |     4.4 KiB |     2.0 KiB |
+|      80–90% |        18 |     6.5 KiB |     1.6 KiB |
+|     90–100% |        13 |    36.2 KiB |     2.1 KiB |
+| 100% (full) |     2,455 |   635.5 KiB |         0 B |
+|   **Total** | **5,829** | **3.0 MiB** | **4.4 MiB** |
 
 ### Map Load Factor
 
 _Load factor (occupied slots ÷ capacity) for 493 of 5,892 maps; high values (≥ 90%) signal dense packing and longer bucket chains per lookup._
 
-|      Load % |    Maps |     Shallow |
-| ----------: | ------: | ----------: |
-|       0–10% |     221 |     11.0 KB |
-|      10–20% |     123 |      6.1 KB |
-|      20–30% |      39 |      2.2 KB |
-|      30–40% |      48 |      2.6 KB |
-|      40–50% |      44 |      2.3 KB |
-|      50–60% |      13 |       768 B |
-|      60–70% |       2 |       128 B |
-|      70–80% |       3 |       160 B |
-|      80–90% |       0 |         0 B |
-|     90–100% |       0 |         0 B |
-| 100% (full) |       0 |         0 B |
-|   **Total** | **493** | **25.3 KB** |
+|      Load % |    Maps |      Shallow |
+| ----------: | ------: | -----------: |
+|       0–10% |     221 |     11.0 KiB |
+|      10–20% |     123 |      6.1 KiB |
+|      20–30% |      39 |      2.2 KiB |
+|      30–40% |      48 |      2.6 KiB |
+|      40–50% |      44 |      2.3 KiB |
+|      50–60% |      13 |        768 B |
+|      60–70% |       2 |        128 B |
+|      70–80% |       3 |        160 B |
+|      80–90% |       0 |          0 B |
+|     90–100% |       0 |          0 B |
+| 100% (full) |       0 |          0 B |
+|   **Total** | **493** | **25.3 KiB** |
 
 ### Constant Primitive Arrays
 
@@ -5902,148 +7509,148 @@ _Primitive arrays whose every element is identical — possible candidates for d
 
 _(31 trivial groups hidden.)_
 
-| Array Class |  Length |       Value | Objects |  Shallow |
-| ----------- | ------: | ----------: | ------: | -------: |
-| `int[]`     | 131,064 |           0 |       1 | 512.0 KB |
-| `int[]`     |   4,902 |           0 |       1 |  19.2 KB |
-| `char[]`    |   8,192 |           0 |       1 |  16.0 KB |
-| `byte[]`    |   8,192 |           0 |       1 |   8.0 KB |
-| `int[]`     |     802 |           0 |       1 |   3.1 KB |
-| `int[]`     |     770 |           0 |       1 |   3.0 KB |
-| `int[]`     |     550 |           0 |       1 |   2.2 KB |
-| `long[]`    |      32 |           0 |       4 |   1.1 KB |
-| `byte[]`    |       2 |          49 |      31 |    744 B |
-| `int[]`     |      32 |           0 |       4 |    576 B |
-| `byte[]`    |     256 |           0 |       2 |    544 B |
-| `byte[]`    |     512 |           0 |       1 |    528 B |
-| `byte[]`    |       8 |           0 |      19 |    456 B |
-| `int[]`     |       2 |           0 |      15 |    360 B |
-| `short[]`   |      32 |           0 |       4 |    320 B |
-| `int[]`     |      74 |           0 |       1 |    312 B |
-| `int[]`     |       4 |           0 |       9 |    288 B |
-| `int[]`     |      10 |           0 |       4 |    224 B |
-| `int[]`     |      48 |           0 |       1 |    208 B |
-| `char[]`    |      26 |           0 |       2 |    144 B |
-| `byte[]`    |      63 |          48 |       1 |     80 B |
-| `int[]`     |      16 | -1881356936 |       1 |     80 B |
-| `int[]`     |      16 | -1881356440 |       1 |     80 B |
-| `int[]`     |      16 | -1881355944 |       1 |     80 B |
-| `int[]`     |      16 | -1881004352 |       1 |     80 B |
-| `int[]`     |      16 |           0 |       1 |     80 B |
-| `int[]`     |      12 |           0 |       1 |     64 B |
-| `int[]`     |       8 |           0 |       1 |     48 B |
-| `byte[]`    |      10 |          32 |       1 |     32 B |
-| `byte[]`    |      13 |          48 |       1 |     32 B |
-| `byte[]`    |      16 |           0 |       1 |     32 B |
-| `byte[]`    |       8 |          32 |       1 |     24 B |
-| `byte[]`    |       8 |          48 |       1 |     24 B |
+| Array Class |  Length |       Value | Objects |   Shallow |
+| ----------- | ------: | ----------: | ------: | --------: |
+| `int[]`     | 131,064 |           0 |       1 | 512.0 KiB |
+| `int[]`     |   4,902 |           0 |       1 |  19.2 KiB |
+| `char[]`    |   8,192 |           0 |       1 |  16.0 KiB |
+| `byte[]`    |   8,192 |           0 |       1 |   8.0 KiB |
+| `int[]`     |     802 |           0 |       1 |   3.1 KiB |
+| `int[]`     |     770 |           0 |       1 |   3.0 KiB |
+| `int[]`     |     550 |           0 |       1 |   2.2 KiB |
+| `long[]`    |      32 |           0 |       4 |   1.1 KiB |
+| `byte[]`    |       2 |          49 |      31 |     744 B |
+| `int[]`     |      32 |           0 |       4 |     576 B |
+| `byte[]`    |     256 |           0 |       2 |     544 B |
+| `byte[]`    |     512 |           0 |       1 |     528 B |
+| `byte[]`    |       8 |           0 |      19 |     456 B |
+| `int[]`     |       2 |           0 |      15 |     360 B |
+| `short[]`   |      32 |           0 |       4 |     320 B |
+| `int[]`     |      74 |           0 |       1 |     312 B |
+| `int[]`     |       4 |           0 |       9 |     288 B |
+| `int[]`     |      10 |           0 |       4 |     224 B |
+| `int[]`     |      48 |           0 |       1 |     208 B |
+| `char[]`    |      26 |           0 |       2 |     144 B |
+| `byte[]`    |      63 |          48 |       1 |      80 B |
+| `int[]`     |      16 | -1881356936 |       1 |      80 B |
+| `int[]`     |      16 | -1881356440 |       1 |      80 B |
+| `int[]`     |      16 | -1881355944 |       1 |      80 B |
+| `int[]`     |      16 | -1881004352 |       1 |      80 B |
+| `int[]`     |      16 |           0 |       1 |      80 B |
+| `int[]`     |      12 |           0 |       1 |      64 B |
+| `int[]`     |       8 |           0 |       1 |      48 B |
+| `byte[]`    |      10 |          32 |       1 |      32 B |
+| `byte[]`    |      13 |          48 |       1 |      32 B |
+| `byte[]`    |      16 |           0 |       1 |      32 B |
+| `byte[]`    |       8 |          32 |       1 |      24 B |
+| `byte[]`    |       8 |          48 |       1 |      24 B |
 
 ### Top Arrays (primitive)
 
 _Largest primitive arrays by shallow size — individual instances and class totals._
 
-| Array Class |  Length |    Shallow | Owner (Class#field)                              |
-| ----------- | ------: | ---------: | ------------------------------------------------ |
-| `int[]`     | 131,064 |   512.0 KB | —                                                |
-| `byte[]`    | 261,187 |   255.1 KB | `java.util.zip.ZipFile$Source#cen`               |
-| `byte[]`    | 238,192 |   232.6 KB | `java.util.zip.ZipFile$Source#cen`               |
-| `byte[]`    | 229,980 |   224.6 KB | `java.util.zip.ZipFile$Source#cen`               |
-| `byte[]`    | 144,353 |   141.0 KB | `java.util.zip.ZipFile$Source#cen`               |
-| `long[]`    |   8,192 |    64.0 KB | `scala.concurrent.stm.skel.SimpleRandom$#states` |
-| `byte[]`    |  60,231 |    58.8 KB | `java.util.zip.ZipFile$Source#cen`               |
-| `byte[]`    |  46,187 |    45.1 KB | `java.util.zip.ZipFile$Source#cen`               |
-| `int[]`     |   8,781 |    34.3 KB | `java.util.zip.ZipFile$Source#entries`           |
-| `int[]`     |   7,863 |    30.7 KB | `java.util.zip.ZipFile$Source#entries`           |
-| **Total**   |         | **1.6 MB** |                                                  |
+| Array Class |  Length |     Shallow | Owner (Class#field)                              |
+| ----------- | ------: | ----------: | ------------------------------------------------ |
+| `int[]`     | 131,064 |   512.0 KiB | —                                                |
+| `byte[]`    | 261,187 |   255.1 KiB | `java.util.zip.ZipFile$Source#cen`               |
+| `byte[]`    | 238,192 |   232.6 KiB | `java.util.zip.ZipFile$Source#cen`               |
+| `byte[]`    | 229,980 |   224.6 KiB | `java.util.zip.ZipFile$Source#cen`               |
+| `byte[]`    | 144,353 |   141.0 KiB | `java.util.zip.ZipFile$Source#cen`               |
+| `long[]`    |   8,192 |    64.0 KiB | `scala.concurrent.stm.skel.SimpleRandom$#states` |
+| `byte[]`    |  60,231 |    58.8 KiB | `java.util.zip.ZipFile$Source#cen`               |
+| `byte[]`    |  46,187 |    45.1 KiB | `java.util.zip.ZipFile$Source#cen`               |
+| `int[]`     |   8,781 |    34.3 KiB | `java.util.zip.ZipFile$Source#entries`           |
+| `int[]`     |   7,863 |    30.7 KiB | `java.util.zip.ZipFile$Source#entries`           |
+| **Total**   |         | **1.6 MiB** |                                                  |
 
 #### Top Array Classes (primitive)
 
-| Array Class |  Instances |    Shallow |
-| ----------- | ---------: | ---------: |
-| `byte[]`    |     25,515 |     2.6 MB |
-| `int[]`     |      3,488 |     1.5 MB |
-| `long[]`    |        173 |     1.1 MB |
-| `char[]`    |        225 |    71.8 KB |
-| `boolean[]` |         10 |     1.9 KB |
-| `double[]`  |          8 |      688 B |
-| `short[]`   |          7 |      368 B |
-| `float[]`   |          4 |      112 B |
-| **Total**   | **29,430** | **5.3 MB** |
+| Array Class |  Instances |     Shallow |
+| ----------- | ---------: | ----------: |
+| `byte[]`    |     25,515 |     2.6 MiB |
+| `int[]`     |      3,488 |     1.5 MiB |
+| `long[]`    |        173 |     1.1 MiB |
+| `char[]`    |        225 |    71.8 KiB |
+| `boolean[]` |         10 |     1.9 KiB |
+| `double[]`  |          8 |       688 B |
+| `short[]`   |          7 |       368 B |
+| `float[]`   |          4 |       112 B |
+| **Total**   | **29,430** | **5.3 MiB** |
 
 ### Top Arrays (object)
 
 _Largest object arrays by shallow size — individual instances and class totals._
 
-| Array Class                                     |  Length |   Used / Length |      Shallow | Owner (Class#field)                                      |
-| ----------------------------------------------- | ------: | --------------: | -----------: | -------------------------------------------------------- |
-| `java.lang.Object[]`                            | 131,072 | 131,072/131,072 |     512.0 KB | —                                                        |
-| `java.lang.Object[]`                            |   7,937 |     7,706/7,937 |      31.0 KB | —                                                        |
-| `java.util.HashMap$Node[]`                      |   4,096 |     2,048/4,096 |      16.0 KB | `java.util.HashMap#table`                                |
-| `java.util.HashMap$Node[]`                      |   4,096 |     1,908/4,096 |      16.0 KB | `java.util.HashMap#table`                                |
-| `java.lang.Object[]`                            |   2,285 |       408/2,285 |       8.9 KB | —                                                        |
-| `java.lang.Object[]`                            |   2,126 |     1,063/2,126 |       8.3 KB | `java.util.ImmutableCollections$SetN#elements`           |
-| `scala.math.BigInt[]`                           |   2,049 |         0/2,049 |       8.0 KB | `scala.math.BigInt$#cache`                               |
-| `scala.math.BigInt[]`                           |   2,049 |         0/2,049 |       8.0 KB | —                                                        |
-| `java.lang.Object[]`                            |   2,048 |        96/2,048 |       8.0 KB | `java.util.concurrent.atomic.AtomicReferenceArray#array` |
-| `java.util.concurrent.ConcurrentHashMap$Node[]` |   2,048 |       749/2,048 |       8.0 KB | `java.util.concurrent.ConcurrentHashMap#table`           |
-| **Total**                                       |         |                 | **624.4 KB** |                                                          |
+| Array Class                                     |  Length |   Used / Length |       Shallow | Owner (Class#field)                                      |
+| ----------------------------------------------- | ------: | --------------: | ------------: | -------------------------------------------------------- |
+| `java.lang.Object[]`                            | 131,072 | 131,072/131,072 |     512.0 KiB | —                                                        |
+| `java.lang.Object[]`                            |   7,937 |     7,706/7,937 |      31.0 KiB | —                                                        |
+| `java.util.HashMap$Node[]`                      |   4,096 |     2,048/4,096 |      16.0 KiB | `java.util.HashMap#table`                                |
+| `java.util.HashMap$Node[]`                      |   4,096 |     1,908/4,096 |      16.0 KiB | `java.util.HashMap#table`                                |
+| `java.lang.Object[]`                            |   2,285 |       408/2,285 |       8.9 KiB | —                                                        |
+| `java.lang.Object[]`                            |   2,126 |     1,063/2,126 |       8.3 KiB | `java.util.ImmutableCollections$SetN#elements`           |
+| `scala.math.BigInt[]`                           |   2,049 |         0/2,049 |       8.0 KiB | `scala.math.BigInt$#cache`                               |
+| `scala.math.BigInt[]`                           |   2,049 |         0/2,049 |       8.0 KiB | —                                                        |
+| `java.lang.Object[]`                            |   2,048 |        96/2,048 |       8.0 KiB | `java.util.concurrent.atomic.AtomicReferenceArray#array` |
+| `java.util.concurrent.ConcurrentHashMap$Node[]` |   2,048 |       749/2,048 |       8.0 KiB | `java.util.concurrent.ConcurrentHashMap#table`           |
+| **Total**                                       |         |                 | **624.4 KiB** |                                                          |
 
 #### Top Array Classes (object)
 
-| Array Class                                     | Instances |    Shallow |
-| ----------------------------------------------- | --------: | ---------: |
-| `java.lang.Object[]`                            |     2,397 |     1.3 MB |
-| `scala.concurrent.stm.ccstm.Handle[]`           |       283 |     1.0 MB |
-| `scala.Function1[]`                             |       774 |   399.1 KB |
-| `java.util.HashMap$Node[]`                      |       396 |    96.8 KB |
-| `java.util.concurrent.ConcurrentHashMap$Node[]` |        93 |    65.9 KB |
-| `java.lang.ref.SoftReference[]`                 |       250 |    18.6 KB |
-| `java.lang.Class[]`                             |       593 |    16.8 KB |
-| `java.lang.String[]`                            |       208 |    13.2 KB |
-| `java.lang.ThreadLocal$ThreadLocalMap$Entry[]`  |       130 |    10.2 KB |
-| `scala.math.BigInt[]`                           |         1 |     8.0 KB |
-| **Total**                                       | **5,125** | **2.9 MB** |
+| Array Class                                     | Instances |     Shallow |
+| ----------------------------------------------- | --------: | ----------: |
+| `java.lang.Object[]`                            |     2,397 |     1.3 MiB |
+| `scala.concurrent.stm.ccstm.Handle[]`           |       283 |     1.0 MiB |
+| `scala.Function1[]`                             |       774 |   399.1 KiB |
+| `java.util.HashMap$Node[]`                      |       396 |    96.8 KiB |
+| `java.util.concurrent.ConcurrentHashMap$Node[]` |        93 |    65.9 KiB |
+| `java.lang.ref.SoftReference[]`                 |       250 |    18.6 KiB |
+| `java.lang.Class[]`                             |       593 |    16.8 KiB |
+| `java.lang.String[]`                            |       208 |    13.2 KiB |
+| `java.lang.ThreadLocal$ThreadLocalMap$Entry[]`  |       130 |    10.2 KiB |
+| `scala.math.BigInt[]`                           |         1 |     8.0 KiB |
+| **Total**                                       | **5,125** | **2.9 MiB** |
 
 ## Collection Waste Budget
 
 _Memory tied up in avoidable objects — duplicate strings, duplicate primitive arrays, boxed primitives, and empty/singleton collection overhead. Fix the biggest category first for the highest impact. Figures are approximate._
 
-| Waste Type                   |      Wasted |   Objects | Fix Suggestion                                                                          |
-| ---------------------------- | ----------: | --------: | --------------------------------------------------------------------------------------- |
-| Boxed Primitives (footprint) |     20.8 KB |     1,201 | Use primitive arrays, or Eclipse Collections / Koloboke for primitive-typed collections |
-| **Total**                    | **20.8 KB** | **1,201** |                                                                                         |
+| Waste Type                   |       Wasted |   Objects | Fix Suggestion                                                                          |
+| ---------------------------- | -----------: | --------: | --------------------------------------------------------------------------------------- |
+| Boxed Primitives (footprint) |     20.8 KiB |     1,201 | Use primitive arrays, or Eclipse Collections / Koloboke for primitive-typed collections |
+| **Total**                    | **20.8 KiB** | **1,201** |                                                                                         |
 
 ## Top Retainers
 
 _Combined ranking of `Class#field` references and stack-frame locals by retained heap. Retained totals can exceed heap size for linked structures (e.g. `List#next`) where each node retains its entire tail — treat as relative, not additive._
 
-| Name                                                                                 | Kind        | Retained |
-| ------------------------------------------------------------------------------------ | ----------- | -------: |
-| scala.concurrent.stm.ccstm.InTxnImpl#topLevelAtomicImpl()                            | Stack Frame |   3.6 MB |
-| scala.concurrent.stm.ccstm.InTxnImpl#topLevelAttempt()                               | Stack Frame |   2.9 MB |
-| scala.concurrent.stm.ccstm.InTxnImpl#runBlock()                                      | Stack Frame |   1.7 MB |
-| org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread#$anonfun$run$2() | Stack Frame |   1.1 MB |
-| scala.concurrent.stm.ccstm.InTxnRefOps#get()                                         | Stack Frame | 986.8 KB |
-| scala.concurrent.stm.ccstm.InTxnImpl#awaitRetry()                                    | Stack Frame | 724.8 KB |
-| scala.concurrent.stm.ccstm.InTxnImpl#topLevelComplete()                              | Stack Frame | 638.4 KB |
-| scala.concurrent.stm.ccstm.InTxnImpl#attemptTopLevelComplete()                       | Stack Frame | 524.8 KB |
-| scala.concurrent.stm.ccstm.InTxnImpl#revalidateImpl()                                | Stack Frame | 348.3 KB |
-| org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread#$anonfun$run$3() | Stack Frame | 290.1 KB |
-| org.renaissance.scala.stm.RealityShowPhilosophers$#time()                            | Stack Frame | 157.1 KB |
-| scala.concurrent.stm.ccstm.InTxnImpl#finishTopLevelCommit()                          | Stack Frame | 145.1 KB |
-| scala.concurrent.stm.ccstm.InTxnImpl#detach()                                        | Stack Frame | 116.0 KB |
-| scala.concurrent.stm.ccstm.InTxnRefOps#set()                                         | Stack Frame |  87.1 KB |
-| scala.concurrent.stm.ccstm.InTxnRefOps#acquireOwnership()                            | Stack Frame |  87.1 KB |
-| scala.concurrent.stm.ccstm.TxnSlotManager#release()                                  | Stack Frame |  82.8 KB |
-| scala.concurrent.stm.ccstm.InTxnImpl#topLevelBegin()                                 | Stack Frame |  58.1 KB |
-| scala.concurrent.stm.ccstm.InTxnImpl#commitWrites()                                  | Stack Frame |  58.0 KB |
-| scala.concurrent.stm.ccstm.InTxnImpl#revalidate()                                    | Stack Frame |  58.0 KB |
-| scala.concurrent.stm.ccstm.WakeupManager#trigger()                                   | Stack Frame |  34.8 KB |
-| scala.concurrent.stm.ccstm.InTxnImpl#checkRead()                                     | Stack Frame |  29.0 KB |
-| scala.concurrent.stm.ccstm.AccessHistory#resetAccessHistory()                        | Stack Frame |  29.0 KB |
-| scala.concurrent.stm.ccstm.TxnSlotManager#assign()                                   | Stack Frame |   8.4 KB |
-| scala.concurrent.stm.ccstm.TxnSlotManager#beginLookup()                              | Stack Frame |   8.3 KB |
-| scala.concurrent.stm.ccstm.TxnSlotManager#lookup()                                   | Stack Frame |   8.3 KB |
+| Name                                                                                 | Kind        |  Retained |
+| ------------------------------------------------------------------------------------ | ----------- | --------: |
+| scala.concurrent.stm.ccstm.InTxnImpl#topLevelAtomicImpl()                            | Stack Frame |   3.6 MiB |
+| scala.concurrent.stm.ccstm.InTxnImpl#topLevelAttempt()                               | Stack Frame |   2.9 MiB |
+| scala.concurrent.stm.ccstm.InTxnImpl#runBlock()                                      | Stack Frame |   1.7 MiB |
+| org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread#$anonfun$run$2() | Stack Frame |   1.1 MiB |
+| scala.concurrent.stm.ccstm.InTxnRefOps#get()                                         | Stack Frame | 986.8 KiB |
+| scala.concurrent.stm.ccstm.InTxnImpl#awaitRetry()                                    | Stack Frame | 724.8 KiB |
+| scala.concurrent.stm.ccstm.InTxnImpl#topLevelComplete()                              | Stack Frame | 638.4 KiB |
+| scala.concurrent.stm.ccstm.InTxnImpl#attemptTopLevelComplete()                       | Stack Frame | 524.8 KiB |
+| scala.concurrent.stm.ccstm.InTxnImpl#revalidateImpl()                                | Stack Frame | 348.3 KiB |
+| org.renaissance.scala.stm.RealityShowPhilosophers$PhilosopherThread#$anonfun$run$3() | Stack Frame | 290.1 KiB |
+| org.renaissance.scala.stm.RealityShowPhilosophers$#time()                            | Stack Frame | 157.1 KiB |
+| scala.concurrent.stm.ccstm.InTxnImpl#finishTopLevelCommit()                          | Stack Frame | 145.1 KiB |
+| scala.concurrent.stm.ccstm.InTxnImpl#detach()                                        | Stack Frame | 116.0 KiB |
+| scala.concurrent.stm.ccstm.InTxnRefOps#set()                                         | Stack Frame |  87.1 KiB |
+| scala.concurrent.stm.ccstm.InTxnRefOps#acquireOwnership()                            | Stack Frame |  87.1 KiB |
+| scala.concurrent.stm.ccstm.TxnSlotManager#release()                                  | Stack Frame |  82.8 KiB |
+| scala.concurrent.stm.ccstm.InTxnImpl#topLevelBegin()                                 | Stack Frame |  58.1 KiB |
+| scala.concurrent.stm.ccstm.InTxnImpl#commitWrites()                                  | Stack Frame |  58.0 KiB |
+| scala.concurrent.stm.ccstm.InTxnImpl#revalidate()                                    | Stack Frame |  58.0 KiB |
+| scala.concurrent.stm.ccstm.WakeupManager#trigger()                                   | Stack Frame |  34.8 KiB |
+| scala.concurrent.stm.ccstm.InTxnImpl#checkRead()                                     | Stack Frame |  29.0 KiB |
+| scala.concurrent.stm.ccstm.AccessHistory#resetAccessHistory()                        | Stack Frame |  29.0 KiB |
+| scala.concurrent.stm.ccstm.TxnSlotManager#assign()                                   | Stack Frame |   8.4 KiB |
+| scala.concurrent.stm.ccstm.TxnSlotManager#beginLookup()                              | Stack Frame |   8.3 KiB |
+| scala.concurrent.stm.ccstm.TxnSlotManager#lookup()                                   | Stack Frame |   8.3 KiB |
 
 ## References
 
@@ -6059,17 +7666,17 @@ _223 reference instances._
 
 | Class                                    | Objects | Shallow | Retained |
 | ---------------------------------------- | ------: | ------: | -------: |
-| `java.lang.invoke.LambdaForm`            |     122 |  5.7 KB |  46.8 KB |
-| `java.lang.Class$ReflectionData`         |      34 |  2.1 KB |   2.1 KB |
-| `sun.util.locale.BaseLocale`             |      20 |   640 B |   1.2 KB |
+| `java.lang.invoke.LambdaForm`            |     122 | 5.7 KiB | 46.8 KiB |
+| `java.lang.Class$ReflectionData`         |      34 | 2.1 KiB |  2.1 KiB |
+| `sun.util.locale.BaseLocale`             |      20 |   640 B |  1.2 KiB |
 | `java.lang.invoke.DirectMethodHandle`    |      19 |   760 B |    760 B |
 | `java.util.Locale`                       |      10 |   320 B |    320 B |
-| `java.util.jar.Manifest`                 |       8 |   192 B |   1.1 MB |
-| `java.util.concurrent.ConcurrentHashMap` |       4 |   256 B |   3.0 KB |
+| `java.util.jar.Manifest`                 |       8 |   192 B |  1.1 MiB |
+| `java.util.concurrent.ConcurrentHashMap` |       4 |   256 B |  3.0 KiB |
 | `java.lang.Object[]`                     |       2 |    64 B |     64 B |
 | `java.util.ArrayList`                    |       1 |    24 B |     80 B |
-| `sun.text.resources.cldr.FormatData`     |       1 |    40 B |  28.3 KB |
-| `sun.text.resources.cldr.FormatData_en`  |       1 |    40 B |  20.0 KB |
+| `sun.text.resources.cldr.FormatData`     |       1 |    40 B | 28.3 KiB |
+| `sun.text.resources.cldr.FormatData_en`  |       1 |    40 B | 20.0 KiB |
 | `sun.util.resources.Bundles$1`           |       1 |    40 B |     40 B |
 
 #### Only Softly Retained
@@ -6078,7 +7685,7 @@ _Referents reachable only through soft references — no strong path. GC clears 
 
 | Class                            | Objects | Shallow | Retained |
 | -------------------------------- | ------: | ------: | -------: |
-| `java.lang.Class$ReflectionData` |      34 |  2.1 KB |   2.1 KB |
+| `java.lang.Class$ReflectionData` |      34 | 2.1 KiB |  2.1 KiB |
 
 ### Weak References
 
@@ -6088,28 +7695,28 @@ _993 reference instances. 7 instances have a null referent — referent collecte
 
 #### Referent Classes
 
-| Class                                                             | Objects | Shallow | Retained |
-| ----------------------------------------------------------------- | ------: | ------: | -------: |
-| `java.lang.invoke.MethodType`                                     |     666 | 26.0 KB |  84.2 KB |
-| `java.lang.ThreadLocal`                                           |     129 |  2.0 KB |   2.0 KB |
-| `scala.concurrent.stm.ccstm.InTxnImpl$`                           |     129 |  2.0 KB |   2.0 KB |
-| `java.util.logging.Level`                                         |       9 |   288 B |    288 B |
-| `java.util.logging.Logger`                                        |       8 |   448 B |   4.3 KB |
-| `java.lang.ClassValue$Version`                                    |       6 |   144 B |    336 B |
-| `java.lang.String`                                                |       5 |   120 B |    312 B |
-| `scala.Symbol`                                                    |       5 |    80 B |     80 B |
-| `java.lang.ClassValue$Identity`                                   |       4 |    64 B |     64 B |
-| `java.lang.Module`                                                |       4 |   192 B |  21.8 KB |
-| `java.util.logging.LogManager$RootLogger`                         |       4 |   256 B |   1.4 KB |
-| `sun.security.provider.FileInputStreamPool$UnclosableInputStream` |       2 |    32 B |     32 B |
-| `java.lang.ClassLoader`                                           |       1 |    16 B |      0 B |
-| `java.lang.ThreadGroup`                                           |       1 |    48 B |     48 B |
-| `java.net.URLClassLoader`                                         |       1 |     8 B |      0 B |
-| `java.security.Provider$Service`                                  |       1 |     8 B |      0 B |
-| `java.security.SecureClassLoader`                                 |       1 |     0 B |      0 B |
-| `jdk.internal.loader.BuiltinClassLoader`                          |       1 |    16 B |      0 B |
-| `jdk.internal.loader.ClassLoaders$AppClassLoader`                 |       1 |     8 B |      0 B |
-| `jdk.internal.loader.ClassLoaders$PlatformClassLoader`            |       1 |     8 B |      0 B |
+| Class                                                             | Objects |  Shallow | Retained |
+| ----------------------------------------------------------------- | ------: | -------: | -------: |
+| `java.lang.invoke.MethodType`                                     |     666 | 26.0 KiB | 84.2 KiB |
+| `java.lang.ThreadLocal`                                           |     129 |  2.0 KiB |  2.0 KiB |
+| `scala.concurrent.stm.ccstm.InTxnImpl$`                           |     129 |  2.0 KiB |  2.0 KiB |
+| `java.util.logging.Level`                                         |       9 |    288 B |    288 B |
+| `java.util.logging.Logger`                                        |       8 |    448 B |  4.3 KiB |
+| `java.lang.ClassValue$Version`                                    |       6 |    144 B |    336 B |
+| `java.lang.String`                                                |       5 |    120 B |    312 B |
+| `scala.Symbol`                                                    |       5 |     80 B |     80 B |
+| `java.lang.ClassValue$Identity`                                   |       4 |     64 B |     64 B |
+| `java.lang.Module`                                                |       4 |    192 B | 21.8 KiB |
+| `java.util.logging.LogManager$RootLogger`                         |       4 |    256 B |  1.4 KiB |
+| `sun.security.provider.FileInputStreamPool$UnclosableInputStream` |       2 |     32 B |     32 B |
+| `java.lang.ClassLoader`                                           |       1 |     16 B |      0 B |
+| `java.lang.ThreadGroup`                                           |       1 |     48 B |     48 B |
+| `java.net.URLClassLoader`                                         |       1 |      8 B |      0 B |
+| `java.security.Provider$Service`                                  |       1 |      8 B |      0 B |
+| `java.security.SecureClassLoader`                                 |       1 |      0 B |      0 B |
+| `jdk.internal.loader.BuiltinClassLoader`                          |       1 |     16 B |      0 B |
+| `jdk.internal.loader.ClassLoaders$AppClassLoader`                 |       1 |      8 B |      0 B |
+| `jdk.internal.loader.ClassLoaders$PlatformClassLoader`            |       1 |      8 B |      0 B |
 _… 7 more classes (7 objects, 120 B shallow, 80 B retained)._
 
 #### Only Weakly Retained
@@ -6128,9 +7735,9 @@ _67 reference instances. 1 instance has a null referent — referent collected, 
 
 | Class                                 | Objects | Shallow | Retained |
 | ------------------------------------- | ------: | ------: | -------: |
-| `java.util.zip.Inflater`              |      22 |  1.4 KB |   1.4 KB |
+| `java.util.zip.Inflater`              |      22 | 1.4 KiB |  1.4 KiB |
 | `java.io.FileDescriptor`              |      21 |   840 B |    840 B |
-| `java.util.jar.JarFile`               |      19 |  1.2 KB |   1.1 MB |
+| `java.util.jar.JarFile`               |      19 | 1.2 KiB |  1.1 MiB |
 | `java.lang.ref.Cleaner`               |       1 |    16 B |     16 B |
 | `java.nio.DirectByteBuffer`           |       1 |    72 B |     72 B |
 | `sun.net.www.protocol.jar.URLJarFile` |       1 |    80 B |    352 B |
@@ -6146,63 +7753,63 @@ _None found — no objects are exclusively reachable via this reference kind._
 
 _Objects that are no longer reachable from any GC root but have not yet been collected. A small unreachable fraction (< 5%) is normal between GC cycles; a large one suggests the dump was taken mid-collection._
 
-_5,970 unreachable objects, 816.8 KB shallow heap. Top 30 classes by shallow heap._
+_5,970 unreachable objects, 816.8 KiB shallow heap. Top 30 classes by shallow heap._
 
 _Unreachable objects are eligible for collection but have not yet been reclaimed. At 6.4% of heap total (reachable + unreachable) this is elevated — the dump was likely taken before a full GC cycle completed. GC reclaims this memory automatically; it is not a leak. Confirm: trigger a full GC (`jcmd <pid> GC.run`) then re-dump; if the count drops sharply, it was pre-GC garbage._
 
-| Kind             | Objects |  Shallow |
-| ---------------- | ------: | -------: |
-| Instances        |   1,795 |  54.5 KB |
-| Object Arrays    |     309 |  12.3 KB |
-| Primitive Arrays |   3,579 | 748.5 KB |
-| Class Objects    |     287 |   1.4 KB |
+| Kind             | Objects |   Shallow |
+| ---------------- | ------: | --------: |
+| Instances        |   1,795 |  54.5 KiB |
+| Object Arrays    |     309 |  12.3 KiB |
+| Primitive Arrays |   3,579 | 748.5 KiB |
+| Class Objects    |     287 |   1.4 KiB |
 
 _Shallow heap is additive; retained sets overlap — nested subtrees are counted once per ancestor, so summing retained across classes overstates the total reclaimable memory._
 
-| Class                                                                   | Objects |  Shallow | Retained |
-| ----------------------------------------------------------------------- | ------: | -------: | -------: |
-| `int[]`                                                                 |   2,142 | 663.1 KB | 663.1 KB |
-| `byte[]`                                                                |   1,437 |  85.4 KB |  85.4 KB |
-| `java.lang.String`                                                      |   1,429 |  33.5 KB | 118.7 KB |
-| `java.lang.Object[]`                                                    |     181 |   7.6 KB |   7.6 KB |
-| `java.lang.reflect.Method`                                              |      80 |   6.9 KB |  15.1 KB |
-| `java.lang.reflect.Field`                                               |      79 |   5.6 KB |   8.9 KB |
-| `java.lang.Class$ReflectionData`                                        |      34 |   2.1 KB |  29.8 KB |
-| `java.lang.Class[]`                                                     |      75 |   1.9 KB |   1.9 KB |
-| `java.lang.Class`                                                       |     287 |   1.4 KB |      0 B |
-| `java.lang.ref.SoftReference`                                           |      34 |   1.3 KB |  31.1 KB |
-| `java.lang.invoke.MemberName`                                           |      23 |    920 B |    984 B |
-| `java.lang.ClassValue$Entry[]`                                          |       6 |    864 B |    864 B |
-| `java.lang.reflect.Constructor`                                         |      11 |    792 B |   2.2 KB |
-| `java.lang.reflect.Field[]`                                             |      14 |    552 B |   9.5 KB |
-| `java.lang.reflect.Method[]`                                            |      12 |    536 B |  15.8 KB |
-| `java.util.WeakHashMap$Entry[]`                                         |       6 |    480 B |    640 B |
-| `java.lang.invoke.DirectMethodHandle$Constructor`                       |       9 |    432 B |   1.3 KB |
-| `java.lang.ClassValue$ClassValueMap`                                    |       6 |    384 B |   2.6 KB |
-| `java.lang.reflect.Constructor[]`                                       |      11 |    264 B |   2.3 KB |
-| `java.util.HashMap$Node`                                                |       7 |    224 B |    224 B |
-| `jdk.internal.reflect.DirectConstructorHandleAccessor`                  |       9 |    216 B |   1.6 KB |
-| `java.lang.invoke.ResolvedMethodName`                                   |      13 |    208 B |    208 B |
-| `java.lang.Thread`                                                      |       2 |    208 B |    520 B |
-| `java.lang.ref.ReferenceQueue`                                          |       6 |    192 B |    624 B |
-| `java.util.concurrent.locks.ReentrantLock$NonfairSync`                  |       6 |    192 B |    192 B |
-| `java.lang.invoke.DirectMethodHandle`                                   |       4 |    160 B |    384 B |
-| `java.lang.invoke.BoundMethodHandle$Species_L`                          |       4 |    160 B |    544 B |
-| `java.util.WeakHashMap$Entry`                                           |       4 |    160 B |    160 B |
-| `java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject` |       6 |    144 B |    144 B |
-| `jdk.internal.reflect.DirectMethodHandleAccessor`                       |       4 |    128 B |    672 B |
+| Class                                                                   | Objects |   Shallow |  Retained |
+| ----------------------------------------------------------------------- | ------: | --------: | --------: |
+| `int[]`                                                                 |   2,142 | 663.1 KiB | 663.1 KiB |
+| `byte[]`                                                                |   1,437 |  85.4 KiB |  85.4 KiB |
+| `java.lang.String`                                                      |   1,429 |  33.5 KiB | 118.7 KiB |
+| `java.lang.Object[]`                                                    |     181 |   7.6 KiB |   7.6 KiB |
+| `java.lang.reflect.Method`                                              |      80 |   6.9 KiB |  15.1 KiB |
+| `java.lang.reflect.Field`                                               |      79 |   5.6 KiB |   8.9 KiB |
+| `java.lang.Class$ReflectionData`                                        |      34 |   2.1 KiB |  29.8 KiB |
+| `java.lang.Class[]`                                                     |      75 |   1.9 KiB |   1.9 KiB |
+| `java.lang.Class`                                                       |     287 |   1.4 KiB |       0 B |
+| `java.lang.ref.SoftReference`                                           |      34 |   1.3 KiB |  31.1 KiB |
+| `java.lang.invoke.MemberName`                                           |      23 |     920 B |     984 B |
+| `java.lang.ClassValue$Entry[]`                                          |       6 |     864 B |     864 B |
+| `java.lang.reflect.Constructor`                                         |      11 |     792 B |   2.2 KiB |
+| `java.lang.reflect.Field[]`                                             |      14 |     552 B |   9.5 KiB |
+| `java.lang.reflect.Method[]`                                            |      12 |     536 B |  15.8 KiB |
+| `java.util.WeakHashMap$Entry[]`                                         |       6 |     480 B |     640 B |
+| `java.lang.invoke.DirectMethodHandle$Constructor`                       |       9 |     432 B |   1.3 KiB |
+| `java.lang.ClassValue$ClassValueMap`                                    |       6 |     384 B |   2.6 KiB |
+| `java.lang.reflect.Constructor[]`                                       |      11 |     264 B |   2.3 KiB |
+| `java.util.HashMap$Node`                                                |       7 |     224 B |     224 B |
+| `jdk.internal.reflect.DirectConstructorHandleAccessor`                  |       9 |     216 B |   1.6 KiB |
+| `java.lang.invoke.ResolvedMethodName`                                   |      13 |     208 B |     208 B |
+| `java.lang.Thread`                                                      |       2 |     208 B |     520 B |
+| `java.lang.ref.ReferenceQueue`                                          |       6 |     192 B |     624 B |
+| `java.util.concurrent.locks.ReentrantLock$NonfairSync`                  |       6 |     192 B |     192 B |
+| `java.lang.invoke.DirectMethodHandle`                                   |       4 |     160 B |     384 B |
+| `java.lang.invoke.BoundMethodHandle$Species_L`                          |       4 |     160 B |     544 B |
+| `java.util.WeakHashMap$Entry`                                           |       4 |     160 B |     160 B |
+| `java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject` |       6 |     144 B |     144 B |
+| `jdk.internal.reflect.DirectMethodHandleAccessor`                       |       4 |     128 B |     672 B |
 
 ### Garbage-Root Dominator Trees
 
 _Top garbage-root subtrees by retained heap — unreachable objects with no reachable predecessor. Each node shows retained heap within its subtree. Tree depth is capped._
 
-1. **int[]** — 512.0 KB (1 object in subtree)
+1. **int[]** — 512.0 KiB (1 object in subtree)
 
-2. **int[]** — 19.2 KB (1 object in subtree)
+2. **int[]** — 19.2 KiB (1 object in subtree)
 
-3. **java.lang.ref.SoftReference** — 12.0 KB (250 objects in subtree)
-   └─ java.lang.Class$ReflectionData — 11.9 KB
-        └─ java.lang.reflect.Method[] — 11.9 KB
+3. **java.lang.ref.SoftReference** — 12.0 KiB (250 objects in subtree)
+   └─ java.lang.Class$ReflectionData — 11.9 KiB
+        └─ java.lang.reflect.Method[] — 11.9 KiB
              ├─ java.lang.reflect.Method — 504 B
              │    ├─ java.lang.String — 328 B
              │    │    └─ byte[] — 304 B
@@ -6252,15 +7859,15 @@ _Top garbage-root subtrees by retained heap — unreachable objects with no reac
                   │    └─ byte[] — 32 B
                   └─ java.lang.Class[] — 24 B
 
-4. **int[]** — 4.0 KB (1 object in subtree)
+4. **int[]** — 4.0 KiB (1 object in subtree)
 
-5. **int[]** — 4.0 KB (1 object in subtree)
+5. **int[]** — 4.0 KiB (1 object in subtree)
 
-6. **int[]** — 3.6 KB (1 object in subtree)
+6. **int[]** — 3.6 KiB (1 object in subtree)
 
-7. **java.lang.ref.SoftReference** — 3.2 KB (70 objects in subtree)
-   └─ java.lang.Class$ReflectionData — 3.2 KB
-        └─ java.lang.reflect.Field[] — 3.1 KB
+7. **java.lang.ref.SoftReference** — 3.2 KiB (70 objects in subtree)
+   └─ java.lang.Class$ReflectionData — 3.2 KiB
+        └─ java.lang.reflect.Field[] — 3.1 KiB
              ├─ java.lang.reflect.Field — 200 B
              │    └─ jdk.internal.reflect.MethodHandleObjectFieldAccessorImpl — 128 B
              │         └─ java.lang.invoke.DirectMethodHandle$StaticAccessor — 96 B
@@ -6286,11 +7893,11 @@ _Top garbage-root subtrees by retained heap — unreachable objects with no reac
                   └─ java.lang.String — 64 B
                        └─ byte[] — 40 B
 
-8. **int[]** — 3.1 KB (1 object in subtree)
+8. **int[]** — 3.1 KiB (1 object in subtree)
 
-9. **int[]** — 2.2 KB (1 object in subtree)
+9. **int[]** — 2.2 KiB (1 object in subtree)
 
-10. **int[]** — 2.0 KB (1 object in subtree)
+10. **int[]** — 2.0 KiB (1 object in subtree)
 
 ## Allocation Sites
 
@@ -6304,9 +7911,9 @@ _Share of the reachable heap retained by the few largest top-level dominators (a
 
 | Scope           | Retained Share | Retained |
 | --------------- | -------------: | -------: |
-| Top 1 object    |          21.5% |   2.5 MB |
-| Top 10 objects  |          44.7% |   5.2 MB |
-| Top 100 objects |          72.5% |   8.4 MB |
+| Top 1 object    |          21.5% |  2.5 MiB |
+| Top 10 objects  |          44.7% |  5.2 MiB |
+| Top 100 objects |          72.5% |  8.4 MiB |
 
 _12 objects each hold ≥1% of the reachable heap._
 
@@ -6337,10 +7944,10 @@ _… (+16 deeper buckets, 305 objects, 100.0% cumulative — see HTML report for
 
 _Point-in-time counts for known Java leak patterns. Non-zero values are not always bugs — see the **What to Check** column for how to triage each one._
 
-| Indicator                            |    Value | What to Check                                                                                                                                         |
-| ------------------------------------ | -------: | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Anonymous/generated classes          |      204 | High counts signal class-loader leaks (e.g. dynamic proxies accumulating per request). In Top Consumers, filter by `$` to find the biggest offenders. |
-| `DirectByteBuffer` off-heap capacity | 134.3 MB | Native memory, excluded from JVM heap totals. Check for NIO buffer pools that leak on close, or Netty/gRPC allocators missing a buffer cap.           |
+| Indicator                            |                                       Value | What to Check                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ------------------------------------ | ------------------------------------------: | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Anonymous/generated classes          |                                         204 | High counts signal class-loader leaks (e.g. dynamic proxies accumulating per request). In Top Consumers, filter by `$` to find the biggest offenders.                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `DirectByteBuffer` off-heap capacity | 134.3 MiB (sum) / 134.3 MiB (de-duplicated) | Native memory, excluded from JVM heap totals. Two figures, two scopes: the **sum** adds up the `capacity` of all 8 `DirectByteBuffer` instances, so memory shared between a buffer and its `duplicate()`/`slice()` views is counted once per view; the **de-duplicated** figure merges those overlapping ranges and is the one to compare against process RSS (MAT's `direct` reports the same quantity). A large gap between them means the app is view-heavy, not that it holds that much native memory. Check for NIO buffer pools that leak on close, or Netty/gRPC allocators missing a buffer cap. |
 
 ## Glossary
 
@@ -6383,6 +7990,16 @@ _Definitions for the heap analysis terms used throughout this report._
 - **Instance vs. class**: an *instance* is one object; a *class* row aggregates
   every instance of that type. "Largest" in the histogram is the shallow size of
   the single biggest instance of a class.
+- **Instance counts — three scopes**: the report counts instances at three
+  different scopes, so the same class legitimately shows three different numbers.
+  (1) `Instances (heap)` in the Class Histogram is the **class total**: every
+  reachable instance of that class. (2) `Top Dominators` in
+  "Biggest Classes by Retained Heap" counts only the objects of that class whose
+  immediate dominator is a GC root — a class with millions of instances can have
+  a handful of top-level dominators. (3) `In Subtree` under a leak suspect's
+  "Accumulated objects by class" counts only the instances **inside that one
+  suspect's dominated subtree**. None of the three is a subset relation you can
+  read off directly, and none of them should be expected to match.
 - **Collection fill ratio**: the fraction of a collection's backing-array capacity
   that is actually occupied by elements — `elements / capacity`. A fill ratio near
   0 means the backing array is mostly empty (wasted memory). A ratio near 1 means
@@ -6399,7 +8016,7 @@ _Definitions for the heap analysis terms used throughout this report._
   ReferenceQueue.
 - **Compressed OOPs** (Compressed Ordinary Object Pointers): a JVM optimization
   where object references are stored as 32-bit integers instead of 64-bit pointers,
-  halving reference-field overhead on heaps ≤ ~32 GB. Visible in the Heap Summary
+  halving reference-field overhead on heaps ≤ ~32 GiB. Visible in the Heap Summary
   as `Compressed OOPs: yes`.
 - **Class#field**: the notation used throughout this report to identify a specific
   field — `HolderClass#fieldName`. For example `java.util.HashMap#table` names the

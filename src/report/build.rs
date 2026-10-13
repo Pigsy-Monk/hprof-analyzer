@@ -902,13 +902,14 @@ fn build_leak_indicators(g: &Graph) -> LeakIndicators {
     // forward edge that would defeat an "any live target" heuristic.
     let thread_local_null_key_count = g.thread_local_null_key_count;
 
-    // 3. DirectByteBuffer capacity sum — already computed in pass2.
-    let direct_byte_buffer_capacity_sum = g.direct_byte_buffer_capacity_sum;
-
+    // 3. DirectByteBuffer capacity — already computed in pass2, as both the
+    //    per-instance sum (upper bound) and the de-duplicated range union.
     LeakIndicators {
         anonymous_class_count,
         thread_local_null_key_count,
-        direct_byte_buffer_capacity_sum,
+        direct_byte_buffer_capacity_sum: g.direct_byte_buffer_capacity_sum,
+        direct_byte_buffer_distinct_capacity_sum: g.direct_byte_buffer_distinct_capacity_sum,
+        direct_byte_buffer_instance_count: g.direct_byte_buffer_instance_count,
     }
 }
 
@@ -2257,6 +2258,7 @@ fn build_significant_frames(
         });
         frames_out.push(SignificantFrame {
             frame,
+            frame_number,
             locals: locals_out,
         });
     }

@@ -235,8 +235,8 @@ mod tests {
     // 4. known MAT rounding -> EXPLAINABLE(iii) with expected-rounded evidence
     #[test]
     fn rounding_bytes_and_pct() {
-        // exact bytes -> "11.6 MB"
-        assert_eq!(report::format_bytes(12_187_000), "11.6 MB");
+        // exact bytes -> "11.6 MiB" (binary units carry the `i` suffix)
+        assert_eq!(report::format_bytes(12_187_000), "11.6 MiB");
         // pct 2287bp -> "22.87%": retained/denom rounds to 22.87
         // choose retained/denom = 0.228749 -> "22.87"
         let s = pct_string(2287, 10000);

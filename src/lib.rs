@@ -738,7 +738,7 @@ pub fn render_report_section(r: &report::Report, section: &str) -> String {
         "leaks" => render_md::render_leak_suspects(&r.leaks, &mut out),
         "top" => render_md::render_top_consumers(&r.top, r.overview.total_shallow, &mut out),
         "threads" => render_md::render_threads(&r.threads, false, &mut out),
-        "overview" => render_md::render_system_overview(&r.overview, 0, &mut out),
+        "overview" => render_md::render_system_overview(&r.overview, &r.leak_indicators, &mut out),
         "triage" => render_md::render_oom_triage(r, &mut out),
         "waste" => render_md::render_waste_summary(r, &mut out),
         "indicators" => render_md::render_leak_indicators(&r.leak_indicators, &mut out),
@@ -759,7 +759,12 @@ pub fn render_report_section(r: &report::Report, section: &str) -> String {
         "dominators" => {
             render_md::render_dominator_analysis(&r.dominator_analysis, false, &mut out)
         }
-        "components" => render_md::render_top_components(&r.top_components, false, &mut out),
+        "components" => render_md::render_top_components(
+            &r.top_components,
+            r.overview.total_shallow,
+            false,
+            &mut out,
+        ),
         "alloc_sites" => {
             if let Some(a) = &r.alloc_sites {
                 render_md::render_alloc_sites(a, false, &mut out);

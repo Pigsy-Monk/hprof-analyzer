@@ -189,45 +189,49 @@ fn format_epoch_nanos(secs: u64, nanos: u32) -> String {
     )
 }
 
-/// Human-readable byte size (`B`/`KB`/`MB`/`GB`/`TB`/`PB`, binary 1024 base).
+/// Human-readable byte size (`B`/`KiB`/`MiB`/`GiB`/`TiB`/`PiB`, binary 1024 base).
 /// Used only for display; the JSON model always carries raw `u64` byte counts.
 /// All units are powers of 1024 (the report's "sizes are binary" convention);
-/// see [`SIZE_BASIS_CAPTION`].
+/// see [`SIZE_BASIS_CAPTION`]. The `i` suffix is deliberate: these are binary
+/// units, and labelling them `KB`/`MB`/`GB` (decimal names) invited readers to
+/// convert them as 1000-based — on a 24.86 GiB heap that is a 7% error, enough
+/// to flip a "does it fit in a 32 GB box" conclusion. One unit spelling, one
+/// meaning, everywhere in the report.
 pub fn format_bytes(n: u64) -> String {
     // Pick the unit by MAGNITUDE, then guard the boundary: a value just below a
-    // unit threshold (e.g. 1 MiB - 1) would otherwise round up to "1024.0 KB".
+    // unit threshold (e.g. 1 MiB - 1) would otherwise round up to "1024.0 KiB".
     // If the rounded mantissa reaches 1024, promote to the next unit.
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    const GB: u64 = 1024 * MB;
-    const TB: u64 = 1024 * GB;
-    const PB: u64 = 1024 * TB;
-    if n < KB {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    const TIB: u64 = 1024 * GIB;
+    const PIB: u64 = 1024 * TIB;
+    if n < KIB {
         return format!("{} B", n);
     }
-    let kb = n as f64 / KB as f64;
-    if n < MB && (kb * 10.0).round() < 1024.0 * 10.0 {
-        return format!("{:.1} KB", kb);
+    let kib = n as f64 / KIB as f64;
+    if n < MIB && (kib * 10.0).round() < 1024.0 * 10.0 {
+        return format!("{:.1} KiB", kib);
     }
-    let mb = n as f64 / MB as f64;
-    if n < GB && (mb * 10.0).round() < 1024.0 * 10.0 {
-        return format!("{:.1} MB", mb);
+    let mib = n as f64 / MIB as f64;
+    if n < GIB && (mib * 10.0).round() < 1024.0 * 10.0 {
+        return format!("{:.1} MiB", mib);
     }
-    let gb = n as f64 / GB as f64;
-    if n < TB && (gb * 100.0).round() < 1024.0 * 100.0 {
-        return format!("{:.2} GB", gb);
+    let gib = n as f64 / GIB as f64;
+    if n < TIB && (gib * 100.0).round() < 1024.0 * 100.0 {
+        return format!("{:.2} GiB", gib);
     }
-    let tb = n as f64 / TB as f64;
-    if n < PB && (tb * 100.0).round() < 1024.0 * 100.0 {
-        return format!("{:.2} TB", tb);
+    let tib = n as f64 / TIB as f64;
+    if n < PIB && (tib * 100.0).round() < 1024.0 * 100.0 {
+        return format!("{:.2} TiB", tib);
     }
-    format!("{:.2} PB", n as f64 / PB as f64)
+    format!("{:.2} PiB", n as f64 / PIB as f64)
 }
 
 /// One-line caption noting that all byte sizes use binary (1024-based) units.
-/// Rendered once near the top of every format so KB/MB/GB/TB/PB are unambiguous.
+/// Rendered once near the top of every format so KiB/MiB/GiB/TiB/PiB are unambiguous.
 pub const SIZE_BASIS_CAPTION: &str =
-    "_All sizes are binary (1 KB = 1024 bytes, 1 MB = 1024 KB, and so on)._";
+    "_All sizes are binary (1 KiB = 1024 bytes, 1 MiB = 1024 KiB, and so on)._";
 
 /// Group an unsigned integer into comma-separated thousands (e.g. `1234567` ->
 /// `1,234,567`). Shared by every count display; the signed delta grouper in
@@ -495,23 +499,23 @@ mod tests {
         assert_eq!(format_bytes(0), "0 B");
         assert_eq!(format_bytes(512), "512 B");
         assert_eq!(format_bytes(1023), "1023 B");
-        assert_eq!(format_bytes(1024), "1.0 KB");
-        assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
-        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GB");
-        // Boundary: just under 1 MiB must not round up to "1024.0 KB".
-        assert_eq!(format_bytes(1024 * 1024 - 1), "1.0 MB");
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GiB");
+        // Boundary: just under 1 MiB must not round up to "1024.0 KiB".
+        assert_eq!(format_bytes(1024 * 1024 - 1), "1.0 MiB");
     }
 
     #[test]
     fn format_bytes_tb_pb() {
         const TB: u64 = 1024u64.pow(4);
         const PB: u64 = 1024u64.pow(5);
-        assert_eq!(format_bytes(TB), "1.00 TB");
-        assert_eq!(format_bytes(5 * TB + TB / 2), "5.50 TB");
-        assert_eq!(format_bytes(PB), "1.00 PB");
-        assert_eq!(format_bytes(3 * PB), "3.00 PB");
-        // Just under 1 TiB stays in GB, not a premature "1024.00 GB".
-        assert_eq!(format_bytes(TB - 1), "1.00 TB");
+        assert_eq!(format_bytes(TB), "1.00 TiB");
+        assert_eq!(format_bytes(5 * TB + TB / 2), "5.50 TiB");
+        assert_eq!(format_bytes(PB), "1.00 PiB");
+        assert_eq!(format_bytes(3 * PB), "3.00 PiB");
+        // Just under 1 TiB stays in GiB, not a premature "1024.00 GiB".
+        assert_eq!(format_bytes(TB - 1), "1.00 TiB");
     }
 
     #[test]

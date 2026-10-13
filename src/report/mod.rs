@@ -40,20 +40,20 @@ mod tests {
     fn test_format_bytes() {
         assert_eq!(format_bytes(0), "0 B");
         assert_eq!(format_bytes(512), "512 B");
-        assert_eq!(format_bytes(1024), "1.0 KB");
-        assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
-        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GB");
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GiB");
     }
 
     #[test]
     fn test_format_bytes_unit_rollover() {
         // A value just below a unit boundary must not round up to "1024.0" of
         // the smaller unit — it must promote to the next unit.
-        assert_eq!(format_bytes(1024 * 1024 - 1), "1.0 MB");
-        assert_eq!(format_bytes(1024 * 1024 * 1024 - 1), "1.00 GB");
+        assert_eq!(format_bytes(1024 * 1024 - 1), "1.0 MiB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024 - 1), "1.00 GiB");
         // Values that legitimately round to just under the boundary stay put.
-        assert_eq!(format_bytes(1023 * 1024), "1023.0 KB");
-        assert_eq!(format_bytes(1000 * 1024 * 1024), "1000.0 MB");
+        assert_eq!(format_bytes(1023 * 1024), "1023.0 KiB");
+        assert_eq!(format_bytes(1000 * 1024 * 1024), "1000.0 MiB");
     }
 
     #[test]
@@ -265,6 +265,8 @@ mod tests {
             fields_by_size_raw: None,
             coll_values_raw: None,
             direct_byte_buffer_capacity_sum: 0,
+            direct_byte_buffer_distinct_capacity_sum: 0,
+            direct_byte_buffer_instance_count: 0,
             thread_local_null_key_count: 0,
             tl_entry_records: Vec::new(),
             unreachable_retained: None,
@@ -540,7 +542,7 @@ mod tests {
         assert!(out.contains("Distinct values: 42"), "present distinct");
         assert!(out.contains("Duplicated values: 7"), "present duplicated");
         assert!(
-            out.contains("Approx wasted bytes: 4.0 KB"),
+            out.contains("Approx wasted bytes: 4.0 KiB"),
             "present wasted bytes formatted"
         );
         assert!(out.contains("Most-Duplicated Values"), "top-N header");

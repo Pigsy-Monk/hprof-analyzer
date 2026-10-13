@@ -713,22 +713,46 @@ impl Rule for ProxyLambdaBloat {
     }
 }
 
-/// Off-heap (DirectByteBuffer). Reads `leak_indicators.direct_byte_buffer_capacity_sum`.
+/// Off-heap (DirectByteBuffer). Reads the `leak_indicators` DirectByteBuffer
+/// figures — the de-duplicated range union when it is available, else the
+/// per-instance sum (see `LeakIndicators::direct_byte_buffer_capacity_sum`).
 struct OffHeap;
 impl Rule for OffHeap {
     fn eval(&self, r: &Report) -> Option<TriageSignal> {
-        let cap = r.leak_indicators.direct_byte_buffer_capacity_sum;
+        let li = &r.leak_indicators;
+        let sum = li.direct_byte_buffer_capacity_sum;
+        let distinct = li.direct_byte_buffer_distinct_capacity_sum;
+        // Fire on the de-duplicated figure where we have one: the per-instance
+        // sum counts memory shared with a `duplicate()`/`slice()` view once per
+        // view, so a view-heavy app can look orders of magnitude worse than it
+        // is. The sum is the fallback for dumps where `java.nio.Buffer.address`
+        // is absent (JDK 22+) or the range bound was exceeded.
+        let (cap, basis) = if distinct > 0 {
+            (distinct, "de-duplicated")
+        } else {
+            (sum, "sum over buffer instances, an upper bound")
+        };
         if cap < DBB_FLOOR_BYTES {
             return None;
+        }
+        let mut detail = format!(
+            "{} of native memory ({basis}) is held by live DirectByteBuffers — not reflected \
+in the on-heap totals, but counts against process RSS and can trigger OS-level OOM.",
+            format_bytes(cap),
+        );
+        if distinct > 0 && sum > distinct {
+            detail.push_str(&format!(
+                " The raw per-instance sum is {} across {} buffers; the difference is memory \
+shared between buffers and their views, counted once per view.",
+                format_bytes(sum),
+                fmt_count(li.direct_byte_buffer_instance_count),
+            ));
         }
         Some(signal(
             "off-heap",
             TriageSeverity::Warning,
             "Off-Heap (DirectByteBuffer)",
-            format!(
-                "{} of native memory is held by live DirectByteBuffers — not reflected in the on-heap totals, but counts against process RSS and can trigger OS-level OOM.",
-                format_bytes(cap),
-            ),
+            detail,
             Some(("off-heap-nio", "Off-Heap NIO")),
         ))
     }
@@ -3625,7 +3649,7 @@ mod tests {
         let s = DuplicatePrimArrays
             .eval(&r)
             .expect("large dup-prim waste must fire");
-        assert!(s.detail.contains("20.0 MB"));
+        assert!(s.detail.contains("20.0 MiB"));
 
         // Below floor.
         r.overview

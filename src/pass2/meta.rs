@@ -628,6 +628,9 @@ struct PropsWorklist<'a> {
     stage: u8,
     props_addr: u64,
     table_addr: u64,
+    /// `java.util.Properties.map` — the JDK 9+ `ConcurrentHashMap` that actually
+    /// holds the entries. Non-zero only when `Hashtable.table` was empty.
+    chm_addr: u64,
     entry_addrs: Vec<u64>,
     all_entry_blobs: HashMap<u64, (u64, Vec<u8>)>,
     entry_off_cache: HashMap<u64, EntryOffs>,
@@ -685,44 +688,48 @@ impl<'a> PropsWorklist<'a> {
         };
 
         // If the props instance blob was opportunistically captured during the 2a
-        // scan, derive table_addr immediately and skip stage 0 (the first
-        // collect_blobs round that would otherwise fetch just this blob).
-        let (stage, table_addr) = match prefetched_props_blob {
+        // scan, derive the container address immediately and skip stage 0 (the
+        // first collect_blobs round that would otherwise fetch just this blob).
+        let (stage, table_addr, chm_addr) = match prefetched_props_blob {
             Some((class_id, ref blob)) if props_addr != 0 => {
                 let obj_ref_width = id_size as usize;
-                let off = field_offset(
-                    class_id,
-                    "table",
-                    "java/util/Hashtable",
-                    class_map,
-                    strings,
-                    obj_ref_width,
-                )
-                .and_then(|(o, t)| {
-                    if t == HprofType::Object {
-                        Some(o as usize)
+                let obj_at = |name: &str, owner: &str| -> u64 {
+                    let off = match field_offset(
+                        class_id,
+                        name,
+                        owner,
+                        class_map,
+                        strings,
+                        obj_ref_width,
+                    ) {
+                        Some((o, HprofType::Object)) => o as usize,
+                        _ => return 0,
+                    };
+                    if off + obj_ref_width <= blob.len() {
+                        read_ref(&blob[off..], obj_ref_width)
                     } else {
-                        None
+                        0
                     }
-                })
-                .unwrap_or(0);
-                let taddr = if off != 0 && off + obj_ref_width <= blob.len() {
-                    read_ref(&blob[off..], obj_ref_width)
-                } else {
-                    0
                 };
-                // If we successfully decoded table_addr, start at stage 1
-                // (next_wants at stage 1 requests the table Object[]). Stage 0
-                // requested the props instance which we already have; skipping it
-                // removes one collect_blobs round (~88s on 34GB). If decoding
-                // failed (e.g. non-standard Hashtable layout), fall back to stage 0.
+                // JDK 8: entries live in the inherited `Hashtable.table`.
+                let taddr = obj_at("table", "java/util/Hashtable");
                 if taddr != 0 {
-                    (1u8, taddr)
+                    // Stage 1: next_wants requests the table Object[].
+                    (1u8, taddr, 0u64)
                 } else {
-                    (0u8, 0u64)
+                    // JDK 9+: entries live in `Properties.map`, a
+                    // ConcurrentHashMap. Stage 6 requests that instance.
+                    let caddr = obj_at("map", "java/util/Properties");
+                    if caddr != 0 {
+                        (6u8, 0u64, caddr)
+                    } else {
+                        // Neither layout resolved: fall back to stage 0 and let
+                        // the staged walk rediscover it from the blob itself.
+                        (0u8, 0u64, 0u64)
+                    }
                 }
             }
-            _ => (0u8, 0u64),
+            _ => (0u8, 0u64, 0u64),
         };
 
         Ok(PropsWorklist {
@@ -731,6 +738,7 @@ impl<'a> PropsWorklist<'a> {
             stage,
             props_addr,
             table_addr,
+            chm_addr,
             entry_addrs: Vec::new(),
             all_entry_blobs: HashMap::new(),
             entry_off_cache: HashMap::new(),
@@ -744,46 +752,43 @@ impl<'a> PropsWorklist<'a> {
         })
     }
 
-    /// Resolve `(key_off, value_off, next_off)` for a Hashtable$Entry class.
+    /// Resolve `(key_off, value_off, next_off)` for an entry/node class, trying
+    /// both storage layouts a `java.lang.System.props` can use:
+    ///
+    /// * `java.util.Hashtable$Entry` — `(key, value, next)`. The JDK 8 layout,
+    ///   where `Properties` really did store its entries in `Hashtable.table`.
+    /// * `java.util.concurrent.ConcurrentHashMap$Node` — `(key, val, next)`.
+    ///   The JDK 9+ layout: `Properties` overrides every accessor to use its own
+    ///   `map` field, and `Hashtable.table` stays null forever. Without this the
+    ///   resolver returned nothing at all on any modern JVM.
+    ///
+    /// Returns `None` for any other class (tree bins, forwarding nodes), which
+    /// the callers skip.
     fn entry_offs(&mut self, class_id: u64) -> EntryOffs {
         let class_map = &self.p1.class_map;
         let strings = &self.p1.strings;
         let obj_ref_width = self.obj_ref_width;
         *self.entry_off_cache.entry(class_id).or_insert_with(|| {
-            let key_off = match field_offset(
-                class_id,
-                "key",
-                "java/util/Hashtable$Entry",
-                class_map,
-                strings,
-                obj_ref_width,
-            ) {
-                Some((o, HprofType::Object)) => o as usize,
-                _ => return None,
+            let lookup = |name: &str, owner: &str| -> Option<usize> {
+                match field_offset(class_id, name, owner, class_map, strings, obj_ref_width) {
+                    Some((o, HprofType::Object)) => Some(o as usize),
+                    _ => None,
+                }
             };
-            let value_off = match field_offset(
-                class_id,
-                "value",
-                "java/util/Hashtable$Entry",
-                class_map,
-                strings,
-                obj_ref_width,
-            ) {
-                Some((o, HprofType::Object)) => o as usize,
-                _ => return None,
-            };
-            let next_off = match field_offset(
-                class_id,
-                "next",
-                "java/util/Hashtable$Entry",
-                class_map,
-                strings,
-                obj_ref_width,
-            ) {
-                Some((o, HprofType::Object)) => o as usize,
-                _ => return None,
-            };
-            Some((key_off, value_off, next_off))
+            for (key, val, owner) in [
+                ("key", "value", "java/util/Hashtable$Entry"),
+                ("key", "val", "java/util/concurrent/ConcurrentHashMap$Node"),
+            ] {
+                let (Some(key_off), Some(value_off), Some(next_off)) = (
+                    lookup(key, owner),
+                    lookup(val, owner),
+                    lookup("next", owner),
+                ) else {
+                    continue;
+                };
+                return Some((key_off, value_off, next_off));
+            }
+            None
         })
     }
 
@@ -896,16 +901,28 @@ impl<'a> BlobWorklist for PropsWorklist<'a> {
                 )
             }
             1 => {
-                // R1 ingested (table_addr derived). R2a: the `table` Object[].
-                self.stage = 2;
-                if self.table_addr == 0 {
-                    self.done = true;
-                    empty()
+                // R1 ingested. R2a: the `table` Object[] (JDK 8 layout), or —
+                // when that is null, which it always is on JDK 9+ — the
+                // `ConcurrentHashMap` in `Properties.map`.
+                self.stage = if self.table_addr != 0 {
+                    2
+                } else if self.chm_addr != 0 {
+                    6
                 } else {
+                    self.done = true;
+                    return empty();
+                };
+                if self.stage == 2 {
                     (
                         std::collections::HashSet::new(),
                         std::collections::HashSet::new(),
                         std::iter::once(self.table_addr).collect(),
+                    )
+                } else {
+                    (
+                        std::iter::once(self.chm_addr).collect(),
+                        std::collections::HashSet::new(),
+                        std::collections::HashSet::new(),
                     )
                 }
             }
@@ -982,6 +999,32 @@ impl<'a> BlobWorklist for PropsWorklist<'a> {
                     )
                 }
             }
+            6 => {
+                // JDK 9+ path: the `Properties.map` ConcurrentHashMap instance is
+                // ingested by stage 7, which reads its `table` Node[].
+                self.stage = 7;
+                (
+                    std::iter::once(self.chm_addr).collect(),
+                    std::collections::HashSet::new(),
+                    std::collections::HashSet::new(),
+                )
+            }
+            7 => {
+                // The ConcurrentHashMap's `table` Node[] has been read; from here
+                // the walk is identical to the Hashtable path (stage 2 collects
+                // the non-null slots, stage 3 follows each node's `next` chain).
+                self.stage = 2;
+                if self.table_addr == 0 {
+                    self.done = true;
+                    empty()
+                } else {
+                    (
+                        std::collections::HashSet::new(),
+                        std::collections::HashSet::new(),
+                        std::iter::once(self.table_addr).collect(),
+                    )
+                }
+            }
             _ => {
                 self.done = true;
                 empty()
@@ -995,22 +1038,56 @@ impl<'a> BlobWorklist for PropsWorklist<'a> {
         }
         let obj_ref_width = self.obj_ref_width;
         match self.stage {
-            // stage advanced to 1: R1 props instance → derive table_addr.
+            // stage advanced to 1: R1 props instance → derive table_addr (JDK 8)
+            // or chm_addr (JDK 9+).
             1 => {
                 if let Some(&(class_id, ref blob)) = inst.get(&self.props_addr) {
-                    let off = match field_offset(
+                    let obj_at = |name: &str, owner: &str| -> Option<u64> {
+                        let off = match field_offset(
+                            class_id,
+                            name,
+                            owner,
+                            &self.p1.class_map,
+                            &self.p1.strings,
+                            obj_ref_width,
+                        ) {
+                            Some((o, HprofType::Object)) => o as usize,
+                            _ => return None,
+                        };
+                        if off + obj_ref_width <= blob.len() {
+                            Some(read_ref(&blob[off..], obj_ref_width))
+                        } else {
+                            None
+                        }
+                    };
+                    // JDK 8: `Properties` inherited `Hashtable`'s storage.
+                    self.table_addr = obj_at("table", "java/util/Hashtable").unwrap_or(0);
+                    if self.table_addr == 0 {
+                        // JDK 9+: every accessor is overridden to use
+                        // `Properties.map`, a ConcurrentHashMap, and
+                        // `Hashtable.table` is never populated. Without this
+                        // fallback the whole system-properties resolution
+                        // returned nothing on any modern JVM.
+                        self.chm_addr = obj_at("map", "java/util/Properties").unwrap_or(0);
+                    }
+                }
+            }
+            // stage advanced to 7: the `Properties.map` ConcurrentHashMap instance
+            // → its `table` Node[].
+            7 => {
+                if let Some(&(class_id, ref blob)) = inst.get(&self.chm_addr) {
+                    if let Some((off, HprofType::Object)) = field_offset(
                         class_id,
                         "table",
-                        "java/util/Hashtable",
+                        "java/util/concurrent/ConcurrentHashMap",
                         &self.p1.class_map,
                         &self.p1.strings,
                         obj_ref_width,
                     ) {
-                        Some((o, HprofType::Object)) => o as usize,
-                        _ => 0,
-                    };
-                    if off != 0 && off + obj_ref_width <= blob.len() {
-                        self.table_addr = read_ref(&blob[off..], obj_ref_width);
+                        let o = off as usize;
+                        if o + obj_ref_width <= blob.len() {
+                            self.table_addr = read_ref(&blob[o..], obj_ref_width);
+                        }
                     }
                 }
             }

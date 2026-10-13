@@ -158,6 +158,8 @@
       "default": {
         "anonymous_class_count": 0,
         "direct_byte_buffer_capacity_sum": 0,
+        "direct_byte_buffer_distinct_capacity_sum": 0,
+        "direct_byte_buffer_instance_count": 0,
         "thread_local_null_key_count": 0
       }
     },
@@ -2251,9 +2253,23 @@
           "minimum": 0
         },
         "direct_byte_buffer_capacity_sum": {
-          "description": "Sum of `capacity` fields across all live `DirectByteBuffer` instances,\nrepresenting total off-heap memory tracked by live NIO buffers.",
+          "description": "Sum of `capacity` fields across all live `DirectByteBuffer` instances,\nrepresenting total off-heap memory tracked by live NIO buffers.\n\nThis is an **overlapping sum**: `duplicate()`, `slice()` and\n`asReadOnlyBuffer()` views each report the capacity of memory they\n*share* with their parent, so the same native allocation is counted once\nper view. Treat it as an upper bound. Use\n[`direct_byte_buffer_distinct_capacity_sum`](Self::direct_byte_buffer_distinct_capacity_sum)\nfor the de-duplicated figure.",
           "type": "integer",
           "format": "uint64",
+          "minimum": 0
+        },
+        "direct_byte_buffer_distinct_capacity_sum": {
+          "description": "De-duplicated off-heap total: the size of the union of every\n`DirectByteBuffer`'s `[address, address + capacity)` memory range, so\neach native allocation is counted once however many views share it.\n0 means **not computed** (the JVM has no `java.nio.Buffer.address` field,\ni.e. JDK 22+, or the range bound was exceeded) — never \"zero bytes\".",
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        },
+        "direct_byte_buffer_instance_count": {
+          "description": "Number of `DirectByteBuffer` instances both sums were taken over. The\nratio `capacity_sum / distinct_capacity_sum` is the average number of\nviews per allocation.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
           "minimum": 0
         },
         "thread_local_null_key_count": {
@@ -3292,6 +3308,13 @@
         "frame": {
           "description": "Rendered frame line `class.method (source:line)`.",
           "type": "string"
+        },
+        "frame_number": {
+          "description": "Zero-based index of this frame in the owning thread's `ThreadInfo::frames`\n(top-first). `u32::MAX` marks a frame that has no slot in that list — the\nsynthetic no-frame bucket (JNI locals / native stack) — and is also the\ndeserialization default for reports written before this field existed.\nThe renderer uses it to attach each frame's locals to the right line of\nthe complete stack, including in recursive stacks where every frame\nrenders identically.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 4294967295,
+          "minimum": 0
         },
         "locals": {
           "description": "Significant local objects held at this frame, retained desc.",

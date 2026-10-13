@@ -451,10 +451,22 @@ pub struct Graph {
     /// Pool[0] is always "" (no name). Populated only when `--ref-paths` is set.
     pub field_name_pool: Option<Vec<String>>,
     /// Sum of `capacity` fields across all live `java/nio/DirectByteBuffer`
-    /// instances. 0 when no such instances are found or the field cannot be
-    /// resolved. Computed unconditionally during the pass2 field-decode scan.
+    /// instances. Views (`duplicate()`/`slice()`/`asReadOnlyBuffer()`) each
+    /// carry the capacity of memory they share with their parent, so this
+    /// OVER-counts real native memory. 0 when no such instances are found or
+    /// the field cannot be resolved. Computed unconditionally during the pass2
+    /// field-decode scan.
     #[allow(dead_code)]
     pub direct_byte_buffer_capacity_sum: u64,
+    /// Native bytes actually covered by those buffers once overlapping memory
+    /// ranges are merged — the de-duplicated counterpart of
+    /// `direct_byte_buffer_capacity_sum`. 0 means "not computed" (no `address`
+    /// field on this JVM, or the range bound was exceeded), never "zero bytes".
+    #[allow(dead_code)]
+    pub direct_byte_buffer_distinct_capacity_sum: u64,
+    /// Number of `DirectByteBuffer` instances the two sums were taken over.
+    #[allow(dead_code)]
+    pub direct_byte_buffer_instance_count: u64,
     /// Count of live `ThreadLocal$ThreadLocalMap$Entry` instances whose weak
     /// `referent` (the ThreadLocal key) is null — the classic thread-local leak
     /// signature (cleared key, value still strongly held). Computed during the
@@ -593,6 +605,8 @@ impl Graph {
             fwd_field_name_idx: None,
             field_name_pool: None,
             direct_byte_buffer_capacity_sum: 0,
+            direct_byte_buffer_distinct_capacity_sum: 0,
+            direct_byte_buffer_instance_count: 0,
             thread_local_null_key_count: 0,
             tl_entry_records: Vec::new(),
             unreachable_retained: None,
@@ -2466,6 +2480,8 @@ mod obj_graph_tests {
             fwd_field_name_idx: None,
             field_name_pool: None,
             direct_byte_buffer_capacity_sum: 0,
+            direct_byte_buffer_distinct_capacity_sum: 0,
+            direct_byte_buffer_instance_count: 0,
             thread_local_null_key_count: 0,
             tl_entry_records: vec![],
             unreachable_retained: None,

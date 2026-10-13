@@ -1022,6 +1022,17 @@ pub(crate) struct FieldDecodeState {
     dbb_class_addr_opt: Option<u64>,
     dbb_cap_off_opt: Option<u32>,
     dbb_capacity_sum: u64,
+    /// `(base address, capacity)` for every `DirectByteBuffer` instance seen,
+    /// used to compute the de-duplicated native total in `finish`. Bounded by
+    /// [`MAX_DBB_RANGES`]; when the bound is hit the de-duplicated total is
+    /// reported as unavailable rather than wrong.
+    dbb_ranges: Vec<(u64, u64)>,
+    dbb_ranges_overflowed: bool,
+    /// Offset of `java.nio.Buffer.address` within a `DirectByteBuffer` blob.
+    /// `None` on JVMs that no longer declare it (JDK 22+); the de-duplicated
+    /// total is then unavailable.
+    dbb_addr_off_opt: Option<u32>,
+    dbb_instance_count: u64,
 
     // prim/obj array accumulators
     const_groups: HashMap<(u8, u64, i64), (u64, u64)>,
@@ -1085,6 +1096,10 @@ impl FieldDecodeState {
             dbb_class_addr_opt: None,
             dbb_cap_off_opt: None,
             dbb_capacity_sum: 0,
+            dbb_ranges: Vec::new(),
+            dbb_ranges_overflowed: false,
+            dbb_addr_off_opt: None,
+            dbb_instance_count: 0,
             const_groups: HashMap::new(),
             const_other: (0, 0),
             const_truncated: false,
@@ -1136,13 +1151,56 @@ impl FieldDecodeState {
                 )
                 .map(|(off, _ty)| off)
             });
+            // `java.nio.Buffer.address` is the base address of the memory the
+            // buffer maps. Two buffers with the same base share the same native
+            // allocation, which is what lets us separate real off-heap memory
+            // from views of it. Absent on JDK 22+ (the field was replaced by a
+            // MemorySegment), in which case de-duplication is unavailable.
+            self.dbb_addr_off_opt = self.dbb_class_addr_opt.and_then(|class_addr| {
+                field_offset(
+                    class_addr,
+                    "address",
+                    "java/nio/Buffer",
+                    class_map,
+                    strings,
+                    obj_ref_width,
+                )
+                .map(|(off, _ty)| off)
+            });
         }
         if let (Some(dbb_addr), Some(cap_off)) = (self.dbb_class_addr_opt, self.dbb_cap_off_opt) {
             if class_id == dbb_addr {
                 let o = cap_off as usize;
                 if o + 4 <= blob.len() {
                     let v = i32::from_be_bytes([blob[o], blob[o + 1], blob[o + 2], blob[o + 3]]);
-                    self.dbb_capacity_sum += v.max(0) as u64;
+                    let cap = v.max(0) as u64;
+                    self.dbb_capacity_sum += cap;
+                    self.dbb_instance_count += 1;
+                    // Record the memory range this buffer maps, so `finish` can
+                    // report how much native memory is actually covered once
+                    // overlapping views are merged.
+                    if let Some(addr_off) = self.dbb_addr_off_opt {
+                        let ao = addr_off as usize;
+                        if ao + 8 <= blob.len() {
+                            let base = u64::from_be_bytes([
+                                blob[ao],
+                                blob[ao + 1],
+                                blob[ao + 2],
+                                blob[ao + 3],
+                                blob[ao + 4],
+                                blob[ao + 5],
+                                blob[ao + 6],
+                                blob[ao + 7],
+                            ]);
+                            if base != 0 && cap > 0 {
+                                if self.dbb_ranges.len() < MAX_DBB_RANGES {
+                                    self.dbb_ranges.push((base, cap));
+                                } else {
+                                    self.dbb_ranges_overflowed = true;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1832,7 +1890,15 @@ impl FieldDecodeState {
                 None
             },
             attribution_truncated,
-            self.dbb_capacity_sum,
+            DbbStats {
+                capacity_sum: self.dbb_capacity_sum,
+                distinct_capacity_sum: if self.dbb_ranges_overflowed {
+                    0
+                } else {
+                    union_span_bytes(&mut self.dbb_ranges)
+                },
+                instance_count: self.dbb_instance_count,
+            },
             self.tl_null_key_count,
             self.tl_entry_records,
         ))
@@ -1841,11 +1907,69 @@ impl FieldDecodeState {
 
 // ── Main entry point ─────────────────────────────────────────────────────────
 
+/// Upper bound on the number of `DirectByteBuffer` memory ranges held for the
+/// de-duplicated off-heap total. 4M ranges is 64 MB of `(u64, u64)` — negligible
+/// next to the multi-GB dumps this runs on, and far above the instance counts
+/// real applications reach. Past it the de-duplicated total is reported as
+/// unavailable (0) rather than as a partial sum.
+const MAX_DBB_RANGES: usize = 4_000_000;
+
+/// Off-heap accounting for `java.nio.DirectByteBuffer`, as two numbers plus the
+/// counts needed to read them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DbbStats {
+    /// Sum of the `capacity` field over every `DirectByteBuffer` **instance**.
+    /// Views created by `duplicate()` / `slice()` / `asReadOnlyBuffer()` each
+    /// carry the capacity of memory they *share* with their parent, so this is
+    /// an upper bound on native memory — it can exceed the real total by a large
+    /// factor in view-heavy code.
+    pub capacity_sum: u64,
+    /// Native bytes actually covered once overlapping ranges are merged: the
+    /// size of the union of every buffer's `[address, address + capacity)`.
+    /// Each allocation is counted once regardless of how many views share it.
+    /// 0 means "not computed" (no `address` field on this JVM, or the range
+    /// bound was exceeded) — never "zero bytes".
+    pub distinct_capacity_sum: u64,
+    /// Number of `DirectByteBuffer` instances the sum was taken over.
+    pub instance_count: u64,
+}
+
+/// Size of the union of the given `(base, capacity)` byte ranges. Overlapping
+/// ranges are counted once — a `duplicate()` view shares its parent's base
+/// address, and a `slice()` view starts inside the parent's range, so both
+/// collapse into the parent's extent. Adjacent (touching but not overlapping)
+/// ranges stay separate.
+fn union_span_bytes(ranges: &mut Vec<(u64, u64)>) -> u64 {
+    ranges.retain(|&(_, cap)| cap > 0);
+    ranges.sort_unstable_by_key(|&(base, _)| base);
+    let mut total = 0u64;
+    let mut covered_end: Option<u64> = None;
+    for &(base, cap) in ranges.iter() {
+        let end = base.saturating_add(cap);
+        match covered_end {
+            // Starts inside the range already covered: only the part past the
+            // covered end is new.
+            Some(e) if base < e => {
+                if end > e {
+                    total += end - e;
+                    covered_end = Some(end);
+                }
+            }
+            // Disjoint (or first): a fresh region.
+            _ => {
+                total += cap;
+                covered_end = Some(end);
+            }
+        }
+    }
+    total
+}
+
 /// Return type of [`build_field_decode_views`]: the collection & reference
 /// views, the per-kind referent indices, the optional raw attribution records
 /// (`Some` only under `--collections`), the optional raw fields-by-size groups
-/// (`Some` only under `--collections`), a truncation flag, and the sum of
-/// `capacity` fields across all `java/nio/DirectByteBuffer` instances.
+/// (`Some` only under `--collections`), a truncation flag, and the off-heap
+/// `DirectByteBuffer` accounting.
 type FieldDecodeViews = (
     CollectionsAnalysis,
     ReferencesAnalysis,
@@ -1856,7 +1980,7 @@ type FieldDecodeViews = (
     Option<Vec<CollValuesRaw>>,
     Option<HashMap<u32, (u32, u32)>>, // node_kv: wrapper dense idx → (key, val)
     bool,
-    u64,              // direct_byte_buffer_capacity_sum
+    DbbStats,         // off-heap DirectByteBuffer accounting (sum + de-duplicated)
     u64,              // thread_local_null_key_count
     Vec<(bool, u32)>, // tl_entry_records: (is_stale, value_dense_idx)
 );

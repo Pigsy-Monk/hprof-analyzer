@@ -1,7 +1,7 @@
 # Heap Dump Analysis: `dump_3_par-mnemonics.hprof`
 
 
-_All sizes are binary (1 KB = 1024 bytes, 1 MB = 1024 KB, and so on)._
+_All sizes are binary (1 KiB = 1024 bytes, 1 MiB = 1024 KiB, and so on)._
 
 ----
 
@@ -33,49 +33,50 @@ _All sizes are binary (1 KB = 1024 bytes, 1 MB = 1024 KB, and so on)._
 
 _At-a-glance digest; see the sections below for full detail._
 
-| Metric               |   Value |
-| -------------------- | ------: |
-| Total Reachable Heap | 19.2 MB |
-| Objects              | 517,791 |
-| Classes              |   2,336 |
-| Class Loaders        |       5 |
-| Threads              |      30 |
-| GC Roots             |   1,619 |
+| Metric               |    Value |
+| -------------------- | -------: |
+| Total Reachable Heap | 19.2 MiB |
+| Objects              |  517,791 |
+| Classes              |    2,336 |
+| Class Loaders        |        5 |
+| Threads              |       30 |
+| GC Roots             |    1,619 |
 
 **Top suspects by retained heap**
 
 |  # | Suspect                                                     | Retained | % Heap |
 | -: | ----------------------------------------------------------- | -------: | -----: |
-|  1 | `java.util.concurrent.ForkJoinWorkerThread` (single object) |   8.9 MB |  46.3% |
-|  2 | `java.util.stream.ReduceOps$ReduceTask` (single object)     |   4.2 MB |  22.0% |
-|  3 | `scala.runtime.LazyVals$` (single object)                   |   2.5 MB |  13.0% |
+|  1 | `java.util.concurrent.ForkJoinWorkerThread` (single object) |  8.9 MiB |  46.3% |
+|  2 | `java.util.stream.ReduceOps$ReduceTask` (single object)     |  4.2 MiB |  22.0% |
+|  3 | `scala.runtime.LazyVals$` (single object)                   |  2.5 MiB |  13.0% |
 
 **Likely problem:** retention is spread across several roots; no single object dominates.
 
 ## Memory Triage
 
-_Automated signals pointing to where memory concentrates and what to investigate first. Total reachable heap: 19.2 MB_
+_Automated signals pointing to where memory concentrates and what to investigate first. Total reachable heap: 19.2 MiB_
 
-- **Headline Retainer:** `java.util.concurrent.ForkJoinWorkerThread` (a single object) retains 8.9 MB (46.3% of reachable heap). See [Leak Suspects](#leak-suspects).
+- **Headline Retainer:** `java.util.concurrent.ForkJoinWorkerThread` (a single object) retains 8.9 MiB (46.3% of reachable heap). See [Leak Suspects](#leak-suspects).
 - **Concentration:** diffuse — no suspect exceeds the threshold; retention is spread across multiple roots. Inspect individual suspects to find the most impactful target. See [Leak Suspects](#leak-suspects).
 - **Heap Shape:** deep — long dominator chains suggest nested collections or linked structures; the depth histogram shows the distribution; use the Big Drops table to find the retaining objects — 90% of objects within depth 9, max depth 28. See [Dominator-Depth Distribution](#dominator-depth-distribution).
 - **One Leak or Many:** the single biggest object, `java.util.concurrent.ForkJoinWorkerThread`, retains 46.3% and the top 10 retain 89.9% of the heap; 7 objects each hold ≥1%. See [Top Consumers](#top-consumers).
-- **Thread Pinning:** thread `ForkJoinPool.commonPool-worker-16` retains 8.9 MB (46.3% of heap) via 316 thread-local GC root references — a running thread is pinning a disproportionate share of the heap. Inspect the thread's stack frames and ThreadLocal values. See [Threads](#threads).
-- **Off-Heap (DirectByteBuffer):** 134.3 MB of native memory is held by live DirectByteBuffers — not reflected in the on-heap totals, but counts against process RSS and can trigger OS-level OOM. See [Off-Heap NIO](#off-heap-nio).
-- **Fixed per-Object Header Overhead:** 5.9 MB (30.9% of heap) consumed by JVM object headers alone (517,791 objects × 12 B each) — consider replacing wrapper objects with primitive arrays, off-heap buffers, or primitive-specialized collections. See [Object Header Overhead](#object-header-overhead).
+- **Thread Pinning:** thread `ForkJoinPool.commonPool-worker-16` retains 8.9 MiB (46.3% of heap) via 316 thread-local GC root references — a running thread is pinning a disproportionate share of the heap. Inspect the thread's stack frames and ThreadLocal values. See [Threads](#threads).
+- **Off-Heap (DirectByteBuffer):** 134.3 MiB of native memory (de-duplicated) is held by live DirectByteBuffers — not reflected in the on-heap totals, but counts against process RSS and can trigger OS-level OOM. See [Off-Heap NIO](#off-heap-nio).
+- **Fixed per-Object Header Overhead:** 5.9 MiB (30.9% of heap) consumed by JVM object headers alone (517,791 objects × 12 B each) — consider replacing wrapper objects with primitive arrays, off-heap buffers, or primitive-specialized collections. See [Object Header Overhead](#object-header-overhead).
 - **Empty-Collection Cemetery:** 2,950 of 3,982 tracked collections (74.1%) are empty — pre-allocated but never populated containers waste object-header overhead at scale. Use lazy initialization (allocate only when the first element is added) or return `Collections.emptyList()` / `List.of()` sentinels for the read-only empty case. See [Collections](#collections).
+- **Stale JDK Version:** JVM version `21.0.11+10-1-25.10.2-Ubuntu` (JDK 21) was released ~1023 days before this dump was captured. Update to the latest patch release to rule out known JDK memory bugs and GC regressions. See [System Overview](#system-overview).
 - **Map Entry Objects Dominate Live Set:** 115,624 map-entry objects (`HashMap$Node` / `ConcurrentHashMap$Node` / `LinkedHashMap$Entry`) account for 22.3% of all 517,791 live objects. This means the heap is filled with accumulated key–value pairs — the maps holding them are not being cleared, evicted, or GC'd. Common causes: a cache without an eviction policy; thread-locals that accumulate a map entry per processed item and are never cleared; a batch job that builds in-memory indexes without releasing them between iterations. Identify the owning `HashMap` instances via the Biggest Collections section and trace them up the dominator tree to find the GC root preventing collection. See [Biggest Collections](#biggest-collections).
-- **Component Retention Imbalance:** Component `<boot>` retains 97.6% of heap (115.7 MB) while the next largest component (`java/net/URLClassLoader`) retains only 2.2%. In a multi-module or multi-app deployment (OSGi, EE, Tomcat) this imbalance means one component dominates the heap. Investigate whether a class-loader-scoped cache, static field, or event-listener registration in `<boot>` is accumulating without a release path. See [Top Components](#top-components).
+- **Component Retention Imbalance:** Component `<boot>` retains 97.6% of heap (115.7 MiB) while the next largest component (`java/net/URLClassLoader`) retains only 2.2%. In a multi-module or multi-app deployment (OSGi, EE, Tomcat) this imbalance means one component dominates the heap. Investigate whether a class-loader-scoped cache, static field, or event-listener registration in `<boot>` is accumulating without a release path. See [Top Components](#top-components).
 - **Collection Waste Not Analyzed:** Collection waste not analyzed — re-run with `--collections` to check for wasted capacity.
 
 ## Waste Summary
 
-**2.3 MB** estimated reclaimable across the sources below — duplicate strings, duplicate primitive arrays, boxed primitives, and empty/singleton collection overhead. Fix the biggest category first for the highest impact. Figures are approximate; sources may overlap.
+**2.3 MiB** estimated reclaimable across the sources below — duplicate strings, duplicate primitive arrays, boxed primitives, and empty/singleton collection overhead. Fix the biggest category first for the highest impact. Figures are approximate; sources may overlap.
 
 | Source                                     | Reclaimable |
 | ------------------------------------------ | ----------: |
-| [Under-filled Object Arrays](#collections) |      1.3 MB |
-| [Under-filled Collections](#collections)   |    988.3 KB |
+| [Under-filled Object Arrays](#collections) |     1.3 MiB |
+| [Under-filled Collections](#collections)   |   988.3 KiB |
 
 ## System Overview
 
@@ -83,35 +84,86 @@ _JVM and dump metadata, heap totals, GC root breakdown, class loader sizes, and 
 
 ### Heap Summary
 
-| Property                                | Value                            |
-| --------------------------------------- | -------------------------------- |
-| HPROF Format                            | JAVA PROFILE 1.0.2               |
-| File Size                               | 31.2 MB                          |
-| Identifier Size                         | 64-bit                           |
-| Compressed OOPs                         | Yes                              |
-| Dump Created                            | 2026-07-08T12:44:39Z             |
-| Total Objects                           | 517,791                          |
-| Total Reachable Heap                    | 19.2 MB                          |
-| Off-Heap / On-Heap                      | 134.3 MB off-heap (7.0× on-heap) |
-| GC Roots                                | 1,619                            |
-| Classes Loaded                          | 2,336                            |
-| Class Loaders                           | 5                                |
-| Unreachable (Excluded)                  | 3,908 (1.1 MB)                   |
-| Dead Object Ratio (unreachable / total) | 5.6%                             |
-| Top-Class Retained Concentration        | 73.5%                            |
+| Property                                | Value                                                                         |
+| --------------------------------------- | ----------------------------------------------------------------------------- |
+| HPROF Format                            | JAVA PROFILE 1.0.2                                                            |
+| File Size                               | 31.2 MiB                                                                      |
+| Identifier Size                         | 64-bit                                                                        |
+| Compressed OOPs                         | Yes                                                                           |
+| Dump Created                            | 2026-07-08T12:44:39Z                                                          |
+| JVM Version                             | 21.0.11+10-1-25.10.2-Ubuntu                                                   |
+| Total Objects                           | 517,791                                                                       |
+| Total Reachable Heap                    | 19.2 MiB                                                                      |
+| Off-Heap (sum over instances)           | 134.3 MiB (7.0× on-heap)                                                      |
+| Off-Heap (de-duplicated)                | 134.3 MiB over 8 buffer instances — no shared views, so the two figures agree |
+| GC Roots                                | 1,619                                                                         |
+| Classes Loaded                          | 2,336                                                                         |
+| Class Loaders                           | 5                                                                             |
+| Unreachable (Excluded)                  | 3,908 (1.1 MiB)                                                               |
+| Dead Object Ratio (unreachable / total) | 5.6%                                                                          |
+| Top-Class Retained Concentration        | 73.5%                                                                         |
 
 - **Class loaders (labels):** java/net/URLClassLoader, jdk/internal/loader/ClassLoaders$AppClassLoader, jdk/internal/loader/ClassLoaders$PlatformClassLoader
+
+### System Properties
+
+_The `java.lang.System` property table as it stood when the dump was taken, sorted by key. **This is not the JVM command line:** HPROF records no launch arguments, so `-Xmx`, `-XX:` GC flags and the humongous-allocation threshold are absent from every heap dump (MAT cannot show them either). Heap-limit and GC-mode conclusions must come from outside the dump._
+
+| Property                                 | Value                                                                                                                     |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| file.encoding                            | UTF-8                                                                                                                     |
+| file.separator                           | /                                                                                                                         |
+| java.class.path                          | /home/i560383/renaissance.jar                                                                                             |
+| java.class.version                       | 65.0                                                                                                                      |
+| java.home                                | /usr/lib/jvm/java-21-openjdk-amd64                                                                                        |
+| java.io.tmpdir                           | /tmp                                                                                                                      |
+| java.library.path                        | /usr/java/packages/lib:/usr/lib/x86_64-linux-gnu/jni:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/usr/lib/jni:/lib:/… |
+| java.runtime.name                        | OpenJDK Runtime Environment                                                                                               |
+| java.runtime.version                     | 21.0.11+10-1-25.10.2-Ubuntu                                                                                               |
+| java.specification.name                  | Java Platform API Specification                                                                                           |
+| java.specification.vendor                | Oracle Corporation                                                                                                        |
+| java.specification.version               | 21                                                                                                                        |
+| java.util.logging.SimpleFormatter.format | [%1$tFT%1$tT.%1$tL%1$tz] %3$s (%2$s)%n%4$s: %5$s%n%6$s                                                                    |
+| java.vendor                              | Ubuntu                                                                                                                    |
+| java.vendor.url                          | https://ubuntu.com/                                                                                                       |
+| java.vendor.url.bug                      | https://bugs.launchpad.net/ubuntu/+source/openjdk-21                                                                      |
+| java.version                             | 21.0.11                                                                                                                   |
+| java.version.date                        | 2026-04-21                                                                                                                |
+| java.vm.compressedOopsMode               | 32-bit                                                                                                                    |
+| java.vm.info                             | mixed mode, sharing                                                                                                       |
+| java.vm.name                             | OpenJDK 64-Bit Server VM                                                                                                  |
+| java.vm.specification.name               | Java Virtual Machine Specification                                                                                        |
+| java.vm.specification.vendor             | Oracle Corporation                                                                                                        |
+| java.vm.specification.version            | 21                                                                                                                        |
+| java.vm.vendor                           | Ubuntu                                                                                                                    |
+| java.vm.version                          | 21.0.11+10-1-25.10.2-Ubuntu                                                                                               |
+| jdk.debug                                | release                                                                                                                   |
+| line.separator                           |                                                                                                                           |
+| native.encoding                          | UTF-8                                                                                                                     |
+| os.arch                                  | amd64                                                                                                                     |
+| os.name                                  | Linux                                                                                                                     |
+| os.version                               | 6.17.0-40-generic                                                                                                         |
+| path.separator                           | :                                                                                                                         |
+| stderr.encoding                          | UTF-8                                                                                                                     |
+| stdout.encoding                          | UTF-8                                                                                                                     |
+| sun.arch.data.model                      | 64                                                                                                                        |
+| sun.boot.library.path                    | /usr/lib/jvm/java-21-openjdk-amd64/lib                                                                                    |
+| sun.cpu.endian                           | little                                                                                                                    |
+| sun.io.unicode.encoding                  | UnicodeLittle                                                                                                             |
+| sun.java.command                         | /home/i560383/renaissance.jar par-mnemonics -r 4                                                                          |
+
+_… (+9 more properties not shown)_
 
 ### GC Roots by Type
 
 _GC roots are the entry points where the JVM starts reachability scanning — anything reachable from a root stays alive. Common root types: thread-stack locals, JNI global references, static fields of loaded classes, and synchronized lock objects._
 
-| Root Type    | Count | % of Roots | Retained |                  | Top Retained Classes                                                                                                                             |
-| ------------ | ----: | ---------: | -------: | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Thread       |    33 |       2.0% |   9.2 MB | ████████████████ | `java.util.concurrent.ForkJoinWorkerThread` ×26 (8.9 MB), `java.lang.Thread` ×4 (302.3 KB), `java.lang.ref.Finalizer$FinalizerThread` ×1 (208 B) |
-| Sticky Class | 1,478 |      90.8% | 887.1 KB | █▌               | `java.lang.Class` ×1,478 (887.1 KB)                                                                                                              |
-| JNI Global   |   108 |       6.6% | 125.8 KB | ▏                | `java.lang.Object[]` ×2 (105.7 KB), `java.lang.invoke.MethodType` ×53 (9.0 KB), `java.lang.Thread` ×21 (5.4 KB)                                  |
-| System Class |     8 |       0.5% |      0 B |                  | `java.lang.Class` ×8 (0 B)                                                                                                                       |
+| Root Type    | Count | % of Roots |  Retained |                  | Top Retained Classes                                                                                                                               |
+| ------------ | ----: | ---------: | --------: | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Thread       |    33 |       2.0% |   9.2 MiB | ████████████████ | `java.util.concurrent.ForkJoinWorkerThread` ×26 (8.9 MiB), `java.lang.Thread` ×4 (302.3 KiB), `java.lang.ref.Finalizer$FinalizerThread` ×1 (208 B) |
+| Sticky Class | 1,478 |      90.8% | 887.1 KiB | █▌               | `java.lang.Class` ×1,478 (887.1 KiB)                                                                                                               |
+| JNI Global   |   108 |       6.6% | 125.8 KiB | ▏                | `java.lang.Object[]` ×2 (105.7 KiB), `java.lang.invoke.MethodType` ×53 (9.0 KiB), `java.lang.Thread` ×21 (5.4 KiB)                                 |
+| System Class |     8 |       0.5% |       0 B |                  | `java.lang.Class` ×8 (0 B)                                                                                                                         |
 
 ### Heap Composition
 
@@ -119,10 +171,10 @@ _Shallow heap broken down by object kind: instances, object arrays, primitive ar
 
 | Kind             | Objects | Shallow Heap |                  |
 | ---------------- | ------: | -----------: | ---------------- |
-| Instances        | 388,187 |       8.9 MB | ████████████████ |
-| Object Arrays    |   4,808 |       1.7 MB | ███              |
-| Primitive Arrays | 122,460 |       8.5 MB | ███████████████▏ |
-| Class Objects    |   2,336 |      30.1 KB | ▏                |
+| Instances        | 388,187 |      8.9 MiB | ████████████████ |
+| Object Arrays    |   4,808 |      1.7 MiB | ███              |
+| Primitive Arrays | 122,460 |      8.5 MiB | ███████████████▏ |
+| Class Objects    |   2,336 |     30.1 KiB | ▏                |
 
 ### Dump Completeness
 
@@ -158,71 +210,71 @@ _Duplicate-string analysis not run — pass `--find-duplicates` to enable._
 
 _Every loaded class with its instance count, shallow heap (own bytes), and retained heap (bytes freed when all instances become unreachable). Top 50 shown._
 
-|  # | Class                                             | Instances |  Shallow |  Largest | Retained | % Heap |                  |
-| -: | ------------------------------------------------- | --------: | -------: | -------: | -------: | -----: | ---------------- |
-|  1 | `java.util.HashMap$Node[]`                        |       422 | 875.0 KB | 512.0 KB |  14.1 MB |  73.5% | ████████████████ |
-|  2 | `java.util.HashMap`                               |       422 |  19.8 KB |     48 B |  14.0 MB |  73.2% | ███████████████▉ |
-|  3 | `java.util.HashMap$Node`                          |   108,445 |   3.3 MB |     32 B |  13.3 MB |  69.2% | ███████████████  |
-|  4 | `java.util.HashSet`                               |       255 |   4.0 KB |     16 B |  13.1 MB |  68.1% | ██████████████▊  |
-|  5 | `java.util.stream.ReduceOps$3ReducingSink`        |        25 |    800 B |     32 B |  13.0 MB |  67.8% | ██████████████▊  |
-|  6 | `java.lang.String`                                |   120,581 |   2.8 MB |     24 B |  10.5 MB |  54.7% | ███████████▉     |
-|  7 | `java.util.concurrent.ForkJoinWorkerThread`       |        26 |   2.8 KB |    112 B |   8.9 MB |  46.3% | ██████████       |
-|  8 | `byte[]`                                          |   121,297 |   8.3 MB | 255.1 KB |   8.3 MB |  43.3% | █████████▍       |
-|  9 | `java.util.stream.ReduceOps$ReduceTask`           |         9 |    576 B |     64 B |   4.2 MB |  22.0% | ████▊            |
-| 10 | `java.lang.Class`                                 |     2,345 |  30.7 KB |   1.1 KB |   3.5 MB |  18.1% | ███▉             |
-| 11 | `java.lang.Object[]`                              |     2,410 | 726.9 KB | 512.0 KB |   2.9 MB |  15.2% | ███▎             |
-| 12 | `scala.runtime.LazyVals$`                         |         1 |     16 B |     16 B |   2.5 MB |  13.0% | ██▊              |
-| 13 | `java.lang.Object`                                |   133,001 |   2.0 MB |     16 B |   2.0 MB |  10.6% | ██▎              |
-| 14 | `java.lang.ref.SoftReference`                     |       149 |   5.8 KB |     40 B | 605.3 KB |   3.1% | ▋                |
-| 15 | `java.util.jar.JarFile`                           |         7 |    448 B |     64 B | 593.3 KB |   3.0% | ▋                |
-| 16 | `java.util.jar.Manifest`                          |         6 |    144 B |     24 B | 590.3 KB |   3.0% | ▋                |
-| 17 | `java.util.concurrent.ConcurrentHashMap`          |       118 |   7.4 KB |     64 B | 527.8 KB |   2.7% | ▌                |
-| 18 | `java.util.concurrent.ConcurrentHashMap$Node[]`   |        93 |  54.1 KB |   8.0 KB | 525.0 KB |   2.7% | ▌                |
-| 19 | `java.util.zip.ZipFile$Source`                    |         7 |    560 B |     80 B | 446.6 KB |   2.3% | ▍                |
-| 20 | `java.util.concurrent.ConcurrentHashMap$Node`     |     6,000 | 187.5 KB |     32 B | 395.1 KB |   2.0% | ▍                |
-| 21 | `java.util.LinkedHashMap`                         |     2,935 | 183.4 KB |     64 B | 338.1 KB |   1.7% | ▎                |
-| 22 | `java.lang.Thread`                                |        27 |   2.7 KB |    104 B | 308.4 KB |   1.6% | ▎                |
-| 23 | `java.util.jar.Attributes`                        |     2,895 |  45.2 KB |     16 B | 238.4 KB |   1.2% | ▎                |
-| 24 | `java.time.zone.ZoneRulesProvider`                |         0 |      0 B |      0 B | 198.4 KB |   1.0% | ▏                |
-| 25 | `org.renaissance.core.ModuleLoader`               |         2 |     48 B |     24 B | 149.8 KB |   0.8% | ▏                |
-| 26 | `sun.util.calendar.ZoneInfoFile`                  |         0 |      0 B |      0 B | 145.4 KB |   0.7% | ▏                |
-| 27 | `java.util.LinkedHashMap$Entry`                   |     1,179 |  46.1 KB |     40 B | 145.1 KB |   0.7% | ▏                |
-| 28 | `java.util.LinkedHashSet`                         |        38 |    608 B |     16 B | 144.6 KB |   0.7% | ▏                |
-| 29 | `java.lang.invoke.MethodType`                     |       692 |  27.0 KB |     40 B | 134.6 KB |   0.7% | ▏                |
-| 30 | `java.time.zone.TzdbZoneRulesProvider`            |         1 |     24 B |     24 B | 118.2 KB |   0.6% | ▏                |
-| 31 | `int[]`                                           |       899 | 106.8 KB |  34.3 KB | 106.8 KB |   0.5% | ▏                |
-| 32 | `byte[][]`                                        |         1 |   1.4 KB |   1.4 KB |  94.1 KB |   0.5% | ▏                |
-| 33 | `java.util.ImmutableCollections$SetN`             |       149 |   3.5 KB |     24 B |  91.5 KB |   0.5% | ▏                |
-| 34 | `sun.security.util.KnownOIDs`                     |       264 |  10.3 KB |     40 B |  88.5 KB |   0.5% | ▏                |
-| 35 | `java.util.ArrayList`                             |       607 |  14.2 KB |     24 B |  82.0 KB |   0.4% | ▏                |
-| 36 | `java.net.URLClassLoader`                         |         2 |    176 B |     88 B |  81.0 KB |   0.4% | ▏                |
-| 37 | `org.renaissance.core.BenchmarkSuite`             |         1 |     32 B |     32 B |  77.0 KB |   0.4% | ▏                |
-| 38 | `java.util.Optional`                              |         4 |     64 B |     16 B |  73.9 KB |   0.4% | ▏                |
-| 39 | `java.lang.Module`                                |        70 |   3.3 KB |     48 B |  65.5 KB |   0.3% | ▏                |
-| 40 | `sun.util.cldr.CLDRLocaleProviderAdapter`         |         1 |     80 B |     80 B |  62.6 KB |   0.3% | ▏                |
-| 41 | `sun.util.locale.provider.LocaleProviderAdapter`  |         0 |      0 B |      0 B |  62.3 KB |   0.3% | ▏                |
-| 42 | `java.lang.invoke.MemberName`                     |       814 |  31.8 KB |     40 B |  58.3 KB |   0.3% | ▏                |
-| 43 | `char[]`                                          |       223 |  55.7 KB |  16.0 KB |  55.7 KB |   0.3% | ▏                |
-| 44 | `sun.security.provider.Sun`                       |         1 |    104 B |    104 B |  53.7 KB |   0.3% | ▏                |
-| 45 | `jdk.internal.loader.ClassLoaders$AppClassLoader` |         1 |     96 B |     96 B |  53.0 KB |   0.3% | ▏                |
-| 46 | `java.lang.invoke.LambdaForm`                     |       140 |   6.6 KB |     48 B |  52.6 KB |   0.3% | ▏                |
-| 47 | `sun.util.resources.Bundles`                      |         0 |      0 B |      0 B |  49.2 KB |   0.3% | ▏                |
-| 48 | `jdk.internal.util.ReferencedKeyMap`              |         1 |     24 B |     24 B |  48.8 KB |   0.2% | ▏                |
-| 49 | `jdk.internal.util.ReferencedKeySet`              |         1 |     16 B |     16 B |  48.7 KB |   0.2% | ▏                |
-| 50 | `java.lang.module.ModuleDescriptor`               |        62 |   3.9 KB |     64 B |  40.1 KB |   0.2% | ▏                |
-_… 2,394 more classes, 388.8 KB shallow / 1.5 MB retained (see HTML report for full list)._
+|  # | Class                                             | Instances |   Shallow |   Largest |  Retained | % Heap |                  |
+| -: | ------------------------------------------------- | --------: | --------: | --------: | --------: | -----: | ---------------- |
+|  1 | `java.util.HashMap$Node[]`                        |       422 | 875.0 KiB | 512.0 KiB |  14.1 MiB |  73.5% | ████████████████ |
+|  2 | `java.util.HashMap`                               |       422 |  19.8 KiB |      48 B |  14.0 MiB |  73.2% | ███████████████▉ |
+|  3 | `java.util.HashMap$Node`                          |   108,445 |   3.3 MiB |      32 B |  13.3 MiB |  69.2% | ███████████████  |
+|  4 | `java.util.HashSet`                               |       255 |   4.0 KiB |      16 B |  13.1 MiB |  68.1% | ██████████████▊  |
+|  5 | `java.util.stream.ReduceOps$3ReducingSink`        |        25 |     800 B |      32 B |  13.0 MiB |  67.8% | ██████████████▊  |
+|  6 | `java.lang.String`                                |   120,581 |   2.8 MiB |      24 B |  10.5 MiB |  54.7% | ███████████▉     |
+|  7 | `java.util.concurrent.ForkJoinWorkerThread`       |        26 |   2.8 KiB |     112 B |   8.9 MiB |  46.3% | ██████████       |
+|  8 | `byte[]`                                          |   121,297 |   8.3 MiB | 255.1 KiB |   8.3 MiB |  43.3% | █████████▍       |
+|  9 | `java.util.stream.ReduceOps$ReduceTask`           |         9 |     576 B |      64 B |   4.2 MiB |  22.0% | ████▊            |
+| 10 | `java.lang.Class`                                 |     2,345 |  30.7 KiB |   1.1 KiB |   3.5 MiB |  18.1% | ███▉             |
+| 11 | `java.lang.Object[]`                              |     2,410 | 726.9 KiB | 512.0 KiB |   2.9 MiB |  15.2% | ███▎             |
+| 12 | `scala.runtime.LazyVals$`                         |         1 |      16 B |      16 B |   2.5 MiB |  13.0% | ██▊              |
+| 13 | `java.lang.Object`                                |   133,001 |   2.0 MiB |      16 B |   2.0 MiB |  10.6% | ██▎              |
+| 14 | `java.lang.ref.SoftReference`                     |       149 |   5.8 KiB |      40 B | 605.3 KiB |   3.1% | ▋                |
+| 15 | `java.util.jar.JarFile`                           |         7 |     448 B |      64 B | 593.3 KiB |   3.0% | ▋                |
+| 16 | `java.util.jar.Manifest`                          |         6 |     144 B |      24 B | 590.3 KiB |   3.0% | ▋                |
+| 17 | `java.util.concurrent.ConcurrentHashMap`          |       118 |   7.4 KiB |      64 B | 527.8 KiB |   2.7% | ▌                |
+| 18 | `java.util.concurrent.ConcurrentHashMap$Node[]`   |        93 |  54.1 KiB |   8.0 KiB | 525.0 KiB |   2.7% | ▌                |
+| 19 | `java.util.zip.ZipFile$Source`                    |         7 |     560 B |      80 B | 446.6 KiB |   2.3% | ▍                |
+| 20 | `java.util.concurrent.ConcurrentHashMap$Node`     |     6,000 | 187.5 KiB |      32 B | 395.1 KiB |   2.0% | ▍                |
+| 21 | `java.util.LinkedHashMap`                         |     2,935 | 183.4 KiB |      64 B | 338.1 KiB |   1.7% | ▎                |
+| 22 | `java.lang.Thread`                                |        27 |   2.7 KiB |     104 B | 308.4 KiB |   1.6% | ▎                |
+| 23 | `java.util.jar.Attributes`                        |     2,895 |  45.2 KiB |      16 B | 238.4 KiB |   1.2% | ▎                |
+| 24 | `java.time.zone.ZoneRulesProvider`                |         0 |       0 B |       0 B | 198.4 KiB |   1.0% | ▏                |
+| 25 | `org.renaissance.core.ModuleLoader`               |         2 |      48 B |      24 B | 149.8 KiB |   0.8% | ▏                |
+| 26 | `sun.util.calendar.ZoneInfoFile`                  |         0 |       0 B |       0 B | 145.4 KiB |   0.7% | ▏                |
+| 27 | `java.util.LinkedHashMap$Entry`                   |     1,179 |  46.1 KiB |      40 B | 145.1 KiB |   0.7% | ▏                |
+| 28 | `java.util.LinkedHashSet`                         |        38 |     608 B |      16 B | 144.6 KiB |   0.7% | ▏                |
+| 29 | `java.lang.invoke.MethodType`                     |       692 |  27.0 KiB |      40 B | 134.6 KiB |   0.7% | ▏                |
+| 30 | `java.time.zone.TzdbZoneRulesProvider`            |         1 |      24 B |      24 B | 118.2 KiB |   0.6% | ▏                |
+| 31 | `int[]`                                           |       899 | 106.8 KiB |  34.3 KiB | 106.8 KiB |   0.5% | ▏                |
+| 32 | `byte[][]`                                        |         1 |   1.4 KiB |   1.4 KiB |  94.1 KiB |   0.5% | ▏                |
+| 33 | `java.util.ImmutableCollections$SetN`             |       149 |   3.5 KiB |      24 B |  91.5 KiB |   0.5% | ▏                |
+| 34 | `sun.security.util.KnownOIDs`                     |       264 |  10.3 KiB |      40 B |  88.5 KiB |   0.5% | ▏                |
+| 35 | `java.util.ArrayList`                             |       607 |  14.2 KiB |      24 B |  82.0 KiB |   0.4% | ▏                |
+| 36 | `java.net.URLClassLoader`                         |         2 |     176 B |      88 B |  81.0 KiB |   0.4% | ▏                |
+| 37 | `org.renaissance.core.BenchmarkSuite`             |         1 |      32 B |      32 B |  77.0 KiB |   0.4% | ▏                |
+| 38 | `java.util.Optional`                              |         4 |      64 B |      16 B |  73.9 KiB |   0.4% | ▏                |
+| 39 | `java.lang.Module`                                |        70 |   3.3 KiB |      48 B |  65.5 KiB |   0.3% | ▏                |
+| 40 | `sun.util.cldr.CLDRLocaleProviderAdapter`         |         1 |      80 B |      80 B |  62.6 KiB |   0.3% | ▏                |
+| 41 | `sun.util.locale.provider.LocaleProviderAdapter`  |         0 |       0 B |       0 B |  62.3 KiB |   0.3% | ▏                |
+| 42 | `java.lang.invoke.MemberName`                     |       814 |  31.8 KiB |      40 B |  58.3 KiB |   0.3% | ▏                |
+| 43 | `char[]`                                          |       223 |  55.7 KiB |  16.0 KiB |  55.7 KiB |   0.3% | ▏                |
+| 44 | `sun.security.provider.Sun`                       |         1 |     104 B |     104 B |  53.7 KiB |   0.3% | ▏                |
+| 45 | `jdk.internal.loader.ClassLoaders$AppClassLoader` |         1 |      96 B |      96 B |  53.0 KiB |   0.3% | ▏                |
+| 46 | `java.lang.invoke.LambdaForm`                     |       140 |   6.6 KiB |      48 B |  52.6 KiB |   0.3% | ▏                |
+| 47 | `sun.util.resources.Bundles`                      |         0 |       0 B |       0 B |  49.2 KiB |   0.3% | ▏                |
+| 48 | `jdk.internal.util.ReferencedKeyMap`              |         1 |      24 B |      24 B |  48.8 KiB |   0.2% | ▏                |
+| 49 | `jdk.internal.util.ReferencedKeySet`              |         1 |      16 B |      16 B |  48.7 KiB |   0.2% | ▏                |
+| 50 | `java.lang.module.ModuleDescriptor`               |        62 |   3.9 KiB |      64 B |  40.1 KiB |   0.2% | ▏                |
+_… 2,394 more classes, 388.8 KiB shallow / 1.5 MiB retained (see HTML report for full list)._
 
 ### Class Loaders
 
 _Classes grouped by the loader that defined them. Growing loaders (e.g. web-app or plugin loaders redeployed multiple times) are a common source of metaspace and heap leaks. The **Loader** column shows the loader's class (e.g. `java/net/URLClassLoader`), not an instance name — the hprof format does not record loader names. Multiple rows with the same loader class are distinct loader instances; many such instances each holding significant heap can signal a class-loader leak._
 
-| Loader                                               | Classes | Instances | Shallow | Retained |                  |
-| ---------------------------------------------------- | ------: | --------: | ------: | -------: | ---------------- |
-| <boot>                                               |   1,748 |   517,340 | 19.2 MB | 115.7 MB | ████████████████ |
-| java/net/URLClassLoader                              |     575 |       330 | 18.0 KB |   2.6 MB | ▎                |
-| jdk/internal/loader/ClassLoaders$AppClassLoader      |      90 |        68 |  1.4 KB | 238.0 KB | ▏                |
-| java/net/URLClassLoader                              |      30 |        52 |  1.0 KB |  11.6 KB | ▏                |
-| jdk/internal/loader/ClassLoaders$PlatformClassLoader |       1 |         1 |    16 B |   7.4 KB | ▏                |
+| Loader                                               | Classes | Instances |  Shallow |  Retained |                  |
+| ---------------------------------------------------- | ------: | --------: | -------: | --------: | ---------------- |
+| <boot>                                               |   1,748 |   517,340 | 19.2 MiB | 115.7 MiB | ████████████████ |
+| java/net/URLClassLoader                              |     575 |       330 | 18.0 KiB |   2.6 MiB | ▎                |
+| jdk/internal/loader/ClassLoaders$AppClassLoader      |      90 |        68 |  1.4 KiB | 238.0 KiB | ▏                |
+| java/net/URLClassLoader                              |      30 |        52 |  1.0 KiB |  11.6 KiB | ▏                |
+| jdk/internal/loader/ClassLoaders$PlatformClassLoader |       1 |         1 |     16 B |   7.4 KiB | ▏                |
 
 ## Leak Suspects
 
@@ -230,17 +282,17 @@ _Objects and class groups retaining the most heap, ranked by retained size — t
 
 |  # | Suspect                                     | Retained | % Heap |                  |
 | -: | ------------------------------------------- | -------: | -----: | ---------------- |
-|  1 | `java.util.concurrent.ForkJoinWorkerThread` |   8.9 MB |  46.3% | ████████████████ |
-|  2 | `java.util.stream.ReduceOps$ReduceTask`     |   4.2 MB |  22.0% | ███████▌         |
-|  3 | `scala.runtime.LazyVals$`                   |   2.5 MB |  13.0% | ████▌            |
+|  1 | `java.util.concurrent.ForkJoinWorkerThread` |  8.9 MiB |  46.3% | ████████████████ |
+|  2 | `java.util.stream.ReduceOps$ReduceTask`     |  4.2 MiB |  22.0% | ███████▌         |
+|  3 | `scala.runtime.LazyVals$`                   |  2.5 MiB |  13.0% | ████▌            |
 
-### 1. `java.util.concurrent.ForkJoinWorkerThread` — retains 8.9 MB (46.3% of reachable heap)
+### 1. `java.util.concurrent.ForkJoinWorkerThread` — retains 8.9 MiB (46.3% of reachable heap)
 
 One `java.util.concurrent.ForkJoinWorkerThread` object (shallow 112 B) dominates this retained heap.
 
 Held by a **Thread** GC root.
 
-Retained heap accumulates at `java.util.HashMap$Node[]` (retained 8.4 MB).
+Retained heap accumulates at `java.util.HashMap$Node[]` (retained 8.4 MiB).
 
 **Accumulated objects (top 50 by retained heap):**
 
@@ -303,16 +355,16 @@ _Directly dominates 51,370 objects (showing top 1 classes by retained heap)._
 
 | Class                    | Instances | Shallow | Retained | % of Suspect |
 | ------------------------ | --------: | ------: | -------: | -----------: |
-| `java.util.HashMap$Node` |    51,370 |  1.6 MB |   7.9 MB |        89.1% |
+| `java.util.HashMap$Node` |    51,370 | 1.6 MiB |  7.9 MiB |        89.1% |
 
 **Dominator chain to GC root:**
 
-1. `java.util.concurrent.ForkJoinWorkerThread` (8.9 MB) — GC root: Thread (this object is directly held by a GC root; no intermediate chain)
+1. `java.util.concurrent.ForkJoinWorkerThread` (8.9 MiB) — GC root: Thread (this object is directly held by a GC root; no intermediate chain)
 
 **Dominator subtree:**
 
 ```
-java.util.HashMap$Node[] (shallow 512.0 KB, retained 8.4 MB)
+java.util.HashMap$Node[] (shallow 512.0 KiB, retained 8.4 MiB)
 ├─ java.util.HashMap$Node (shallow 32 B, retained 768 B)
    ├─ java.util.HashMap$Node (shallow 32 B, retained 640 B)
    │  ├─ java.util.HashMap$Node (shallow 32 B, retained 512 B)
@@ -5314,11 +5366,11 @@ java.util.HashMap$Node[] (shallow 512.0 KB, retained 8.4 MB)
 └─ java.util.HashMap$Node (shallow 32 B, retained 384 B)
 ```
 
-### 2. `java.util.stream.ReduceOps$ReduceTask` — retains 4.2 MB (22.0% of reachable heap)
+### 2. `java.util.stream.ReduceOps$ReduceTask` — retains 4.2 MiB (22.0% of reachable heap)
 
 One `java.util.stream.ReduceOps$ReduceTask` object (shallow 64 B) dominates this retained heap.
 
-Retained heap accumulates at `java.util.HashMap$Node[]` (retained 4.2 MB).
+Retained heap accumulates at `java.util.HashMap$Node[]` (retained 4.2 MiB).
 
 **Accumulated objects (top 50 by retained heap):**
 
@@ -5379,18 +5431,18 @@ _Directly dominates 25,551 objects (showing top 1 classes by retained heap)._
 
 **Accumulated objects by class:**
 
-| Class                    | Instances |  Shallow | Retained | % of Suspect |
-| ------------------------ | --------: | -------: | -------: | -----------: |
-| `java.util.HashMap$Node` |    25,551 | 798.5 KB |   4.0 MB |        94.1% |
+| Class                    | Instances |   Shallow | Retained | % of Suspect |
+| ------------------------ | --------: | --------: | -------: | -----------: |
+| `java.util.HashMap$Node` |    25,551 | 798.5 KiB |  4.0 MiB |        94.1% |
 
 **Dominator chain to GC root:**
 
-1. `java.util.stream.ReduceOps$ReduceTask` (4.2 MB)
+1. `java.util.stream.ReduceOps$ReduceTask` (4.2 MiB)
 
 **Dominator subtree:**
 
 ```
-java.util.HashMap$Node[] (shallow 256.0 KB, retained 4.2 MB)
+java.util.HashMap$Node[] (shallow 256.0 KiB, retained 4.2 MiB)
 ├─ java.util.HashMap$Node (shallow 32 B, retained 768 B)
    ├─ java.util.HashMap$Node (shallow 32 B, retained 640 B)
    │  ├─ java.util.HashMap$Node (shallow 32 B, retained 512 B)
@@ -10392,11 +10444,11 @@ java.util.HashMap$Node[] (shallow 256.0 KB, retained 4.2 MB)
 └─ java.util.HashMap$Node (shallow 32 B, retained 384 B)
 ```
 
-### 3. `scala.runtime.LazyVals$` — retains 2.5 MB (13.0% of reachable heap)
+### 3. `scala.runtime.LazyVals$` — retains 2.5 MiB (13.0% of reachable heap)
 
 One `scala.runtime.LazyVals$` object (shallow 32 B) dominates this retained heap.
 
-Retained heap accumulates at `java.lang.Object[]` (retained 2.5 MB).
+Retained heap accumulates at `java.lang.Object[]` (retained 2.5 MiB).
 
 **Accumulated objects (top 50 by retained heap):**
 
@@ -10459,16 +10511,16 @@ _Directly dominates 131,072 objects (showing top 1 classes by retained heap)._
 
 | Class              | Instances | Shallow | Retained | % of Suspect |
 | ------------------ | --------: | ------: | -------: | -----------: |
-| `java.lang.Object` |   131,072 |  2.0 MB |   2.0 MB |        80.0% |
+| `java.lang.Object` |   131,072 | 2.0 MiB |  2.0 MiB |        80.0% |
 
 **Dominator chain to GC root:**
 
-1. `scala.runtime.LazyVals$` (2.5 MB)
+1. `scala.runtime.LazyVals$` (2.5 MiB)
 
 **Dominator subtree:**
 
 ```
-java.lang.Object[] (shallow 512.0 KB, retained 2.5 MB)
+java.lang.Object[] (shallow 512.0 KiB, retained 2.5 MiB)
 ├─ java.lang.Object (shallow 16 B, retained 16 B)
 ├─ java.lang.Object (shallow 16 B, retained 16 B)
 ├─ java.lang.Object (shallow 16 B, retained 16 B)
@@ -15478,112 +15530,112 @@ _Biggest objects, classes, and packages by retained heap. Unlike Leak Suspects, 
 
 _All top-level dominators ranked by retained heap — every object directly held by a GC root, sorted largest first._
 
-|  # | Class                                                  | Shallow | Retained | % Heap |                  |
-| -: | ------------------------------------------------------ | ------: | -------: | -----: | ---------------- |
-|  1 | `java.util.concurrent.ForkJoinWorkerThread`            |   112 B |   8.9 MB |  46.3% | ████████████████ |
-|  2 | `java.util.stream.ReduceOps$ReduceTask`                |    64 B |   4.2 MB |  22.0% | ███████▌         |
-|  3 | `scala.runtime.LazyVals$`                              |    32 B |   2.5 MB |  13.0% | ████▌            |
-|  4 | `java.util.jar.JarFile`                                |    64 B | 585.1 KB |   3.0% | █                |
-|  5 | `java.lang.Thread`                                     |   104 B | 301.5 KB |   1.5% | ▌                |
-|  6 | `java.util.zip.ZipFile$Source`                         |    80 B | 295.2 KB |   1.5% | ▌                |
-|  7 | `java.time.zone.ZoneRulesProvider`                     |    16 B | 198.4 KB |   1.0% | ▎                |
-|  8 | `sun.util.calendar.ZoneInfoFile`                       |   120 B | 145.4 KB |   0.7% | ▎                |
-|  9 | `sun.security.util.KnownOIDs`                          |  1.1 KB |  88.5 KB |   0.5% | ▏                |
-| 10 | `java.lang.Object[]`                                   |  8.9 KB |  74.7 KB |   0.4% | ▏                |
-| 11 | `java.net.URLClassLoader`                              |    88 B |  74.5 KB |   0.4% | ▏                |
-| 12 | `java.util.zip.ZipFile$Source`                         |    80 B |  68.2 KB |   0.3% | ▏                |
-| 13 | `sun.util.locale.provider.LocaleProviderAdapter`       |    24 B |  62.3 KB |   0.3% | ▏                |
-| 14 | `sun.security.provider.Sun`                            |   104 B |  53.7 KB |   0.3% | ▏                |
-| 15 | `jdk.internal.loader.ClassLoaders$AppClassLoader`      |    96 B |  53.0 KB |   0.3% | ▏                |
-| 16 | `java.util.zip.ZipFile$Source`                         |    80 B |  52.5 KB |   0.3% | ▏                |
-| 17 | `sun.util.resources.Bundles`                           |    24 B |  49.2 KB |   0.3% | ▏                |
-| 18 | `java.lang.invoke.MethodType`                          |    48 B |  49.0 KB |   0.2% | ▏                |
-| 19 | `java.util.concurrent.ConcurrentHashMap`               |    64 B |  34.0 KB |   0.2% | ▏                |
-| 20 | `jdk.internal.loader.ClassLoaders$PlatformClassLoader` |    96 B |  32.8 KB |   0.2% | ▏                |
+|  # | Class                                                  | Shallow |  Retained | % Heap |                  |
+| -: | ------------------------------------------------------ | ------: | --------: | -----: | ---------------- |
+|  1 | `java.util.concurrent.ForkJoinWorkerThread`            |   112 B |   8.9 MiB |  46.3% | ████████████████ |
+|  2 | `java.util.stream.ReduceOps$ReduceTask`                |    64 B |   4.2 MiB |  22.0% | ███████▌         |
+|  3 | `scala.runtime.LazyVals$`                              |    32 B |   2.5 MiB |  13.0% | ████▌            |
+|  4 | `java.util.jar.JarFile`                                |    64 B | 585.1 KiB |   3.0% | █                |
+|  5 | `java.lang.Thread`                                     |   104 B | 301.5 KiB |   1.5% | ▌                |
+|  6 | `java.util.zip.ZipFile$Source`                         |    80 B | 295.2 KiB |   1.5% | ▌                |
+|  7 | `java.time.zone.ZoneRulesProvider`                     |    16 B | 198.4 KiB |   1.0% | ▎                |
+|  8 | `sun.util.calendar.ZoneInfoFile`                       |   120 B | 145.4 KiB |   0.7% | ▎                |
+|  9 | `sun.security.util.KnownOIDs`                          | 1.1 KiB |  88.5 KiB |   0.5% | ▏                |
+| 10 | `java.lang.Object[]`                                   | 8.9 KiB |  74.7 KiB |   0.4% | ▏                |
+| 11 | `java.net.URLClassLoader`                              |    88 B |  74.5 KiB |   0.4% | ▏                |
+| 12 | `java.util.zip.ZipFile$Source`                         |    80 B |  68.2 KiB |   0.3% | ▏                |
+| 13 | `sun.util.locale.provider.LocaleProviderAdapter`       |    24 B |  62.3 KiB |   0.3% | ▏                |
+| 14 | `sun.security.provider.Sun`                            |   104 B |  53.7 KiB |   0.3% | ▏                |
+| 15 | `jdk.internal.loader.ClassLoaders$AppClassLoader`      |    96 B |  53.0 KiB |   0.3% | ▏                |
+| 16 | `java.util.zip.ZipFile$Source`                         |    80 B |  52.5 KiB |   0.3% | ▏                |
+| 17 | `sun.util.resources.Bundles`                           |    24 B |  49.2 KiB |   0.3% | ▏                |
+| 18 | `java.lang.invoke.MethodType`                          |    48 B |  49.0 KiB |   0.2% | ▏                |
+| 19 | `java.util.concurrent.ConcurrentHashMap`               |    64 B |  34.0 KiB |   0.2% | ▏                |
+| 20 | `jdk.internal.loader.ClassLoaders$PlatformClassLoader` |    96 B |  32.8 KiB |   0.2% | ▏                |
 
 ### Biggest Classes by Retained Heap
 
 _Classes ranked by total retained heap. High retained with low shallow means the class is keeping many other objects alive — investigate it in Dominator Analysis._
 
-|  # | Class                                                  | Instances | Retained |                  |
-| -: | ------------------------------------------------------ | --------: | -------: | ---------------- |
-|  1 | `java.util.concurrent.ForkJoinWorkerThread`            |        26 |   8.9 MB | ████████████████ |
-|  2 | `java.util.stream.ReduceOps$ReduceTask`                |         5 |   4.2 MB | ███████▌         |
-|  3 | `java.lang.Class`                                      |     1,665 |   3.4 MB | ██████▏          |
-|  4 | `java.util.jar.JarFile`                                |         7 | 592.8 KB | █                |
-|  5 | `java.lang.String`                                     |     8,924 | 591.7 KB | █                |
-|  6 | `java.util.zip.ZipFile$Source`                         |         7 | 446.2 KB | ▊                |
-|  7 | `java.lang.Thread`                                     |        25 | 307.7 KB | ▌                |
-|  8 | `java.lang.Object[]`                                   |         5 | 105.8 KB | ▏                |
-|  9 | `java.lang.invoke.MethodType`                          |       686 |  85.6 KB | ▏                |
-| 10 | `java.net.URLClassLoader`                              |         2 |  80.8 KB | ▏                |
-| 11 | `java.lang.Module`                                     |        61 |  63.1 KB | ▏                |
-| 12 | `sun.security.provider.Sun`                            |         1 |  53.7 KB | ▏                |
-| 13 | `jdk.internal.loader.ClassLoaders$AppClassLoader`      |         1 |  53.0 KB | ▏                |
-| 14 | `java.lang.invoke.LambdaForm`                          |       104 |  41.9 KB | ▏                |
-| 15 | `java.lang.module.ModuleDescriptor`                    |        62 |  40.0 KB | ▏                |
-| 16 | `java.util.concurrent.ConcurrentHashMap`               |         2 |  34.1 KB | ▏                |
-| 17 | `jdk.internal.loader.ClassLoaders$PlatformClassLoader` |         1 |  32.8 KB | ▏                |
-| 18 | `java.lang.invoke.MethodTypeForm`                      |       107 |  29.0 KB | ▏                |
-| 19 | `java.io.PrintStream`                                  |         1 |  17.3 KB | ▏                |
-| 20 | `java.net.URI`                                         |        61 |  11.8 KB | ▏                |
+|  # | Class                                                  | Instances |  Retained |                  |
+| -: | ------------------------------------------------------ | --------: | --------: | ---------------- |
+|  1 | `java.util.concurrent.ForkJoinWorkerThread`            |        26 |   8.9 MiB | ████████████████ |
+|  2 | `java.util.stream.ReduceOps$ReduceTask`                |         5 |   4.2 MiB | ███████▌         |
+|  3 | `java.lang.Class`                                      |     1,665 |   3.4 MiB | ██████▏          |
+|  4 | `java.util.jar.JarFile`                                |         7 | 592.8 KiB | █                |
+|  5 | `java.lang.String`                                     |     8,924 | 591.7 KiB | █                |
+|  6 | `java.util.zip.ZipFile$Source`                         |         7 | 446.2 KiB | ▊                |
+|  7 | `java.lang.Thread`                                     |        25 | 307.7 KiB | ▌                |
+|  8 | `java.lang.Object[]`                                   |         5 | 105.8 KiB | ▏                |
+|  9 | `java.lang.invoke.MethodType`                          |       686 |  85.6 KiB | ▏                |
+| 10 | `java.net.URLClassLoader`                              |         2 |  80.8 KiB | ▏                |
+| 11 | `java.lang.Module`                                     |        61 |  63.1 KiB | ▏                |
+| 12 | `sun.security.provider.Sun`                            |         1 |  53.7 KiB | ▏                |
+| 13 | `jdk.internal.loader.ClassLoaders$AppClassLoader`      |         1 |  53.0 KiB | ▏                |
+| 14 | `java.lang.invoke.LambdaForm`                          |       104 |  41.9 KiB | ▏                |
+| 15 | `java.lang.module.ModuleDescriptor`                    |        62 |  40.0 KiB | ▏                |
+| 16 | `java.util.concurrent.ConcurrentHashMap`               |         2 |  34.1 KiB | ▏                |
+| 17 | `jdk.internal.loader.ClassLoaders$PlatformClassLoader` |         1 |  32.8 KiB | ▏                |
+| 18 | `java.lang.invoke.MethodTypeForm`                      |       107 |  29.0 KiB | ▏                |
+| 19 | `java.io.PrintStream`                                  |         1 |  17.3 KiB | ▏                |
+| 20 | `java.net.URI`                                         |        61 |  11.8 KiB | ▏                |
 
 ### Retained Size Distribution
 
 _Retained heap distributed across all 12,887 top-level dominators. The shape reveals whether a handful of large objects dominate the heap or memory is scattered across many small ones._
 
 - Dominators: 12,887
-- Smallest / largest retained: 0 B / 8.9 MB
+- Smallest / largest retained: 0 B / 8.9 MiB
 - Median retained: 64 B
-- Total retained (top-level): 19.2 MB
+- Total retained (top-level): 19.2 MiB
 
-`▂▂▂▂█▄▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂`  (0 B – 8.9 MB)
+`▂▂▂▂█▄▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂`  (0 B – 8.9 MiB)
 
-|   Size ≤ | Count |                  |
-| -------: | ----: | ---------------- |
-|      1 B |   464 | █                |
-|      8 B |    99 | ▏                |
-|     16 B |   184 | ▍                |
-|     32 B |   752 | █▊               |
-|     64 B | 6,793 | ████████████████ |
-|    128 B | 3,380 | ███████▉         |
-|    256 B |   621 | █▍               |
-|    512 B |   346 | ▊                |
-|   1.0 KB |   118 | ▎                |
-|   2.0 KB |    48 | ▏                |
-|   4.0 KB |    27 | ▏                |
-|   8.0 KB |    21 | ▏                |
-|  16.0 KB |     8 | ▏                |
-|  32.0 KB |     6 | ▏                |
-|  64.0 KB |     8 | ▏                |
-| 128.0 KB |     4 | ▏                |
-| 256.0 KB |     2 | ▏                |
-| 512.0 KB |     2 | ▏                |
-|   1.0 MB |     1 | ▏                |
-|   4.0 MB |     1 | ▏                |
-|   8.0 MB |     1 | ▏                |
-|  16.0 MB |     1 | ▏                |
+|    Size ≤ | Count |                  |
+| --------: | ----: | ---------------- |
+|       1 B |   464 | █                |
+|       8 B |    99 | ▏                |
+|      16 B |   184 | ▍                |
+|      32 B |   752 | █▊               |
+|      64 B | 6,793 | ████████████████ |
+|     128 B | 3,380 | ███████▉         |
+|     256 B |   621 | █▍               |
+|     512 B |   346 | ▊                |
+|   1.0 KiB |   118 | ▎                |
+|   2.0 KiB |    48 | ▏                |
+|   4.0 KiB |    27 | ▏                |
+|   8.0 KiB |    21 | ▏                |
+|  16.0 KiB |     8 | ▏                |
+|  32.0 KiB |     6 | ▏                |
+|  64.0 KiB |     8 | ▏                |
+| 128.0 KiB |     4 | ▏                |
+| 256.0 KiB |     2 | ▏                |
+| 512.0 KiB |     2 | ▏                |
+|   1.0 MiB |     1 | ▏                |
+|   4.0 MiB |     1 | ▏                |
+|   8.0 MiB |     1 | ▏                |
+|  16.0 MiB |     1 | ▏                |
 
 ### Biggest Packages by Retained Heap
 
 _Retained heap aggregated by package prefix — only packages retaining ≥1% of the heap are shown; the tree shows nesting._
 
-| Package            | # Objects |  Shallow | Retained |                  |
-| ------------------ | --------: | -------: | -------: | ---------------- |
-| `java`             |    12,014 | 346.2 KB |  16.0 MB | ████████████████ |
-| ├─ `util`          |       716 |  16.9 KB |  14.2 MB | ██████████████▏  |
-| │  ├─ `concurrent` |       124 |   7.4 KB |   8.9 MB | ████████▉        |
-| │  ├─ `stream`     |       166 |   1.7 KB |   4.2 MB | ████▏            |
-| │  ├─ `jar`        |        30 |    952 B | 594.8 KB | ▌                |
-| │  └─ `zip`        |        62 |   2.1 KB | 453.0 KB | ▍                |
-| ├─ `lang`          |    10,816 | 314.7 KB |   1.4 MB | █▍               |
-| │  └─ `invoke`     |     1,290 |  46.9 KB | 246.1 KB | ▏                |
-| └─ `time`          |       153 |   3.8 KB | 230.7 KB | ▏                |
-| │  └─ `zone`       |        11 |    208 B | 205.6 KB | ▏                |
-| `scala`            |        67 |    760 B |   2.5 MB | ██▌              |
-| └─ `runtime`       |         8 |     96 B |   2.5 MB | ██▍              |
-| `sun`              |       265 |   6.9 KB | 465.7 KB | ▍                |
-| └─ `util`          |        87 |   1.9 KB | 288.3 KB | ▎                |
+| Package            | # Objects |   Shallow |  Retained |                  |
+| ------------------ | --------: | --------: | --------: | ---------------- |
+| `java`             |    12,014 | 346.2 KiB |  16.0 MiB | ████████████████ |
+| ├─ `util`          |       716 |  16.9 KiB |  14.2 MiB | ██████████████▏  |
+| │  ├─ `concurrent` |       124 |   7.4 KiB |   8.9 MiB | ████████▉        |
+| │  ├─ `stream`     |       166 |   1.7 KiB |   4.2 MiB | ████▏            |
+| │  ├─ `jar`        |        30 |     952 B | 594.8 KiB | ▌                |
+| │  └─ `zip`        |        62 |   2.1 KiB | 453.0 KiB | ▍                |
+| ├─ `lang`          |    10,816 | 314.7 KiB |   1.4 MiB | █▍               |
+| │  └─ `invoke`     |     1,290 |  46.9 KiB | 246.1 KiB | ▏                |
+| └─ `time`          |       153 |   3.8 KiB | 230.7 KiB | ▏                |
+| │  └─ `zone`       |        11 |     208 B | 205.6 KiB | ▏                |
+| `scala`            |        67 |     760 B |   2.5 MiB | ██▌              |
+| └─ `runtime`       |         8 |      96 B |   2.5 MiB | ██▍              |
+| `sun`              |       265 |   6.9 KiB | 465.7 KiB | ▍                |
+| └─ `util`          |        87 |   1.9 KiB | 288.3 KiB | ▎                |
 
 ## Dominator Analysis
 
@@ -15591,29 +15643,29 @@ _An object **dominates** another if every path from a GC root passes through it 
 
 ### Big Drops
 
-_Objects retaining far more than their largest single child — memory held directly in the object or spread across many small dominated children. Drop = object retained − largest child retained; the memory freed by dropping just this object, not counting what its largest dominated child already retains. Threshold 0.2 MB (1% of reachable heap). Multiple rows with the same class are distinct objects._
+_Objects retaining far more than their largest single child — memory held directly in the object or spread across many small dominated children. Drop = object retained − largest child retained; the memory freed by dropping just this object, not counting what its largest dominated child already retains. Threshold 0.2 MiB (1% of reachable heap). Multiple rows with the same class are distinct objects._
 
-| Object                                      |      # |    Retained | Largest Child                              | Child Retained |        Drop |                  |
-| ------------------------------------------- | -----: | ----------: | ------------------------------------------ | -------------: | ----------: | ---------------- |
-| `java.util.HashMap$Node[]`                  | 379386 |      8.4 MB | `java.util.HashMap$Node`                   |          768 B |      8.4 MB | ████████████████ |
-| `java.util.HashMap$Node[]`                  | 110049 |      4.2 MB | `java.util.HashMap$Node`                   |          768 B |      4.2 MB | ████████         |
-| `java.lang.Object[]`                        |      1 |      2.5 MB | `java.lang.Object`                         |           16 B |      2.5 MB | ████▊            |
-| `java.util.HashMap$Node[]`                  |  52083 |    577.2 KB | `java.util.HashMap$Node`                   |         1000 B |    576.2 KB | █                |
-| `java.util.concurrent.ForkJoinWorkerThread` |  74911 |      8.9 MB | `java.util.stream.ReduceOps$3ReducingSink` |         8.4 MB |    480.7 KB | ▉                |
-| `java.util.HashMap$Node[]`                  | 205929 |    309.0 KB | `java.util.HashMap$Node`                   |          600 B |    308.4 KB | ▌                |
-| `byte[]`                                    | 452171 |    255.1 KB | —                                          |            0 B |    255.1 KB | ▍                |
-| `java.lang.Thread`                          | 452083 |    301.5 KB | `java.util.HashMap`                        |       137.0 KB |    164.5 KB | ▎                |
-| `java.lang.Class`                           |  14454 |    198.4 KB | `java.time.zone.TzdbZoneRulesProvider`     |       118.2 KB |     80.2 KB | ▏                |
-| `java.util.zip.ZipFile$Source`              | 452160 |    295.2 KB | `byte[]`                                   |       255.1 KB |     40.1 KB | ▏                |
-| `java.util.jar.Manifest`                    | 435742 |    584.7 KB | `java.util.HashMap`                        |       577.2 KB |      7.5 KB | ▏                |
-| `java.lang.Class`                           | 445032 |      2.5 MB | `java.lang.Object[]`                       |         2.5 MB |      1.0 KB | ▏                |
-| `java.util.jar.JarFile`                     | 435739 |    585.1 KB | `java.lang.ref.SoftReference`              |       584.8 KB |       352 B | ▏                |
-| `java.util.stream.ReduceOps$ReduceTask`     |     ×2 |      4.2 MB | `java.util.stream.ReduceOps$ReduceTask`    |         4.2 MB |        64 B | ▏                |
-| `java.util.HashMap`                         |     ×4 |    577.2 KB | `java.util.HashMap$Node[]`                 |       577.2 KB |        48 B | ▏                |
-| `java.lang.ref.SoftReference`               | 435741 |    584.8 KB | `java.util.jar.Manifest`                   |       584.7 KB |        40 B | ▏                |
-| `java.util.stream.ReduceOps$3ReducingSink`  |     ×3 |      4.2 MB | `java.util.HashSet`                        |         4.2 MB |        32 B | ▏                |
-| `java.util.HashSet`                         |     ×2 |      4.2 MB | `java.util.HashMap`                        |         4.2 MB |        16 B | ▏                |
-| **Total**                                   |        | **77.6 MB** |                                            |    **60.6 MB** | **17.0 MB** |                  |
+| Object                                      |      # |     Retained | Largest Child                              | Child Retained |         Drop |                  |
+| ------------------------------------------- | -----: | -----------: | ------------------------------------------ | -------------: | -----------: | ---------------- |
+| `java.util.HashMap$Node[]`                  | 379386 |      8.4 MiB | `java.util.HashMap$Node`                   |          768 B |      8.4 MiB | ████████████████ |
+| `java.util.HashMap$Node[]`                  | 110049 |      4.2 MiB | `java.util.HashMap$Node`                   |          768 B |      4.2 MiB | ████████         |
+| `java.lang.Object[]`                        |      1 |      2.5 MiB | `java.lang.Object`                         |           16 B |      2.5 MiB | ████▊            |
+| `java.util.HashMap$Node[]`                  |  52083 |    577.2 KiB | `java.util.HashMap$Node`                   |         1000 B |    576.2 KiB | █                |
+| `java.util.concurrent.ForkJoinWorkerThread` |  74911 |      8.9 MiB | `java.util.stream.ReduceOps$3ReducingSink` |        8.4 MiB |    480.7 KiB | ▉                |
+| `java.util.HashMap$Node[]`                  | 205929 |    309.0 KiB | `java.util.HashMap$Node`                   |          600 B |    308.4 KiB | ▌                |
+| `byte[]`                                    | 452171 |    255.1 KiB | —                                          |            0 B |    255.1 KiB | ▍                |
+| `java.lang.Thread`                          | 452083 |    301.5 KiB | `java.util.HashMap`                        |      137.0 KiB |    164.5 KiB | ▎                |
+| `java.lang.Class`                           |  14454 |    198.4 KiB | `java.time.zone.TzdbZoneRulesProvider`     |      118.2 KiB |     80.2 KiB | ▏                |
+| `java.util.zip.ZipFile$Source`              | 452160 |    295.2 KiB | `byte[]`                                   |      255.1 KiB |     40.1 KiB | ▏                |
+| `java.util.jar.Manifest`                    | 435742 |    584.7 KiB | `java.util.HashMap`                        |      577.2 KiB |      7.5 KiB | ▏                |
+| `java.lang.Class`                           | 445032 |      2.5 MiB | `java.lang.Object[]`                       |        2.5 MiB |      1.0 KiB | ▏                |
+| `java.util.jar.JarFile`                     | 435739 |    585.1 KiB | `java.lang.ref.SoftReference`              |      584.8 KiB |        352 B | ▏                |
+| `java.util.stream.ReduceOps$ReduceTask`     |     ×2 |      4.2 MiB | `java.util.stream.ReduceOps$ReduceTask`    |        4.2 MiB |         64 B | ▏                |
+| `java.util.HashMap`                         |     ×4 |    577.2 KiB | `java.util.HashMap$Node[]`                 |      577.2 KiB |         48 B | ▏                |
+| `java.lang.ref.SoftReference`               | 435741 |    584.8 KiB | `java.util.jar.Manifest`                   |      584.7 KiB |         40 B | ▏                |
+| `java.util.stream.ReduceOps$3ReducingSink`  |     ×3 |      4.2 MiB | `java.util.HashSet`                        |        4.2 MiB |         32 B | ▏                |
+| `java.util.HashSet`                         |     ×2 |      4.2 MiB | `java.util.HashMap`                        |        4.2 MiB |         16 B | ▏                |
+| **Total**                                   |        | **77.6 MiB** |                                            |   **60.6 MiB** | **17.0 MiB** |                  |
 
 ### Immediate Dominators
 
@@ -15621,37 +15673,37 @@ _Each row shows one dominator class: how many other objects it immediately domin
 
 | Dominator Class                                   | # Dominators | # Dominated | Dominator Shallow | Dominated Shallow |                  |
 | ------------------------------------------------- | -----------: | ----------: | ----------------: | ----------------: | ---------------- |
-| `java.lang.String`                                |      120,467 |     120,467 |            2.8 MB |            7.7 MB | ████████████████ |
-| `java.util.HashMap$Node`                          |      105,949 |     132,553 |            3.2 MB |            3.2 MB | ██████▌          |
-| `java.util.HashMap$Node[]`                        |          377 |      85,360 |          865.5 KB |            2.6 MB | █████▍           |
-| `java.lang.Object[]`                              |          235 |     134,018 |          557.3 KB |            2.1 MB | ████▎            |
-| `java.util.HashMap`                               |          376 |         428 |           17.6 KB |          861.7 KB | █▋               |
-| `java.lang.Class`                                 |        1,494 |       4,436 |           28.0 KB |          739.4 KB | █▍               |
-| `java.util.zip.ZipFile$Source`                    |            7 |          21 |             560 B |          445.6 KB | ▉                |
-| `java.util.concurrent.ConcurrentHashMap$Node[]`   |           91 |       4,950 |           54.0 KB |          185.2 KB | ▎                |
-| `java.util.jar.Attributes`                        |        2,895 |       2,895 |           45.2 KB |          180.9 KB | ▎                |
-| `java.util.concurrent.ConcurrentHashMap$Node`     |        4,090 |       5,102 |          127.8 KB |          177.7 KB | ▎                |
-| `byte[][]`                                        |            1 |         346 |            1.4 KB |           92.8 KB | ▏                |
-| `java.util.LinkedHashMap`                         |           45 |       1,228 |            2.8 KB |           55.6 KB | ▏                |
-| `java.util.concurrent.ConcurrentHashMap`          |           93 |         102 |            5.8 KB |           54.1 KB | ▏                |
-| `java.util.ArrayList`                             |          588 |         588 |           13.8 KB |           33.4 KB | ▏                |
-| `java.io.BufferedWriter`                          |            2 |           4 |              80 B |           32.1 KB | ▏                |
-| `java.util.LinkedHashMap$Entry`                   |        1,125 |       1,142 |           43.9 KB |           26.8 KB | ▏                |
-| `jdk.internal.math.FDBigInteger`                  |          341 |         341 |           10.7 KB |           24.2 KB | ▏                |
-| `java.util.ImmutableCollections$SetN`             |          149 |         149 |            3.5 KB |           23.3 KB | ▏                |
-| `java.lang.invoke.MethodType`                     |          575 |         823 |           22.5 KB |           22.4 KB | ▏                |
-| `java.lang.invoke.MethodTypeForm`                 |          137 |         274 |            4.3 KB |           20.3 KB | ▏                |
-| `java.util.concurrent.ForkJoinWorkerThread`       |           26 |         422 |            2.8 KB |           19.5 KB | ▏                |
-| `java.lang.invoke.MemberName`                     |          502 |         808 |           19.6 KB |           14.4 KB | ▏                |
-| `java.lang.invoke.LambdaForm`                     |          140 |         306 |            6.6 KB |           12.4 KB | ▏                |
-| `java.lang.invoke.DirectMethodHandle$Constructor` |          132 |         453 |            6.2 KB |           12.4 KB | ▏                |
-| `java.util.HashSet`                               |          255 |         255 |            4.0 KB |           12.0 KB | ▏                |
-| `java.lang.invoke.LambdaForm$Name[]`              |          134 |         371 |            5.7 KB |           11.6 KB | ▏                |
-| `java.lang.invoke.LambdaForm$Name`                |          311 |         420 |            9.7 KB |           11.2 KB | ▏                |
-| `jdk.internal.math.FDBigInteger[]`                |            1 |         341 |            1.3 KB |           10.6 KB | ▏                |
-| `java.util.concurrent.ForkJoinPool$WorkQueue`     |           27 |          27 |            1.5 KB |            7.2 KB | ▏                |
-| `java.lang.invoke.DirectMethodHandle`             |          171 |         172 |            6.7 KB |            6.7 KB | ▏                |
-| **Total**                                         |  **240,736** | **498,802** |        **7.8 MB** |       **18.6 MB** |                  |
+| `java.lang.String`                                |      120,467 |     120,467 |           2.8 MiB |           7.7 MiB | ████████████████ |
+| `java.util.HashMap$Node`                          |      105,949 |     132,553 |           3.2 MiB |           3.2 MiB | ██████▌          |
+| `java.util.HashMap$Node[]`                        |          377 |      85,360 |         865.5 KiB |           2.6 MiB | █████▍           |
+| `java.lang.Object[]`                              |          235 |     134,018 |         557.3 KiB |           2.1 MiB | ████▎            |
+| `java.util.HashMap`                               |          376 |         428 |          17.6 KiB |         861.7 KiB | █▋               |
+| `java.lang.Class`                                 |        1,494 |       4,436 |          28.0 KiB |         739.4 KiB | █▍               |
+| `java.util.zip.ZipFile$Source`                    |            7 |          21 |             560 B |         445.6 KiB | ▉                |
+| `java.util.concurrent.ConcurrentHashMap$Node[]`   |           91 |       4,950 |          54.0 KiB |         185.2 KiB | ▎                |
+| `java.util.jar.Attributes`                        |        2,895 |       2,895 |          45.2 KiB |         180.9 KiB | ▎                |
+| `java.util.concurrent.ConcurrentHashMap$Node`     |        4,090 |       5,102 |         127.8 KiB |         177.7 KiB | ▎                |
+| `byte[][]`                                        |            1 |         346 |           1.4 KiB |          92.8 KiB | ▏                |
+| `java.util.LinkedHashMap`                         |           45 |       1,228 |           2.8 KiB |          55.6 KiB | ▏                |
+| `java.util.concurrent.ConcurrentHashMap`          |           93 |         102 |           5.8 KiB |          54.1 KiB | ▏                |
+| `java.util.ArrayList`                             |          588 |         588 |          13.8 KiB |          33.4 KiB | ▏                |
+| `java.io.BufferedWriter`                          |            2 |           4 |              80 B |          32.1 KiB | ▏                |
+| `java.util.LinkedHashMap$Entry`                   |        1,125 |       1,142 |          43.9 KiB |          26.8 KiB | ▏                |
+| `jdk.internal.math.FDBigInteger`                  |          341 |         341 |          10.7 KiB |          24.2 KiB | ▏                |
+| `java.util.ImmutableCollections$SetN`             |          149 |         149 |           3.5 KiB |          23.3 KiB | ▏                |
+| `java.lang.invoke.MethodType`                     |          575 |         823 |          22.5 KiB |          22.4 KiB | ▏                |
+| `java.lang.invoke.MethodTypeForm`                 |          137 |         274 |           4.3 KiB |          20.3 KiB | ▏                |
+| `java.util.concurrent.ForkJoinWorkerThread`       |           26 |         422 |           2.8 KiB |          19.5 KiB | ▏                |
+| `java.lang.invoke.MemberName`                     |          502 |         808 |          19.6 KiB |          14.4 KiB | ▏                |
+| `java.lang.invoke.LambdaForm`                     |          140 |         306 |           6.6 KiB |          12.4 KiB | ▏                |
+| `java.lang.invoke.DirectMethodHandle$Constructor` |          132 |         453 |           6.2 KiB |          12.4 KiB | ▏                |
+| `java.util.HashSet`                               |          255 |         255 |           4.0 KiB |          12.0 KiB | ▏                |
+| `java.lang.invoke.LambdaForm$Name[]`              |          134 |         371 |           5.7 KiB |          11.6 KiB | ▏                |
+| `java.lang.invoke.LambdaForm$Name`                |          311 |         420 |           9.7 KiB |          11.2 KiB | ▏                |
+| `jdk.internal.math.FDBigInteger[]`                |            1 |         341 |           1.3 KiB |          10.6 KiB | ▏                |
+| `java.util.concurrent.ForkJoinPool$WorkQueue`     |           27 |          27 |           1.5 KiB |           7.2 KiB | ▏                |
+| `java.lang.invoke.DirectMethodHandle`             |          171 |         172 |           6.7 KiB |           6.7 KiB | ▏                |
+| **Total**                                         |  **240,736** | **498,802** |       **7.8 MiB** |      **18.6 MiB** |                  |
 
 ## Threads
 
@@ -15661,38 +15713,38 @@ _Per-thread call stacks and retained heap. A thread keeps everything on its stac
 
 _Name, shallow/retained heap, max single-local retained, context class loader, daemon flag, priority, and thread state for every recorded thread._
 
-| Name                                            | Shallow | Retained | Max Local Retained | Context Class Loader                                           | Daemon | Priority | State                                                  |                  |
-| ----------------------------------------------- | ------: | -------: | -----------------: | -------------------------------------------------------------- | ------ | -------: | ------------------------------------------------------ | ---------------- |
-| [main](#thread-1)                               |   104 B | 301.5 KB |             4.2 MB | `java/net/URLClassLoader @ 0xc040b670`                         | No     |        5 | [alive, waiting, waiting indefinitely, parked]         | ▌                |
-| [Reference Handler](#thread-2)                  |   104 B |    200 B |                0 B | `—`                                                            | Yes    |       10 | [alive, runnable]                                      | ▏                |
-| [Finalizer](#thread-3)                          |   112 B |    208 B |               40 B | `—`                                                            | Yes    |        8 | [alive, waiting, waiting indefinitely, in Object.wait] | ▏                |
-| [Common-Cleaner](#thread-6)                     |   112 B |    168 B |              128 B | `—`                                                            | Yes    |        8 | [alive, waiting, waiting with timeout, parked]         | ▏                |
-| [ForkJoinPool.commonPool-worker-1](#thread-7)   |   112 B |    240 B |             1.0 KB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
-| [ForkJoinPool.commonPool-worker-2](#thread-8)   |   112 B |    240 B |             1.0 KB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
-| [ForkJoinPool.commonPool-worker-3](#thread-9)   |   112 B |    240 B |             1.0 KB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
-| [ForkJoinPool.commonPool-worker-4](#thread-10)  |   112 B |    240 B |             1.0 KB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
-| [ForkJoinPool.commonPool-worker-5](#thread-11)  |   112 B |    240 B |             1.0 KB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
-| [ForkJoinPool.commonPool-worker-6](#thread-12)  |   112 B |    240 B |             1.0 KB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
-| [ForkJoinPool.commonPool-worker-7](#thread-13)  |   112 B |    240 B |             1.0 KB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
-| [ForkJoinPool.commonPool-worker-8](#thread-14)  |   112 B |    240 B |             1.0 KB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
-| [ForkJoinPool.commonPool-worker-9](#thread-15)  |   112 B |    240 B |             1.0 KB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
-| [ForkJoinPool.commonPool-worker-10](#thread-16) |   112 B |    248 B |             1.0 KB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
-| [ForkJoinPool.commonPool-worker-11](#thread-17) |   112 B |    248 B |             1.0 KB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
-| [ForkJoinPool.commonPool-worker-12](#thread-18) |   112 B |    248 B |             1.0 KB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
-| [ForkJoinPool.commonPool-worker-13](#thread-19) |   112 B |    248 B |             1.0 KB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
-| [ForkJoinPool.commonPool-worker-14](#thread-20) |   112 B |    248 B |             1.0 KB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
-| [ForkJoinPool.commonPool-worker-15](#thread-21) |   112 B |    248 B |             1.0 KB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
-| [ForkJoinPool.commonPool-worker-16](#thread-22) |   112 B |   8.9 MB |             2.8 KB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, runnable]                                      | ████████████████ |
-| [ForkJoinPool.commonPool-worker-17](#thread-23) |   112 B |    248 B |             1.0 KB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
-| [ForkJoinPool.commonPool-worker-18](#thread-24) |   112 B |    248 B |             1.0 KB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
-| [ForkJoinPool.commonPool-worker-19](#thread-25) |   112 B |    248 B |             1.0 KB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
-| [ForkJoinPool.commonPool-worker-20](#thread-26) |   112 B |    248 B |             1.0 KB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
-| [ForkJoinPool.commonPool-worker-21](#thread-27) |   112 B |    248 B |             1.0 KB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
-| [ForkJoinPool.commonPool-worker-22](#thread-28) |   112 B |    248 B |             1.0 KB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
-| [ForkJoinPool.commonPool-worker-23](#thread-29) |   112 B |    248 B |             1.0 KB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
-| [ForkJoinPool.commonPool-worker-24](#thread-30) |   112 B |    248 B |             1.0 KB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
-| [ForkJoinPool.commonPool-worker-25](#thread-31) |   112 B |    248 B |             1.0 KB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
-| [ForkJoinPool.commonPool-worker-26](#thread-32) |   112 B |    248 B |             1.0 KB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
+| Name                                            | Shallow |  Retained | Max Local Retained | Context Class Loader                                           | Daemon | Priority | State                                                  |                  |
+| ----------------------------------------------- | ------: | --------: | -----------------: | -------------------------------------------------------------- | ------ | -------: | ------------------------------------------------------ | ---------------- |
+| [main](#thread-1)                               |   104 B | 301.5 KiB |            4.2 MiB | `java/net/URLClassLoader @ 0xc040b670`                         | No     |        5 | [alive, waiting, waiting indefinitely, parked]         | ▌                |
+| [Reference Handler](#thread-2)                  |   104 B |     200 B |                0 B | `—`                                                            | Yes    |       10 | [alive, runnable]                                      | ▏                |
+| [Finalizer](#thread-3)                          |   112 B |     208 B |               40 B | `—`                                                            | Yes    |        8 | [alive, waiting, waiting indefinitely, in Object.wait] | ▏                |
+| [Common-Cleaner](#thread-6)                     |   112 B |     168 B |              128 B | `—`                                                            | Yes    |        8 | [alive, waiting, waiting with timeout, parked]         | ▏                |
+| [ForkJoinPool.commonPool-worker-1](#thread-7)   |   112 B |     240 B |            1.0 KiB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
+| [ForkJoinPool.commonPool-worker-2](#thread-8)   |   112 B |     240 B |            1.0 KiB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
+| [ForkJoinPool.commonPool-worker-3](#thread-9)   |   112 B |     240 B |            1.0 KiB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
+| [ForkJoinPool.commonPool-worker-4](#thread-10)  |   112 B |     240 B |            1.0 KiB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
+| [ForkJoinPool.commonPool-worker-5](#thread-11)  |   112 B |     240 B |            1.0 KiB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
+| [ForkJoinPool.commonPool-worker-6](#thread-12)  |   112 B |     240 B |            1.0 KiB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
+| [ForkJoinPool.commonPool-worker-7](#thread-13)  |   112 B |     240 B |            1.0 KiB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
+| [ForkJoinPool.commonPool-worker-8](#thread-14)  |   112 B |     240 B |            1.0 KiB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
+| [ForkJoinPool.commonPool-worker-9](#thread-15)  |   112 B |     240 B |            1.0 KiB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
+| [ForkJoinPool.commonPool-worker-10](#thread-16) |   112 B |     248 B |            1.0 KiB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
+| [ForkJoinPool.commonPool-worker-11](#thread-17) |   112 B |     248 B |            1.0 KiB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
+| [ForkJoinPool.commonPool-worker-12](#thread-18) |   112 B |     248 B |            1.0 KiB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
+| [ForkJoinPool.commonPool-worker-13](#thread-19) |   112 B |     248 B |            1.0 KiB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
+| [ForkJoinPool.commonPool-worker-14](#thread-20) |   112 B |     248 B |            1.0 KiB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
+| [ForkJoinPool.commonPool-worker-15](#thread-21) |   112 B |     248 B |            1.0 KiB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
+| [ForkJoinPool.commonPool-worker-16](#thread-22) |   112 B |   8.9 MiB |            2.8 KiB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, runnable]                                      | ████████████████ |
+| [ForkJoinPool.commonPool-worker-17](#thread-23) |   112 B |     248 B |            1.0 KiB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
+| [ForkJoinPool.commonPool-worker-18](#thread-24) |   112 B |     248 B |            1.0 KiB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
+| [ForkJoinPool.commonPool-worker-19](#thread-25) |   112 B |     248 B |            1.0 KiB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
+| [ForkJoinPool.commonPool-worker-20](#thread-26) |   112 B |     248 B |            1.0 KiB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
+| [ForkJoinPool.commonPool-worker-21](#thread-27) |   112 B |     248 B |            1.0 KiB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
+| [ForkJoinPool.commonPool-worker-22](#thread-28) |   112 B |     248 B |            1.0 KiB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
+| [ForkJoinPool.commonPool-worker-23](#thread-29) |   112 B |     248 B |            1.0 KiB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
+| [ForkJoinPool.commonPool-worker-24](#thread-30) |   112 B |     248 B |            1.0 KiB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
+| [ForkJoinPool.commonPool-worker-25](#thread-31) |   112 B |     248 B |            1.0 KiB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
+| [ForkJoinPool.commonPool-worker-26](#thread-32) |   112 B |     248 B |            1.0 KiB | `jdk/internal/loader/ClassLoaders$AppClassLoader @ 0xffeecf48` | Yes    |        5 | [alive, waiting, waiting indefinitely, parked]         | ▏                |
 
 <a id="thread-1"></a>
 
@@ -15706,8 +15758,8 @@ _Showing top 20 of 98 by retained heap; retained sizes overlap, so totals may ex
 
 | Object                                                    | Count | Shallow | Retained |
 | --------------------------------------------------------- | ----: | ------: | -------: |
-| `java.util.stream.ReduceOps$ReduceTask`                   |    ×2 |    64 B |   4.2 MB |
-| `org.renaissance.jdk.streams.MnemonicsCoderWithStream`    |    ×2 |    24 B |   2.8 KB |
+| `java.util.stream.ReduceOps$ReduceTask`                   |    ×2 |    64 B |  4.2 MiB |
+| `org.renaissance.jdk.streams.MnemonicsCoderWithStream`    |    ×2 |    24 B |  2.8 KiB |
 | `java.util.concurrent.ForkJoinPool$WorkQueue`             |     1 |    56 B |    328 B |
 | `java.util.concurrent.ForkJoinPool`                       |     1 |    96 B |    144 B |
 | `java.lang.String`                                        |    ×2 |    24 B |     80 B |
@@ -15720,42 +15772,67 @@ _Showing top 20 of 98 by retained heap; retained sizes overlap, so totals may ex
 | `java.util.concurrent.ForkJoinTask$Aux`                   |     1 |    24 B |     24 B |
 | `org.renaissance.jdk.streams.ParMnemonics`                |     1 |    24 B |     24 B |
 
-_Frame percentages are of this thread's 301.5 KB retained heap._
+_Complete stack: 29 frames as recorded in the dump._
 
-- `java.util.concurrent.ForkJoinTask.awaitDone (ForkJoinTask.java:461)`
-  - `java.util.stream.ReduceOps$ReduceTask` retains 4.2 MB (22.0% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 301.5 KiB retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:371)`
+- ✦ `java.util.concurrent.ForkJoinTask.awaitDone (ForkJoinTask.java:461)`
+  - `java.util.stream.ReduceOps$ReduceTask` retains 4.2 MiB (22.0% of thread retained)
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinTask$Aux` retains 24 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinTask.invoke (ForkJoinTask.java:668)`
-  - `java.util.stream.ReduceOps$ReduceTask` retains 4.2 MB (22.0% of thread retained)
-- `java.util.stream.ReduceOps$ReduceOp.evaluateParallel (ReduceOps.java:927)`
+- ✦ `java.util.concurrent.ForkJoinTask.invoke (ForkJoinTask.java:668)`
+  - `java.util.stream.ReduceOps$ReduceTask` retains 4.2 MiB (22.0% of thread retained)
+- ✦ `java.util.stream.ReduceOps$ReduceOp.evaluateParallel (ReduceOps.java:927)`
   - `java.util.concurrent.ConcurrentHashMap$EntrySpliterator` retains 56 B (<0.1% of thread retained)
   - `java.util.stream.ReferencePipeline$7` retains 56 B (<0.1% of thread retained)
   - `java.util.stream.ReduceOps$3` retains 32 B (<0.1% of thread retained)
-- `java.util.stream.AbstractPipeline.evaluate (AbstractPipeline.java:233)`
+- ✦ `java.util.stream.AbstractPipeline.evaluate (AbstractPipeline.java:233)`
   - `java.util.stream.ReferencePipeline$7` retains 56 B (<0.1% of thread retained)
   - `java.util.stream.ReduceOps$3` retains 32 B (<0.1% of thread retained)
-- `java.util.stream.ReferencePipeline.collect (ReferencePipeline.java:682)`
+- ✦ `java.util.stream.ReferencePipeline.collect (ReferencePipeline.java:682)`
   - `java.util.stream.ReferencePipeline$7` retains 56 B (<0.1% of thread retained)
   - `java.util.stream.Collectors$CollectorImpl` retains 32 B (<0.1% of thread retained)
-- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.parallelEncode (MnemonicsCoderWithStream.java:107)`
-  - `org.renaissance.jdk.streams.MnemonicsCoderWithStream` retains 2.8 KB (<0.1% of thread retained)
+- ✦ `org.renaissance.jdk.streams.MnemonicsCoderWithStream.parallelEncode (MnemonicsCoderWithStream.java:107)`
+  - `org.renaissance.jdk.streams.MnemonicsCoderWithStream` retains 2.8 KiB (<0.1% of thread retained)
   - `java.lang.String` retains 80 B (<0.1% of thread retained)
   - `java.util.HashSet` retains 64 B (<0.1% of thread retained)
   - `java.util.stream.ReferencePipeline$Head` retains 56 B (<0.1% of thread retained)
   - `java.util.stream.ReferencePipeline$Head` retains 56 B (<0.1% of thread retained)
-- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.parallelTranslate (MnemonicsCoderWithStream.java:112)`
-  - `org.renaissance.jdk.streams.MnemonicsCoderWithStream` retains 2.8 KB (<0.1% of thread retained)
+- ✦ `org.renaissance.jdk.streams.MnemonicsCoderWithStream.parallelTranslate (MnemonicsCoderWithStream.java:112)`
+  - `org.renaissance.jdk.streams.MnemonicsCoderWithStream` retains 2.8 KiB (<0.1% of thread retained)
   - `java.lang.String` retains 80 B (<0.1% of thread retained)
-- `org.renaissance.jdk.streams.ParMnemonics.run (ParMnemonics.scala:79)`
+- ✦ `org.renaissance.jdk.streams.ParMnemonics.run (ParMnemonics.scala:79)`
   - `org.renaissance.jdk.streams.ParMnemonics` retains 24 B (<0.1% of thread retained)
+- `org.renaissance.harness.ExecutionDriver.executeOperation (ExecutionDriver.java:137)`
+- `org.renaissance.harness.ExecutionDriver.executeBenchmark (ExecutionDriver.java:93)`
+- `org.renaissance.harness.RenaissanceSuite$.runBenchmarks$$anonfun$1 (RenaissanceSuite.scala:172)`
+- `org.renaissance.harness.RenaissanceSuite$$$Lambda+0x00007c84941205b8.applyVoid (Unknown Source)`
+- `scala.runtime.function.JProcedure1.apply (JProcedure1.java:15)`
+- `scala.runtime.function.JProcedure1.apply (JProcedure1.java:10)`
+- `scala.collection.immutable.List.foreach (List.scala:333)`
+- `org.renaissance.harness.RenaissanceSuite$.runBenchmarks (RenaissanceSuite.scala:205)`
+- `org.renaissance.harness.RenaissanceSuite$.main (RenaissanceSuite.scala:130)`
+- `org.renaissance.harness.RenaissanceSuite.main (RenaissanceSuite.scala)`
+- `java.lang.invoke.LambdaForm$DMH+0x00007c8494004800.invokeStatic (LambdaForm$DMH)`
+- `java.lang.invoke.LambdaForm$MH+0x00007c8494009800.invoke (LambdaForm$MH)`
+- `java.lang.invoke.Invokers$Holder.invokeExact_MT (Invokers$Holder)`
+- `jdk.internal.reflect.DirectMethodHandleAccessor.invokeImpl (DirectMethodHandleAccessor.java:154)`
+- `jdk.internal.reflect.DirectMethodHandleAccessor.invoke (DirectMethodHandleAccessor.java:103)`
+- `java.lang.reflect.Method.invoke (Method.java:580)`
+- `org.renaissance.core.Launcher.loadAndInvokeHarnessClass (Launcher.java:129)`
+- `org.renaissance.core.Launcher.launchHarnessClass (Launcher.java:78)`
+- `org.renaissance.core.Launcher.main (Launcher.java:43)`
 
 <a id="thread-2"></a>
 
 ### Thread 2 "Reference Handler" (java/lang/ref/Reference$ReferenceHandler)
 
 _Local roots: 0._
+
+_Complete stack: 3 frames as recorded in the dump._
 
 - `java.lang.ref.Reference.waitForReferencePendingList (Native Method)`
 - `java.lang.ref.Reference.processPendingReferences (Reference.java:246)`
@@ -15775,20 +15852,23 @@ _Local roots: 7._
 | `java.lang.ref.NativeReferenceQueue$Lock` |    ×3 |    16 B |     16 B |
 | `java.lang.System$2`                      |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 208 B retained heap._
+_Complete stack: 7 frames as recorded in the dump._
 
-- `java.lang.Object.wait (Object.java:366)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 208 B retained heap._
+
+- `java.lang.Object.wait0 (Native Method)`
+- ✦ `java.lang.Object.wait (Object.java:366)`
   - `java.lang.ref.NativeReferenceQueue$Lock` retains 16 B (<0.1% of thread retained)
-- `java.lang.Object.wait (Object.java:339)`
+- ✦ `java.lang.Object.wait (Object.java:339)`
   - `java.lang.ref.NativeReferenceQueue$Lock` retains 16 B (<0.1% of thread retained)
-- `java.lang.ref.NativeReferenceQueue.await (NativeReferenceQueue.java:48)`
+- ✦ `java.lang.ref.NativeReferenceQueue.await (NativeReferenceQueue.java:48)`
   - `java.lang.ref.NativeReferenceQueue` retains 40 B (<0.1% of thread retained)
-- `java.lang.ref.ReferenceQueue.remove0 (ReferenceQueue.java:158)`
+- ✦ `java.lang.ref.ReferenceQueue.remove0 (ReferenceQueue.java:158)`
   - `java.lang.ref.NativeReferenceQueue` retains 40 B (<0.1% of thread retained)
-- `java.lang.ref.NativeReferenceQueue.remove (NativeReferenceQueue.java:89)`
+- ✦ `java.lang.ref.NativeReferenceQueue.remove (NativeReferenceQueue.java:89)`
   - `java.lang.ref.NativeReferenceQueue` retains 40 B (<0.1% of thread retained)
   - `java.lang.ref.NativeReferenceQueue$Lock` retains 16 B (<0.1% of thread retained)
-- `java.lang.ref.Finalizer$FinalizerThread.run (Finalizer.java:173)`
+- ✦ `java.lang.ref.Finalizer$FinalizerThread.run (Finalizer.java:173)`
   - `java.lang.System$2` retains 16 B (<0.1% of thread retained)
 
 <a id="thread-6"></a>
@@ -15808,28 +15888,32 @@ _Local roots: 12._
 | `java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject` |    ×2 |    24 B |     24 B |
 | `jdk.internal.ref.CleanerImpl`                                          |    ×3 |    24 B |     24 B |
 
-_Frame percentages are of this thread's 168 B retained heap._
+_Complete stack: 10 frames as recorded in the dump._
 
-- `java.util.concurrent.locks.LockSupport.parkNanos (LockSupport.java:269)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 168 B retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- ✦ `java.util.concurrent.locks.LockSupport.parkNanos (LockSupport.java:269)`
   - `java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject` retains 24 B (<0.1% of thread retained)
-- `java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject.await (AbstractQueuedSynchronizer.java:1886)`
+- ✦ `java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject.await (AbstractQueuedSynchronizer.java:1886)`
   - `java.util.concurrent.TimeUnit` retains 80 B (<0.1% of thread retained)
   - `java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionNode` retains 32 B (<0.1% of thread retained)
   - `java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject` retains 24 B (<0.1% of thread retained)
-- `java.lang.ref.ReferenceQueue.await (ReferenceQueue.java:71)`
+- ✦ `java.lang.ref.ReferenceQueue.await (ReferenceQueue.java:71)`
   - `java.lang.ref.ReferenceQueue` retains 48 B (<0.1% of thread retained)
-- `java.lang.ref.ReferenceQueue.remove0 (ReferenceQueue.java:143)`
+- ✦ `java.lang.ref.ReferenceQueue.remove0 (ReferenceQueue.java:143)`
   - `java.lang.ref.ReferenceQueue` retains 48 B (<0.1% of thread retained)
-- `java.lang.ref.ReferenceQueue.remove (ReferenceQueue.java:218)`
+- ✦ `java.lang.ref.ReferenceQueue.remove (ReferenceQueue.java:218)`
   - `java.lang.ref.ReferenceQueue` retains 48 B (<0.1% of thread retained)
-- `jdk.internal.ref.CleanerImpl.run (CleanerImpl.java:140)`
+- ✦ `jdk.internal.ref.CleanerImpl.run (CleanerImpl.java:140)`
   - `jdk.internal.ref.CleanerImpl` retains 24 B (<0.1% of thread retained)
-- `java.lang.Thread.runWith (Thread.java:1596)`
+- ✦ `java.lang.Thread.runWith (Thread.java:1596)`
   - `java.lang.Class` retains 128 B (<0.1% of thread retained)
   - `jdk.internal.ref.CleanerImpl` retains 24 B (<0.1% of thread retained)
-- `java.lang.Thread.run (Thread.java:1583)`
+- ✦ `java.lang.Thread.run (Thread.java:1583)`
   - `java.lang.Class` retains 128 B (<0.1% of thread retained)
   - `jdk.internal.ref.CleanerImpl` retains 24 B (<0.1% of thread retained)
+- `jdk.internal.misc.InnocuousThread.run (InnocuousThread.java:186)`
 
 <a id="thread-7"></a>
 
@@ -15841,20 +15925,24 @@ _Local roots: 7._
 
 | Object                                          | Count | Shallow | Retained |
 | ----------------------------------------------- | ----: | ------: | -------: |
-| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 |  1.0 KB |   1.0 KB |
+| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 | 1.0 KiB |  1.0 KiB |
 | `java.util.concurrent.ForkJoinPool$WorkQueue`   |    ×3 |    56 B |    328 B |
 | `java.util.concurrent.ForkJoinPool`             |    ×3 |    96 B |    144 B |
 
-_Frame percentages are of this thread's 240 B retained heap._
+_Complete stack: 5 frames as recorded in the dump._
 
-- `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
-  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KB (<0.1% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 240 B retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:371)`
+- ✦ `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
+  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KiB (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
+- ✦ `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
+- ✦ `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
 
@@ -15868,20 +15956,24 @@ _Local roots: 7._
 
 | Object                                          | Count | Shallow | Retained |
 | ----------------------------------------------- | ----: | ------: | -------: |
-| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 |  1.0 KB |   1.0 KB |
+| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 | 1.0 KiB |  1.0 KiB |
 | `java.util.concurrent.ForkJoinPool$WorkQueue`   |    ×3 |    56 B |    328 B |
 | `java.util.concurrent.ForkJoinPool`             |    ×3 |    96 B |    144 B |
 
-_Frame percentages are of this thread's 240 B retained heap._
+_Complete stack: 5 frames as recorded in the dump._
 
-- `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
-  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KB (<0.1% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 240 B retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:371)`
+- ✦ `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
+  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KiB (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
+- ✦ `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
+- ✦ `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
 
@@ -15895,20 +15987,24 @@ _Local roots: 7._
 
 | Object                                          | Count | Shallow | Retained |
 | ----------------------------------------------- | ----: | ------: | -------: |
-| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 |  1.0 KB |   1.0 KB |
+| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 | 1.0 KiB |  1.0 KiB |
 | `java.util.concurrent.ForkJoinPool$WorkQueue`   |    ×3 |    56 B |    328 B |
 | `java.util.concurrent.ForkJoinPool`             |    ×3 |    96 B |    144 B |
 
-_Frame percentages are of this thread's 240 B retained heap._
+_Complete stack: 5 frames as recorded in the dump._
 
-- `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
-  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KB (<0.1% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 240 B retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:371)`
+- ✦ `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
+  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KiB (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
+- ✦ `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
+- ✦ `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
 
@@ -15922,20 +16018,24 @@ _Local roots: 7._
 
 | Object                                          | Count | Shallow | Retained |
 | ----------------------------------------------- | ----: | ------: | -------: |
-| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 |  1.0 KB |   1.0 KB |
+| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 | 1.0 KiB |  1.0 KiB |
 | `java.util.concurrent.ForkJoinPool$WorkQueue`   |    ×3 |    56 B |    328 B |
 | `java.util.concurrent.ForkJoinPool`             |    ×3 |    96 B |    144 B |
 
-_Frame percentages are of this thread's 240 B retained heap._
+_Complete stack: 5 frames as recorded in the dump._
 
-- `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
-  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KB (<0.1% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 240 B retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:371)`
+- ✦ `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
+  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KiB (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
+- ✦ `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
+- ✦ `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
 
@@ -15949,20 +16049,24 @@ _Local roots: 7._
 
 | Object                                          | Count | Shallow | Retained |
 | ----------------------------------------------- | ----: | ------: | -------: |
-| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 |  1.0 KB |   1.0 KB |
+| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 | 1.0 KiB |  1.0 KiB |
 | `java.util.concurrent.ForkJoinPool$WorkQueue`   |    ×3 |    56 B |    328 B |
 | `java.util.concurrent.ForkJoinPool`             |    ×3 |    96 B |    144 B |
 
-_Frame percentages are of this thread's 240 B retained heap._
+_Complete stack: 5 frames as recorded in the dump._
 
-- `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
-  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KB (<0.1% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 240 B retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:371)`
+- ✦ `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
+  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KiB (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
+- ✦ `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
+- ✦ `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
 
@@ -15976,20 +16080,24 @@ _Local roots: 7._
 
 | Object                                          | Count | Shallow | Retained |
 | ----------------------------------------------- | ----: | ------: | -------: |
-| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 |  1.0 KB |   1.0 KB |
+| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 | 1.0 KiB |  1.0 KiB |
 | `java.util.concurrent.ForkJoinPool$WorkQueue`   |    ×3 |    56 B |    328 B |
 | `java.util.concurrent.ForkJoinPool`             |    ×3 |    96 B |    144 B |
 
-_Frame percentages are of this thread's 240 B retained heap._
+_Complete stack: 5 frames as recorded in the dump._
 
-- `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
-  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KB (<0.1% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 240 B retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:371)`
+- ✦ `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
+  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KiB (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
+- ✦ `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
+- ✦ `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
 
@@ -16003,20 +16111,24 @@ _Local roots: 7._
 
 | Object                                          | Count | Shallow | Retained |
 | ----------------------------------------------- | ----: | ------: | -------: |
-| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 |  1.0 KB |   1.0 KB |
+| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 | 1.0 KiB |  1.0 KiB |
 | `java.util.concurrent.ForkJoinPool$WorkQueue`   |    ×3 |    56 B |    328 B |
 | `java.util.concurrent.ForkJoinPool`             |    ×3 |    96 B |    144 B |
 
-_Frame percentages are of this thread's 240 B retained heap._
+_Complete stack: 5 frames as recorded in the dump._
 
-- `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
-  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KB (<0.1% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 240 B retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:371)`
+- ✦ `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
+  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KiB (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
+- ✦ `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
+- ✦ `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
 
@@ -16030,20 +16142,24 @@ _Local roots: 7._
 
 | Object                                          | Count | Shallow | Retained |
 | ----------------------------------------------- | ----: | ------: | -------: |
-| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 |  1.0 KB |   1.0 KB |
+| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 | 1.0 KiB |  1.0 KiB |
 | `java.util.concurrent.ForkJoinPool$WorkQueue`   |    ×3 |    56 B |    328 B |
 | `java.util.concurrent.ForkJoinPool`             |    ×3 |    96 B |    144 B |
 
-_Frame percentages are of this thread's 240 B retained heap._
+_Complete stack: 5 frames as recorded in the dump._
 
-- `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
-  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KB (<0.1% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 240 B retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:371)`
+- ✦ `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
+  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KiB (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
+- ✦ `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
+- ✦ `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
 
@@ -16057,20 +16173,24 @@ _Local roots: 7._
 
 | Object                                          | Count | Shallow | Retained |
 | ----------------------------------------------- | ----: | ------: | -------: |
-| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 |  1.0 KB |   1.0 KB |
+| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 | 1.0 KiB |  1.0 KiB |
 | `java.util.concurrent.ForkJoinPool$WorkQueue`   |    ×3 |    56 B |    328 B |
 | `java.util.concurrent.ForkJoinPool`             |    ×3 |    96 B |    144 B |
 
-_Frame percentages are of this thread's 240 B retained heap._
+_Complete stack: 5 frames as recorded in the dump._
 
-- `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
-  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KB (<0.1% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 240 B retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:371)`
+- ✦ `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
+  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KiB (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
+- ✦ `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
+- ✦ `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
 
@@ -16084,20 +16204,24 @@ _Local roots: 7._
 
 | Object                                          | Count | Shallow | Retained |
 | ----------------------------------------------- | ----: | ------: | -------: |
-| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 |  1.0 KB |   1.0 KB |
+| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 | 1.0 KiB |  1.0 KiB |
 | `java.util.concurrent.ForkJoinPool$WorkQueue`   |    ×3 |    56 B |    328 B |
 | `java.util.concurrent.ForkJoinPool`             |    ×3 |    96 B |    144 B |
 
-_Frame percentages are of this thread's 248 B retained heap._
+_Complete stack: 5 frames as recorded in the dump._
 
-- `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
-  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KB (<0.1% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 248 B retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:371)`
+- ✦ `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
+  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KiB (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
+- ✦ `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
+- ✦ `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
 
@@ -16111,20 +16235,24 @@ _Local roots: 7._
 
 | Object                                          | Count | Shallow | Retained |
 | ----------------------------------------------- | ----: | ------: | -------: |
-| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 |  1.0 KB |   1.0 KB |
+| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 | 1.0 KiB |  1.0 KiB |
 | `java.util.concurrent.ForkJoinPool$WorkQueue`   |    ×3 |    56 B |    328 B |
 | `java.util.concurrent.ForkJoinPool`             |    ×3 |    96 B |    144 B |
 
-_Frame percentages are of this thread's 248 B retained heap._
+_Complete stack: 5 frames as recorded in the dump._
 
-- `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
-  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KB (<0.1% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 248 B retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:371)`
+- ✦ `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
+  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KiB (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
+- ✦ `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
+- ✦ `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
 
@@ -16138,20 +16266,24 @@ _Local roots: 7._
 
 | Object                                          | Count | Shallow | Retained |
 | ----------------------------------------------- | ----: | ------: | -------: |
-| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 |  1.0 KB |   1.0 KB |
+| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 | 1.0 KiB |  1.0 KiB |
 | `java.util.concurrent.ForkJoinPool$WorkQueue`   |    ×3 |    56 B |    328 B |
 | `java.util.concurrent.ForkJoinPool`             |    ×3 |    96 B |    144 B |
 
-_Frame percentages are of this thread's 248 B retained heap._
+_Complete stack: 5 frames as recorded in the dump._
 
-- `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
-  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KB (<0.1% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 248 B retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:371)`
+- ✦ `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
+  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KiB (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
+- ✦ `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
+- ✦ `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
 
@@ -16165,20 +16297,24 @@ _Local roots: 7._
 
 | Object                                          | Count | Shallow | Retained |
 | ----------------------------------------------- | ----: | ------: | -------: |
-| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 |  1.0 KB |   1.0 KB |
+| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 | 1.0 KiB |  1.0 KiB |
 | `java.util.concurrent.ForkJoinPool$WorkQueue`   |    ×3 |    56 B |    328 B |
 | `java.util.concurrent.ForkJoinPool`             |    ×3 |    96 B |    144 B |
 
-_Frame percentages are of this thread's 248 B retained heap._
+_Complete stack: 5 frames as recorded in the dump._
 
-- `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
-  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KB (<0.1% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 248 B retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:371)`
+- ✦ `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
+  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KiB (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
+- ✦ `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
+- ✦ `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
 
@@ -16192,20 +16328,24 @@ _Local roots: 7._
 
 | Object                                          | Count | Shallow | Retained |
 | ----------------------------------------------- | ----: | ------: | -------: |
-| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 |  1.0 KB |   1.0 KB |
+| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 | 1.0 KiB |  1.0 KiB |
 | `java.util.concurrent.ForkJoinPool$WorkQueue`   |    ×3 |    56 B |    328 B |
 | `java.util.concurrent.ForkJoinPool`             |    ×3 |    96 B |    144 B |
 
-_Frame percentages are of this thread's 248 B retained heap._
+_Complete stack: 5 frames as recorded in the dump._
 
-- `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
-  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KB (<0.1% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 248 B retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:371)`
+- ✦ `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
+  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KiB (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
+- ✦ `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
+- ✦ `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
 
@@ -16219,20 +16359,24 @@ _Local roots: 7._
 
 | Object                                          | Count | Shallow | Retained |
 | ----------------------------------------------- | ----: | ------: | -------: |
-| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 |  1.0 KB |   1.0 KB |
+| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 | 1.0 KiB |  1.0 KiB |
 | `java.util.concurrent.ForkJoinPool$WorkQueue`   |    ×3 |    56 B |    328 B |
 | `java.util.concurrent.ForkJoinPool`             |    ×3 |    96 B |    144 B |
 
-_Frame percentages are of this thread's 248 B retained heap._
+_Complete stack: 5 frames as recorded in the dump._
 
-- `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
-  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KB (<0.1% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 248 B retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:371)`
+- ✦ `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
+  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KiB (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
+- ✦ `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
+- ✦ `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
 
@@ -16248,8 +16392,8 @@ _Showing top 20 of 316 by retained heap; retained sizes overlap, so totals may e
 
 | Object                                                   | Count | Shallow | Retained |
 | -------------------------------------------------------- | ----: | ------: | -------: |
-| `org.renaissance.jdk.streams.MnemonicsCoderWithStream`   |     1 |    24 B |   2.8 KB |
-| `java.util.HashMap`                                      |     1 |    48 B |   1.8 KB |
+| `org.renaissance.jdk.streams.MnemonicsCoderWithStream`   |     1 |    24 B |  2.8 KiB |
+| `java.util.HashMap`                                      |     1 |    48 B |  1.8 KiB |
 | `java.lang.String[]`                                     |     1 |   160 B |    160 B |
 | `java.util.stream.IntPipeline$1$1`                       |    ×2 |    24 B |    152 B |
 | `java.util.stream.ReduceOps$3ReducingSink`               |     1 |    32 B |     88 B |
@@ -16265,40 +16409,323 @@ _Showing top 20 of 316 by retained heap; retained sizes overlap, so totals may e
 | `java.util.stream.Collectors$$Lambda+0x00007c849406e898` |     1 |    16 B |     16 B |
 | `java.util.stream.Collectors$$Lambda+0x00007c849406eab8` |     1 |    16 B |     16 B |
 
-_Frame percentages are of this thread's 8.9 MB retained heap._
+_Complete stack: 293 frames as recorded in the dump._
 
-- `java.lang.StringLatin1$CharsSpliterator.forEachRemaining (StringLatin1.java:811)`
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 8.9 MiB retained heap._
+
+- `java.util.stream.ReduceOps$3ReducingSink.accept (ReduceOps.java:169)`
+- `java.util.stream.IntPipeline$1$1.accept (IntPipeline.java:180)`
+- ✦ `java.lang.StringLatin1$CharsSpliterator.forEachRemaining (StringLatin1.java:811)`
   - `java.util.stream.IntPipeline$1$1` retains 152 B (<0.1% of thread retained)
   - `byte[]` retains 24 B (<0.1% of thread retained)
-- `java.util.stream.AbstractPipeline.copyInto (AbstractPipeline.java:509)`
+- `java.util.Spliterator$OfInt.forEachRemaining (Spliterator.java:712)`
+- ✦ `java.util.stream.AbstractPipeline.copyInto (AbstractPipeline.java:509)`
   - `java.util.stream.IntPipeline$1$1` retains 152 B (<0.1% of thread retained)
-- `java.util.stream.AbstractPipeline.wrapAndCopyInto (AbstractPipeline.java:499)`
+- ✦ `java.util.stream.AbstractPipeline.wrapAndCopyInto (AbstractPipeline.java:499)`
   - `java.util.stream.ReduceOps$3ReducingSink` retains 88 B (<0.1% of thread retained)
-- `java.util.stream.Collectors.lambda$groupingBy$53 (Collectors.java:1105)`
-  - `java.util.HashMap` retains 1.8 KB (<0.1% of thread retained)
+- `java.util.stream.ReduceOps$ReduceOp.evaluateSequential (ReduceOps.java:921)`
+- `java.util.stream.AbstractPipeline.evaluate (AbstractPipeline.java:234)`
+- `java.util.stream.ReferencePipeline.collect (ReferencePipeline.java:682)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.wordCode (MnemonicsCoderWithStream.java:38)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream$$Lambda+0x00007c8494128248.apply (Unknown Source)`
+- ✦ `java.util.stream.Collectors.lambda$groupingBy$53 (Collectors.java:1105)`
+  - `java.util.HashMap` retains 1.8 KiB (<0.1% of thread retained)
   - `java.lang.String` retains 24 B (<0.1% of thread retained)
   - `java.util.stream.Collectors$$Lambda+0x00007c849406e898` retains 16 B (<0.1% of thread retained)
   - `java.util.stream.Collectors$$Lambda+0x00007c849406eab8` retains 16 B (<0.1% of thread retained)
-- `java.util.Spliterators$ArraySpliterator.forEachRemaining (Spliterators.java:1024)`
+- `java.util.stream.Collectors$$Lambda+0x00007c849407e748.accept (Unknown Source)`
+- `java.util.stream.ReduceOps$3ReducingSink.accept (ReduceOps.java:169)`
+- ✦ `java.util.Spliterators$ArraySpliterator.forEachRemaining (Spliterators.java:1024)`
   - `java.lang.String[]` retains 160 B (<0.1% of thread retained)
   - `java.util.stream.ReduceOps$3ReducingSink` retains 32 B (<0.1% of thread retained)
-- `java.util.stream.AbstractPipeline.copyInto (AbstractPipeline.java:509)`
+- ✦ `java.util.stream.AbstractPipeline.copyInto (AbstractPipeline.java:509)`
   - `java.util.stream.ReduceOps$3ReducingSink` retains 32 B (<0.1% of thread retained)
-- `java.util.stream.AbstractPipeline.wrapAndCopyInto (AbstractPipeline.java:499)`
+- ✦ `java.util.stream.AbstractPipeline.wrapAndCopyInto (AbstractPipeline.java:499)`
   - `java.util.stream.ReduceOps$3ReducingSink` retains 32 B (<0.1% of thread retained)
-- `java.util.stream.ReferencePipeline.collect (ReferencePipeline.java:682)`
+- `java.util.stream.ReduceOps$ReduceOp.evaluateSequential (ReduceOps.java:921)`
+- `java.util.stream.AbstractPipeline.evaluate (AbstractPipeline.java:234)`
+- ✦ `java.util.stream.ReferencePipeline.collect (ReferencePipeline.java:682)`
   - `java.util.stream.Collectors$CollectorImpl` retains 32 B (<0.1% of thread retained)
-- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.encode (MnemonicsCoderWithStream.java:62)`
-  - `org.renaissance.jdk.streams.MnemonicsCoderWithStream` retains 2.8 KB (<0.1% of thread retained)
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.wordsForNum (MnemonicsCoderWithStream.java:44)`
+- ✦ `org.renaissance.jdk.streams.MnemonicsCoderWithStream.encode (MnemonicsCoderWithStream.java:62)`
+  - `org.renaissance.jdk.streams.MnemonicsCoderWithStream` retains 2.8 KiB (<0.1% of thread retained)
   - `java.util.HashSet` retains 64 B (<0.1% of thread retained)
   - `java.lang.String` retains 56 B (<0.1% of thread retained)
-- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.lambda$encode$9 (MnemonicsCoderWithStream.java:67)`
+- ✦ `org.renaissance.jdk.streams.MnemonicsCoderWithStream.lambda$encode$9 (MnemonicsCoderWithStream.java:67)`
   - `java.lang.String` retains 56 B (<0.1% of thread retained)
   - `java.lang.String` retains 48 B (<0.1% of thread retained)
-- `java.util.stream.ReferencePipeline$3$1.accept (ReferencePipeline.java:197)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream$$Lambda+0x00007c8494128dc0.apply (Unknown Source)`
+- ✦ `java.util.stream.ReferencePipeline$3$1.accept (ReferencePipeline.java:197)`
   - `java.util.stream.ReferencePipeline$7$1` retains 24 B (<0.1% of thread retained)
-- `java.util.ArrayList$ArrayListSpliterator.forEachRemaining (ArrayList.java:1708)`
+- ✦ `java.util.ArrayList$ArrayListSpliterator.forEachRemaining (ArrayList.java:1708)`
   - `java.util.ArrayList$ArrayListSpliterator` retains 32 B (<0.1% of thread retained)
+- `java.util.stream.ReferencePipeline$Head.forEach (ReferencePipeline.java:762)`
+- `java.util.stream.ReferencePipeline$7$1.accept (ReferencePipeline.java:276)`
+- `java.util.stream.ReferencePipeline$2$1.accept (ReferencePipeline.java:179)`
+- `java.util.HashMap$EntrySpliterator.forEachRemaining (HashMap.java:1858)`
+- `java.util.stream.AbstractPipeline.copyInto (AbstractPipeline.java:509)`
+- `java.util.stream.AbstractPipeline.wrapAndCopyInto (AbstractPipeline.java:499)`
+- `java.util.stream.ReduceOps$ReduceOp.evaluateSequential (ReduceOps.java:921)`
+- `java.util.stream.AbstractPipeline.evaluate (AbstractPipeline.java:234)`
+- `java.util.stream.ReferencePipeline.collect (ReferencePipeline.java:682)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.encode (MnemonicsCoderWithStream.java:75)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.lambda$encode$9 (MnemonicsCoderWithStream.java:67)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream$$Lambda+0x00007c8494128dc0.apply (Unknown Source)`
+- `java.util.stream.ReferencePipeline$3$1.accept (ReferencePipeline.java:197)`
+- `java.util.ArrayList$ArrayListSpliterator.forEachRemaining (ArrayList.java:1708)`
+- `java.util.stream.ReferencePipeline$Head.forEach (ReferencePipeline.java:762)`
+- `java.util.stream.ReferencePipeline$7$1.accept (ReferencePipeline.java:276)`
+- `java.util.stream.ReferencePipeline$2$1.accept (ReferencePipeline.java:179)`
+- `java.util.HashMap$EntrySpliterator.forEachRemaining (HashMap.java:1858)`
+- `java.util.stream.AbstractPipeline.copyInto (AbstractPipeline.java:509)`
+- `java.util.stream.AbstractPipeline.wrapAndCopyInto (AbstractPipeline.java:499)`
+- `java.util.stream.ReduceOps$ReduceOp.evaluateSequential (ReduceOps.java:921)`
+- `java.util.stream.AbstractPipeline.evaluate (AbstractPipeline.java:234)`
+- `java.util.stream.ReferencePipeline.collect (ReferencePipeline.java:682)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.encode (MnemonicsCoderWithStream.java:75)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.lambda$encode$9 (MnemonicsCoderWithStream.java:67)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream$$Lambda+0x00007c8494128dc0.apply (Unknown Source)`
+- `java.util.stream.ReferencePipeline$3$1.accept (ReferencePipeline.java:197)`
+- `java.util.ArrayList$ArrayListSpliterator.forEachRemaining (ArrayList.java:1708)`
+- `java.util.stream.ReferencePipeline$Head.forEach (ReferencePipeline.java:762)`
+- `java.util.stream.ReferencePipeline$7$1.accept (ReferencePipeline.java:276)`
+- `java.util.stream.ReferencePipeline$2$1.accept (ReferencePipeline.java:179)`
+- `java.util.HashMap$EntrySpliterator.forEachRemaining (HashMap.java:1858)`
+- `java.util.stream.AbstractPipeline.copyInto (AbstractPipeline.java:509)`
+- `java.util.stream.AbstractPipeline.wrapAndCopyInto (AbstractPipeline.java:499)`
+- `java.util.stream.ReduceOps$ReduceOp.evaluateSequential (ReduceOps.java:921)`
+- `java.util.stream.AbstractPipeline.evaluate (AbstractPipeline.java:234)`
+- `java.util.stream.ReferencePipeline.collect (ReferencePipeline.java:682)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.encode (MnemonicsCoderWithStream.java:75)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.lambda$encode$9 (MnemonicsCoderWithStream.java:67)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream$$Lambda+0x00007c8494128dc0.apply (Unknown Source)`
+- `java.util.stream.ReferencePipeline$3$1.accept (ReferencePipeline.java:197)`
+- `java.util.ArrayList$ArrayListSpliterator.forEachRemaining (ArrayList.java:1708)`
+- `java.util.stream.ReferencePipeline$Head.forEach (ReferencePipeline.java:762)`
+- `java.util.stream.ReferencePipeline$7$1.accept (ReferencePipeline.java:276)`
+- `java.util.stream.ReferencePipeline$2$1.accept (ReferencePipeline.java:179)`
+- `java.util.HashMap$EntrySpliterator.forEachRemaining (HashMap.java:1858)`
+- `java.util.stream.AbstractPipeline.copyInto (AbstractPipeline.java:509)`
+- `java.util.stream.AbstractPipeline.wrapAndCopyInto (AbstractPipeline.java:499)`
+- `java.util.stream.ReduceOps$ReduceOp.evaluateSequential (ReduceOps.java:921)`
+- `java.util.stream.AbstractPipeline.evaluate (AbstractPipeline.java:234)`
+- `java.util.stream.ReferencePipeline.collect (ReferencePipeline.java:682)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.encode (MnemonicsCoderWithStream.java:75)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.lambda$encode$9 (MnemonicsCoderWithStream.java:67)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream$$Lambda+0x00007c8494128dc0.apply (Unknown Source)`
+- `java.util.stream.ReferencePipeline$3$1.accept (ReferencePipeline.java:197)`
+- `java.util.ArrayList$ArrayListSpliterator.forEachRemaining (ArrayList.java:1708)`
+- `java.util.stream.ReferencePipeline$Head.forEach (ReferencePipeline.java:762)`
+- `java.util.stream.ReferencePipeline$7$1.accept (ReferencePipeline.java:276)`
+- `java.util.stream.ReferencePipeline$2$1.accept (ReferencePipeline.java:179)`
+- `java.util.HashMap$EntrySpliterator.forEachRemaining (HashMap.java:1858)`
+- `java.util.stream.AbstractPipeline.copyInto (AbstractPipeline.java:509)`
+- `java.util.stream.AbstractPipeline.wrapAndCopyInto (AbstractPipeline.java:499)`
+- `java.util.stream.ReduceOps$ReduceOp.evaluateSequential (ReduceOps.java:921)`
+- `java.util.stream.AbstractPipeline.evaluate (AbstractPipeline.java:234)`
+- `java.util.stream.ReferencePipeline.collect (ReferencePipeline.java:682)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.encode (MnemonicsCoderWithStream.java:75)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.lambda$encode$9 (MnemonicsCoderWithStream.java:67)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream$$Lambda+0x00007c8494128dc0.apply (Unknown Source)`
+- `java.util.stream.ReferencePipeline$3$1.accept (ReferencePipeline.java:197)`
+- `java.util.ArrayList$ArrayListSpliterator.forEachRemaining (ArrayList.java:1708)`
+- `java.util.stream.ReferencePipeline$Head.forEach (ReferencePipeline.java:762)`
+- `java.util.stream.ReferencePipeline$7$1.accept (ReferencePipeline.java:276)`
+- `java.util.stream.ReferencePipeline$2$1.accept (ReferencePipeline.java:179)`
+- `java.util.HashMap$EntrySpliterator.forEachRemaining (HashMap.java:1858)`
+- `java.util.stream.AbstractPipeline.copyInto (AbstractPipeline.java:509)`
+- `java.util.stream.AbstractPipeline.wrapAndCopyInto (AbstractPipeline.java:499)`
+- `java.util.stream.ReduceOps$ReduceOp.evaluateSequential (ReduceOps.java:921)`
+- `java.util.stream.AbstractPipeline.evaluate (AbstractPipeline.java:234)`
+- `java.util.stream.ReferencePipeline.collect (ReferencePipeline.java:682)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.encode (MnemonicsCoderWithStream.java:75)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.lambda$encode$9 (MnemonicsCoderWithStream.java:67)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream$$Lambda+0x00007c8494128dc0.apply (Unknown Source)`
+- `java.util.stream.ReferencePipeline$3$1.accept (ReferencePipeline.java:197)`
+- `java.util.ArrayList$ArrayListSpliterator.forEachRemaining (ArrayList.java:1708)`
+- `java.util.stream.ReferencePipeline$Head.forEach (ReferencePipeline.java:762)`
+- `java.util.stream.ReferencePipeline$7$1.accept (ReferencePipeline.java:276)`
+- `java.util.stream.ReferencePipeline$2$1.accept (ReferencePipeline.java:179)`
+- `java.util.HashMap$EntrySpliterator.forEachRemaining (HashMap.java:1858)`
+- `java.util.stream.AbstractPipeline.copyInto (AbstractPipeline.java:509)`
+- `java.util.stream.AbstractPipeline.wrapAndCopyInto (AbstractPipeline.java:499)`
+- `java.util.stream.ReduceOps$ReduceOp.evaluateSequential (ReduceOps.java:921)`
+- `java.util.stream.AbstractPipeline.evaluate (AbstractPipeline.java:234)`
+- `java.util.stream.ReferencePipeline.collect (ReferencePipeline.java:682)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.encode (MnemonicsCoderWithStream.java:75)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.lambda$encode$9 (MnemonicsCoderWithStream.java:67)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream$$Lambda+0x00007c8494128dc0.apply (Unknown Source)`
+- `java.util.stream.ReferencePipeline$3$1.accept (ReferencePipeline.java:197)`
+- `java.util.ArrayList$ArrayListSpliterator.forEachRemaining (ArrayList.java:1708)`
+- `java.util.stream.ReferencePipeline$Head.forEach (ReferencePipeline.java:762)`
+- `java.util.stream.ReferencePipeline$7$1.accept (ReferencePipeline.java:276)`
+- `java.util.stream.ReferencePipeline$2$1.accept (ReferencePipeline.java:179)`
+- `java.util.HashMap$EntrySpliterator.forEachRemaining (HashMap.java:1858)`
+- `java.util.stream.AbstractPipeline.copyInto (AbstractPipeline.java:509)`
+- `java.util.stream.AbstractPipeline.wrapAndCopyInto (AbstractPipeline.java:499)`
+- `java.util.stream.ReduceOps$ReduceOp.evaluateSequential (ReduceOps.java:921)`
+- `java.util.stream.AbstractPipeline.evaluate (AbstractPipeline.java:234)`
+- `java.util.stream.ReferencePipeline.collect (ReferencePipeline.java:682)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.encode (MnemonicsCoderWithStream.java:75)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.lambda$encode$9 (MnemonicsCoderWithStream.java:67)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream$$Lambda+0x00007c8494128dc0.apply (Unknown Source)`
+- `java.util.stream.ReferencePipeline$3$1.accept (ReferencePipeline.java:197)`
+- `java.util.ArrayList$ArrayListSpliterator.forEachRemaining (ArrayList.java:1708)`
+- `java.util.stream.ReferencePipeline$Head.forEach (ReferencePipeline.java:762)`
+- `java.util.stream.ReferencePipeline$7$1.accept (ReferencePipeline.java:276)`
+- `java.util.stream.ReferencePipeline$2$1.accept (ReferencePipeline.java:179)`
+- `java.util.HashMap$EntrySpliterator.forEachRemaining (HashMap.java:1858)`
+- `java.util.stream.AbstractPipeline.copyInto (AbstractPipeline.java:509)`
+- `java.util.stream.AbstractPipeline.wrapAndCopyInto (AbstractPipeline.java:499)`
+- `java.util.stream.ReduceOps$ReduceOp.evaluateSequential (ReduceOps.java:921)`
+- `java.util.stream.AbstractPipeline.evaluate (AbstractPipeline.java:234)`
+- `java.util.stream.ReferencePipeline.collect (ReferencePipeline.java:682)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.encode (MnemonicsCoderWithStream.java:75)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.lambda$encode$9 (MnemonicsCoderWithStream.java:67)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream$$Lambda+0x00007c8494128dc0.apply (Unknown Source)`
+- `java.util.stream.ReferencePipeline$3$1.accept (ReferencePipeline.java:197)`
+- `java.util.ArrayList$ArrayListSpliterator.forEachRemaining (ArrayList.java:1708)`
+- `java.util.stream.ReferencePipeline$Head.forEach (ReferencePipeline.java:762)`
+- `java.util.stream.ReferencePipeline$7$1.accept (ReferencePipeline.java:276)`
+- `java.util.stream.ReferencePipeline$2$1.accept (ReferencePipeline.java:179)`
+- `java.util.HashMap$EntrySpliterator.forEachRemaining (HashMap.java:1858)`
+- `java.util.stream.AbstractPipeline.copyInto (AbstractPipeline.java:509)`
+- `java.util.stream.AbstractPipeline.wrapAndCopyInto (AbstractPipeline.java:499)`
+- `java.util.stream.ReduceOps$ReduceOp.evaluateSequential (ReduceOps.java:921)`
+- `java.util.stream.AbstractPipeline.evaluate (AbstractPipeline.java:234)`
+- `java.util.stream.ReferencePipeline.collect (ReferencePipeline.java:682)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.encode (MnemonicsCoderWithStream.java:75)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.lambda$encode$9 (MnemonicsCoderWithStream.java:67)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream$$Lambda+0x00007c8494128dc0.apply (Unknown Source)`
+- `java.util.stream.ReferencePipeline$3$1.accept (ReferencePipeline.java:197)`
+- `java.util.ArrayList$ArrayListSpliterator.forEachRemaining (ArrayList.java:1708)`
+- `java.util.stream.ReferencePipeline$Head.forEach (ReferencePipeline.java:762)`
+- `java.util.stream.ReferencePipeline$7$1.accept (ReferencePipeline.java:276)`
+- `java.util.stream.ReferencePipeline$2$1.accept (ReferencePipeline.java:179)`
+- `java.util.HashMap$EntrySpliterator.forEachRemaining (HashMap.java:1858)`
+- `java.util.stream.AbstractPipeline.copyInto (AbstractPipeline.java:509)`
+- `java.util.stream.AbstractPipeline.wrapAndCopyInto (AbstractPipeline.java:499)`
+- `java.util.stream.ReduceOps$ReduceOp.evaluateSequential (ReduceOps.java:921)`
+- `java.util.stream.AbstractPipeline.evaluate (AbstractPipeline.java:234)`
+- `java.util.stream.ReferencePipeline.collect (ReferencePipeline.java:682)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.encode (MnemonicsCoderWithStream.java:75)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.lambda$encode$9 (MnemonicsCoderWithStream.java:67)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream$$Lambda+0x00007c8494128dc0.apply (Unknown Source)`
+- `java.util.stream.ReferencePipeline$3$1.accept (ReferencePipeline.java:197)`
+- `java.util.ArrayList$ArrayListSpliterator.forEachRemaining (ArrayList.java:1708)`
+- `java.util.stream.ReferencePipeline$Head.forEach (ReferencePipeline.java:762)`
+- `java.util.stream.ReferencePipeline$7$1.accept (ReferencePipeline.java:276)`
+- `java.util.stream.ReferencePipeline$2$1.accept (ReferencePipeline.java:179)`
+- `java.util.HashMap$EntrySpliterator.forEachRemaining (HashMap.java:1858)`
+- `java.util.stream.AbstractPipeline.copyInto (AbstractPipeline.java:509)`
+- `java.util.stream.AbstractPipeline.wrapAndCopyInto (AbstractPipeline.java:499)`
+- `java.util.stream.ReduceOps$ReduceOp.evaluateSequential (ReduceOps.java:921)`
+- `java.util.stream.AbstractPipeline.evaluate (AbstractPipeline.java:234)`
+- `java.util.stream.ReferencePipeline.collect (ReferencePipeline.java:682)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.encode (MnemonicsCoderWithStream.java:75)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.lambda$encode$9 (MnemonicsCoderWithStream.java:67)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream$$Lambda+0x00007c8494128dc0.apply (Unknown Source)`
+- `java.util.stream.ReferencePipeline$3$1.accept (ReferencePipeline.java:197)`
+- `java.util.ArrayList$ArrayListSpliterator.forEachRemaining (ArrayList.java:1708)`
+- `java.util.stream.ReferencePipeline$Head.forEach (ReferencePipeline.java:762)`
+- `java.util.stream.ReferencePipeline$7$1.accept (ReferencePipeline.java:276)`
+- `java.util.stream.ReferencePipeline$2$1.accept (ReferencePipeline.java:179)`
+- `java.util.HashMap$EntrySpliterator.forEachRemaining (HashMap.java:1858)`
+- `java.util.stream.AbstractPipeline.copyInto (AbstractPipeline.java:509)`
+- `java.util.stream.AbstractPipeline.wrapAndCopyInto (AbstractPipeline.java:499)`
+- `java.util.stream.ReduceOps$ReduceOp.evaluateSequential (ReduceOps.java:921)`
+- `java.util.stream.AbstractPipeline.evaluate (AbstractPipeline.java:234)`
+- `java.util.stream.ReferencePipeline.collect (ReferencePipeline.java:682)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.encode (MnemonicsCoderWithStream.java:75)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.lambda$encode$9 (MnemonicsCoderWithStream.java:67)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream$$Lambda+0x00007c8494128dc0.apply (Unknown Source)`
+- `java.util.stream.ReferencePipeline$3$1.accept (ReferencePipeline.java:197)`
+- `java.util.ArrayList$ArrayListSpliterator.forEachRemaining (ArrayList.java:1708)`
+- `java.util.stream.ReferencePipeline$Head.forEach (ReferencePipeline.java:762)`
+- `java.util.stream.ReferencePipeline$7$1.accept (ReferencePipeline.java:276)`
+- `java.util.stream.ReferencePipeline$2$1.accept (ReferencePipeline.java:179)`
+- `java.util.HashMap$EntrySpliterator.forEachRemaining (HashMap.java:1858)`
+- `java.util.stream.AbstractPipeline.copyInto (AbstractPipeline.java:509)`
+- `java.util.stream.AbstractPipeline.wrapAndCopyInto (AbstractPipeline.java:499)`
+- `java.util.stream.ReduceOps$ReduceOp.evaluateSequential (ReduceOps.java:921)`
+- `java.util.stream.AbstractPipeline.evaluate (AbstractPipeline.java:234)`
+- `java.util.stream.ReferencePipeline.collect (ReferencePipeline.java:682)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.encode (MnemonicsCoderWithStream.java:75)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.lambda$encode$9 (MnemonicsCoderWithStream.java:67)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream$$Lambda+0x00007c8494128dc0.apply (Unknown Source)`
+- `java.util.stream.ReferencePipeline$3$1.accept (ReferencePipeline.java:197)`
+- `java.util.ArrayList$ArrayListSpliterator.forEachRemaining (ArrayList.java:1708)`
+- `java.util.stream.ReferencePipeline$Head.forEach (ReferencePipeline.java:762)`
+- `java.util.stream.ReferencePipeline$7$1.accept (ReferencePipeline.java:276)`
+- `java.util.stream.ReferencePipeline$2$1.accept (ReferencePipeline.java:179)`
+- `java.util.HashMap$EntrySpliterator.forEachRemaining (HashMap.java:1858)`
+- `java.util.stream.AbstractPipeline.copyInto (AbstractPipeline.java:509)`
+- `java.util.stream.AbstractPipeline.wrapAndCopyInto (AbstractPipeline.java:499)`
+- `java.util.stream.ReduceOps$ReduceOp.evaluateSequential (ReduceOps.java:921)`
+- `java.util.stream.AbstractPipeline.evaluate (AbstractPipeline.java:234)`
+- `java.util.stream.ReferencePipeline.collect (ReferencePipeline.java:682)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.encode (MnemonicsCoderWithStream.java:75)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.lambda$encode$9 (MnemonicsCoderWithStream.java:67)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream$$Lambda+0x00007c8494128dc0.apply (Unknown Source)`
+- `java.util.stream.ReferencePipeline$3$1.accept (ReferencePipeline.java:197)`
+- `java.util.ArrayList$ArrayListSpliterator.forEachRemaining (ArrayList.java:1708)`
+- `java.util.stream.ReferencePipeline$Head.forEach (ReferencePipeline.java:762)`
+- `java.util.stream.ReferencePipeline$7$1.accept (ReferencePipeline.java:276)`
+- `java.util.stream.ReferencePipeline$2$1.accept (ReferencePipeline.java:179)`
+- `java.util.HashMap$EntrySpliterator.forEachRemaining (HashMap.java:1858)`
+- `java.util.stream.AbstractPipeline.copyInto (AbstractPipeline.java:509)`
+- `java.util.stream.AbstractPipeline.wrapAndCopyInto (AbstractPipeline.java:499)`
+- `java.util.stream.ReduceOps$ReduceOp.evaluateSequential (ReduceOps.java:921)`
+- `java.util.stream.AbstractPipeline.evaluate (AbstractPipeline.java:234)`
+- `java.util.stream.ReferencePipeline.collect (ReferencePipeline.java:682)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.encode (MnemonicsCoderWithStream.java:75)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.lambda$encode$9 (MnemonicsCoderWithStream.java:67)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream$$Lambda+0x00007c8494128dc0.apply (Unknown Source)`
+- `java.util.stream.ReferencePipeline$3$1.accept (ReferencePipeline.java:197)`
+- `java.util.ArrayList$ArrayListSpliterator.forEachRemaining (ArrayList.java:1708)`
+- `java.util.stream.ReferencePipeline$Head.forEach (ReferencePipeline.java:762)`
+- `java.util.stream.ReferencePipeline$7$1.accept (ReferencePipeline.java:276)`
+- `java.util.stream.ReferencePipeline$2$1.accept (ReferencePipeline.java:179)`
+- `java.util.HashMap$EntrySpliterator.forEachRemaining (HashMap.java:1858)`
+- `java.util.stream.AbstractPipeline.copyInto (AbstractPipeline.java:509)`
+- `java.util.stream.AbstractPipeline.wrapAndCopyInto (AbstractPipeline.java:499)`
+- `java.util.stream.ReduceOps$ReduceOp.evaluateSequential (ReduceOps.java:921)`
+- `java.util.stream.AbstractPipeline.evaluate (AbstractPipeline.java:234)`
+- `java.util.stream.ReferencePipeline.collect (ReferencePipeline.java:682)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.encode (MnemonicsCoderWithStream.java:75)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.lambda$encode$9 (MnemonicsCoderWithStream.java:67)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream$$Lambda+0x00007c8494128dc0.apply (Unknown Source)`
+- `java.util.stream.ReferencePipeline$3$1.accept (ReferencePipeline.java:197)`
+- `java.util.ArrayList$ArrayListSpliterator.forEachRemaining (ArrayList.java:1708)`
+- `java.util.stream.ReferencePipeline$Head.forEach (ReferencePipeline.java:762)`
+- `java.util.stream.ReferencePipeline$7$1.accept (ReferencePipeline.java:276)`
+- `java.util.stream.ReferencePipeline$2$1.accept (ReferencePipeline.java:179)`
+- `java.util.HashMap$EntrySpliterator.forEachRemaining (HashMap.java:1858)`
+- `java.util.stream.AbstractPipeline.copyInto (AbstractPipeline.java:509)`
+- `java.util.stream.AbstractPipeline.wrapAndCopyInto (AbstractPipeline.java:499)`
+- `java.util.stream.ReduceOps$ReduceOp.evaluateSequential (ReduceOps.java:921)`
+- `java.util.stream.AbstractPipeline.evaluate (AbstractPipeline.java:234)`
+- `java.util.stream.ReferencePipeline.collect (ReferencePipeline.java:682)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.encode (MnemonicsCoderWithStream.java:75)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream.lambda$parallelEncode$15 (MnemonicsCoderWithStream.java:98)`
+- `org.renaissance.jdk.streams.MnemonicsCoderWithStream$$Lambda+0x00007c8494127800.apply (Unknown Source)`
+- `java.util.stream.ReferencePipeline$3$1.accept (ReferencePipeline.java:197)`
+- `java.util.ArrayList$ArrayListSpliterator.forEachRemaining (ArrayList.java:1708)`
+- `java.util.stream.ReferencePipeline$Head.forEach (ReferencePipeline.java:762)`
+- `java.util.stream.ReferencePipeline$7$1.accept (ReferencePipeline.java:276)`
+- `java.util.stream.ReferencePipeline$2$1.accept (ReferencePipeline.java:179)`
+- `java.util.concurrent.ConcurrentHashMap$EntrySpliterator.forEachRemaining (ConcurrentHashMap.java:3652)`
+- `java.util.stream.AbstractPipeline.copyInto (AbstractPipeline.java:509)`
+- `java.util.stream.AbstractPipeline.wrapAndCopyInto (AbstractPipeline.java:499)`
+- `java.util.stream.ReduceOps$ReduceTask.doLeaf (ReduceOps.java:960)`
+- `java.util.stream.ReduceOps$ReduceTask.doLeaf (ReduceOps.java:934)`
+- `java.util.stream.AbstractTask.compute (AbstractTask.java:327)`
+- `java.util.concurrent.CountedCompleter.exec (CountedCompleter.java:754)`
+- `java.util.concurrent.ForkJoinTask.doExec (ForkJoinTask.java:387)`
+- `java.util.concurrent.ForkJoinPool$WorkQueue.topLevelExec (ForkJoinPool.java:1312)`
+- `java.util.concurrent.ForkJoinPool.scan (ForkJoinPool.java:1843)`
+- `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1808)`
+- `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
 
 <a id="thread-23"></a>
 
@@ -16310,20 +16737,24 @@ _Local roots: 7._
 
 | Object                                          | Count | Shallow | Retained |
 | ----------------------------------------------- | ----: | ------: | -------: |
-| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 |  1.0 KB |   1.0 KB |
+| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 | 1.0 KiB |  1.0 KiB |
 | `java.util.concurrent.ForkJoinPool$WorkQueue`   |    ×3 |    56 B |    328 B |
 | `java.util.concurrent.ForkJoinPool`             |    ×3 |    96 B |    144 B |
 
-_Frame percentages are of this thread's 248 B retained heap._
+_Complete stack: 5 frames as recorded in the dump._
 
-- `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
-  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KB (<0.1% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 248 B retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:371)`
+- ✦ `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
+  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KiB (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
+- ✦ `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
+- ✦ `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
 
@@ -16337,20 +16768,24 @@ _Local roots: 7._
 
 | Object                                          | Count | Shallow | Retained |
 | ----------------------------------------------- | ----: | ------: | -------: |
-| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 |  1.0 KB |   1.0 KB |
+| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 | 1.0 KiB |  1.0 KiB |
 | `java.util.concurrent.ForkJoinPool$WorkQueue`   |    ×3 |    56 B |    328 B |
 | `java.util.concurrent.ForkJoinPool`             |    ×3 |    96 B |    144 B |
 
-_Frame percentages are of this thread's 248 B retained heap._
+_Complete stack: 5 frames as recorded in the dump._
 
-- `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
-  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KB (<0.1% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 248 B retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:371)`
+- ✦ `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
+  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KiB (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
+- ✦ `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
+- ✦ `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
 
@@ -16364,20 +16799,24 @@ _Local roots: 7._
 
 | Object                                          | Count | Shallow | Retained |
 | ----------------------------------------------- | ----: | ------: | -------: |
-| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 |  1.0 KB |   1.0 KB |
+| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 | 1.0 KiB |  1.0 KiB |
 | `java.util.concurrent.ForkJoinPool$WorkQueue`   |    ×3 |    56 B |    328 B |
 | `java.util.concurrent.ForkJoinPool`             |    ×3 |    96 B |    144 B |
 
-_Frame percentages are of this thread's 248 B retained heap._
+_Complete stack: 5 frames as recorded in the dump._
 
-- `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
-  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KB (<0.1% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 248 B retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:371)`
+- ✦ `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
+  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KiB (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
+- ✦ `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
+- ✦ `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
 
@@ -16391,20 +16830,24 @@ _Local roots: 7._
 
 | Object                                          | Count | Shallow | Retained |
 | ----------------------------------------------- | ----: | ------: | -------: |
-| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 |  1.0 KB |   1.0 KB |
+| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 | 1.0 KiB |  1.0 KiB |
 | `java.util.concurrent.ForkJoinPool$WorkQueue`   |    ×3 |    56 B |    328 B |
 | `java.util.concurrent.ForkJoinPool`             |    ×3 |    96 B |    144 B |
 
-_Frame percentages are of this thread's 248 B retained heap._
+_Complete stack: 5 frames as recorded in the dump._
 
-- `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
-  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KB (<0.1% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 248 B retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:371)`
+- ✦ `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
+  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KiB (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
+- ✦ `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
+- ✦ `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
 
@@ -16418,20 +16861,24 @@ _Local roots: 7._
 
 | Object                                          | Count | Shallow | Retained |
 | ----------------------------------------------- | ----: | ------: | -------: |
-| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 |  1.0 KB |   1.0 KB |
+| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 | 1.0 KiB |  1.0 KiB |
 | `java.util.concurrent.ForkJoinPool$WorkQueue`   |    ×3 |    56 B |    328 B |
 | `java.util.concurrent.ForkJoinPool`             |    ×3 |    96 B |    144 B |
 
-_Frame percentages are of this thread's 248 B retained heap._
+_Complete stack: 5 frames as recorded in the dump._
 
-- `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
-  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KB (<0.1% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 248 B retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:371)`
+- ✦ `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
+  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KiB (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
+- ✦ `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
+- ✦ `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
 
@@ -16445,20 +16892,24 @@ _Local roots: 7._
 
 | Object                                          | Count | Shallow | Retained |
 | ----------------------------------------------- | ----: | ------: | -------: |
-| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 |  1.0 KB |   1.0 KB |
+| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 | 1.0 KiB |  1.0 KiB |
 | `java.util.concurrent.ForkJoinPool$WorkQueue`   |    ×3 |    56 B |    328 B |
 | `java.util.concurrent.ForkJoinPool`             |    ×3 |    96 B |    144 B |
 
-_Frame percentages are of this thread's 248 B retained heap._
+_Complete stack: 5 frames as recorded in the dump._
 
-- `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
-  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KB (<0.1% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 248 B retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:371)`
+- ✦ `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
+  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KiB (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
+- ✦ `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
+- ✦ `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
 
@@ -16472,20 +16923,24 @@ _Local roots: 7._
 
 | Object                                          | Count | Shallow | Retained |
 | ----------------------------------------------- | ----: | ------: | -------: |
-| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 |  1.0 KB |   1.0 KB |
+| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 | 1.0 KiB |  1.0 KiB |
 | `java.util.concurrent.ForkJoinPool$WorkQueue`   |    ×3 |    56 B |    328 B |
 | `java.util.concurrent.ForkJoinPool`             |    ×3 |    96 B |    144 B |
 
-_Frame percentages are of this thread's 248 B retained heap._
+_Complete stack: 5 frames as recorded in the dump._
 
-- `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
-  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KB (<0.1% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 248 B retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:371)`
+- ✦ `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
+  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KiB (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
+- ✦ `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
+- ✦ `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
 
@@ -16499,20 +16954,24 @@ _Local roots: 7._
 
 | Object                                          | Count | Shallow | Retained |
 | ----------------------------------------------- | ----: | ------: | -------: |
-| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 |  1.0 KB |   1.0 KB |
+| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 | 1.0 KiB |  1.0 KiB |
 | `java.util.concurrent.ForkJoinPool$WorkQueue`   |    ×3 |    56 B |    328 B |
 | `java.util.concurrent.ForkJoinPool`             |    ×3 |    96 B |    144 B |
 
-_Frame percentages are of this thread's 248 B retained heap._
+_Complete stack: 5 frames as recorded in the dump._
 
-- `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
-  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KB (<0.1% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 248 B retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:371)`
+- ✦ `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
+  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KiB (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
+- ✦ `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
+- ✦ `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
 
@@ -16526,20 +16985,24 @@ _Local roots: 7._
 
 | Object                                          | Count | Shallow | Retained |
 | ----------------------------------------------- | ----: | ------: | -------: |
-| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 |  1.0 KB |   1.0 KB |
+| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 | 1.0 KiB |  1.0 KiB |
 | `java.util.concurrent.ForkJoinPool$WorkQueue`   |    ×3 |    56 B |    328 B |
 | `java.util.concurrent.ForkJoinPool`             |    ×3 |    96 B |    144 B |
 
-_Frame percentages are of this thread's 248 B retained heap._
+_Complete stack: 5 frames as recorded in the dump._
 
-- `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
-  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KB (<0.1% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 248 B retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:371)`
+- ✦ `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
+  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KiB (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
+- ✦ `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
+- ✦ `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
 
@@ -16553,34 +17016,46 @@ _Local roots: 7._
 
 | Object                                          | Count | Shallow | Retained |
 | ----------------------------------------------- | ----: | ------: | -------: |
-| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 |  1.0 KB |   1.0 KB |
+| `java.util.concurrent.ForkJoinPool$WorkQueue[]` |     1 | 1.0 KiB |  1.0 KiB |
 | `java.util.concurrent.ForkJoinPool$WorkQueue`   |    ×3 |    56 B |    328 B |
 | `java.util.concurrent.ForkJoinPool`             |    ×3 |    96 B |    144 B |
 
-_Frame percentages are of this thread's 248 B retained heap._
+_Complete stack: 5 frames as recorded in the dump._
 
-- `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
-  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KB (<0.1% of thread retained)
+_Frames marked ✦ hold a sampled local variable; its retained heap is a percentage of this thread's 248 B retained heap._
+
+- `jdk.internal.misc.Unsafe.park (Native Method)`
+- `java.util.concurrent.locks.LockSupport.park (LockSupport.java:371)`
+- ✦ `java.util.concurrent.ForkJoinPool.awaitWork (ForkJoinPool.java:1893)`
+  - `java.util.concurrent.ForkJoinPool$WorkQueue[]` retains 1.0 KiB (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
+- ✦ `java.util.concurrent.ForkJoinPool.runWorker (ForkJoinPool.java:1809)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
-- `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
+- ✦ `java.util.concurrent.ForkJoinWorkerThread.run (ForkJoinWorkerThread.java:188)`
   - `java.util.concurrent.ForkJoinPool$WorkQueue` retains 328 B (<0.1% of thread retained)
   - `java.util.concurrent.ForkJoinPool` retains 144 B (<0.1% of thread retained)
 
 ## Top Components
 
-_Retained heap grouped by class loader (component). `% Heap` is the share of total reachable heap. Totals can exceed 100% because retained sets overlap — an object held by multiple components is counted in each._
+_Retained heap grouped by class loader (component). `% Heap` is the share of the total per-class retained heap — the same overlapping sum the `Retained` column is drawn from — **not** a share of the reachable heap._
 
-| Component                                              | Retained | % Heap | Top Classes                                                                                                                                                                                                                                                                                                                                                                  |                  |
-| ------------------------------------------------------ | -------: | -----: | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------- |
-| `<boot>`                                               | 115.7 MB |  97.6% | `java.util.HashMap$Node[]` (14.1 MB), `java.util.HashMap` (14.0 MB), `java.util.HashMap$Node` (13.3 MB), `java.util.HashSet` (13.1 MB), `java.util.stream.ReduceOps$3ReducingSink` (13.0 MB)                                                                                                                                                                                 | ████████████████ |
-| `java/net/URLClassLoader`                              |   2.6 MB |   2.2% | `scala.runtime.LazyVals$` (2.5 MB), `org.renaissance.harness.ConfigParser$$anon$1` (13.0 KB), `scala.math.BigInt$` (8.2 KB), `scopt.ORunner$` (8.1 KB), `scala.math.BigInt[]` (8.0 KB)                                                                                                                                                                                       | ▎                |
-| `jdk/internal/loader/ClassLoaders$AppClassLoader`      | 238.0 KB |   0.2% | `org.renaissance.core.ModuleLoader` (149.8 KB), `org.renaissance.core.BenchmarkSuite` (77.0 KB), `org.renaissance.BenchmarkResult$Validators` (2.5 KB), `org.renaissance.core.BenchmarkDescriptor` (2.3 KB), `org.renaissance.core.Launcher` (1.6 KB)                                                                                                                        | ▏                |
-| `java/net/URLClassLoader`                              |  11.6 KB |  <0.1% | `org.renaissance.jdk.streams.MnemonicsCoderWithStream` (8.9 KB), `org.renaissance.jdk.streams.MnemonicsCoderWithStream$$Lambda+0x00007c8494128dc0` (1.5 KB), `org.renaissance.jdk.streams.MnemonicsCoderWithStream$1` (456 B), `org.renaissance.jdk.streams.ParMnemonics` (312 B), `org.renaissance.jdk.streams.MnemonicsCoderWithStream$$Lambda+0x00007c8494128490` (288 B) | ▏                |
-| `jdk/internal/loader/ClassLoaders$PlatformClassLoader` |   7.4 KB |  <0.1% | `sun.util.resources.cldr.provider.CLDRLocaleDataMetaInfo` (7.4 KB)                                                                                                                                                                                                                                                                                                           | ▏                |
+> ⚠ **These numbers do not add up, and must not be added up.**
+>
+> The `Retained` column sums, per class loader, the retained heap of every class that loader defined. Those retained sets **overlap**, so the same object is counted under every component that can reach it. The column total here is 118.6 MiB — **6.2× the entire reachable heap** (19.2 MiB).
+>
+> A single component cannot retain more than the whole heap. Use this table to compare components *against each other*; do not compare a row with the heap total, and do not sum rows. For addable, non-overlapping totals use [Heap Composition](#heap-composition) and the [Class Histogram](#class-histogram-by-retained-heap).
+
+> ⚠ Rows marked ✦ individually exceed the reachable heap — an artifact of the overlapping sum described above, not a measurement error in the dump.
+
+| Component                                              |  Retained | % Heap | Top Classes                                                                                                                                                                                                                                                                                                                                                                    |                  |
+| ------------------------------------------------------ | --------: | -----: | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------- |
+| `<boot>` ✦                                             | 115.7 MiB |  97.6% | `java.util.HashMap$Node[]` (14.1 MiB), `java.util.HashMap` (14.0 MiB), `java.util.HashMap$Node` (13.3 MiB), `java.util.HashSet` (13.1 MiB), `java.util.stream.ReduceOps$3ReducingSink` (13.0 MiB)                                                                                                                                                                              | ████████████████ |
+| `java/net/URLClassLoader`                              |   2.6 MiB |   2.2% | `scala.runtime.LazyVals$` (2.5 MiB), `org.renaissance.harness.ConfigParser$$anon$1` (13.0 KiB), `scala.math.BigInt$` (8.2 KiB), `scopt.ORunner$` (8.1 KiB), `scala.math.BigInt[]` (8.0 KiB)                                                                                                                                                                                    | ▎                |
+| `jdk/internal/loader/ClassLoaders$AppClassLoader`      | 238.0 KiB |   0.2% | `org.renaissance.core.ModuleLoader` (149.8 KiB), `org.renaissance.core.BenchmarkSuite` (77.0 KiB), `org.renaissance.BenchmarkResult$Validators` (2.5 KiB), `org.renaissance.core.BenchmarkDescriptor` (2.3 KiB), `org.renaissance.core.Launcher` (1.6 KiB)                                                                                                                     | ▏                |
+| `java/net/URLClassLoader`                              |  11.6 KiB |  <0.1% | `org.renaissance.jdk.streams.MnemonicsCoderWithStream` (8.9 KiB), `org.renaissance.jdk.streams.MnemonicsCoderWithStream$$Lambda+0x00007c8494128dc0` (1.5 KiB), `org.renaissance.jdk.streams.MnemonicsCoderWithStream$1` (456 B), `org.renaissance.jdk.streams.ParMnemonics` (312 B), `org.renaissance.jdk.streams.MnemonicsCoderWithStream$$Lambda+0x00007c8494128490` (288 B) | ▏                |
+| `jdk/internal/loader/ClassLoaders$PlatformClassLoader` |   7.4 KiB |  <0.1% | `sun.util.resources.cldr.provider.CLDRLocaleDataMetaInfo` (7.4 KiB)                                                                                                                                                                                                                                                                                                            | ▏                |
 
 ## Arrays by Size
 
@@ -16588,49 +17063,49 @@ _Array length distribution bucketed by powers of two — **Max Length** is the i
 
 ### Object Arrays
 
-| Max Length |   Objects |    Shallow |   % Heap |                  |
-| ---------: | --------: | ---------: | -------: | ---------------- |
-|        ≤ 1 |       704 |    16.5 KB |     0.1% | ████████▌        |
-|        ≤ 2 |       558 |    13.1 KB |     0.1% | ██████▊          |
-|        ≤ 4 |       674 |    21.1 KB |     0.1% | ████████▏        |
-|        ≤ 8 |       657 |    27.3 KB |     0.1% | ████████         |
-|       ≤ 16 |     1,314 |    85.3 KB |     0.4% | ████████████████ |
-|       ≤ 32 |       341 |    39.2 KB |     0.2% | ████▏            |
-|       ≤ 64 |       157 |    34.6 KB |     0.2% | █▉               |
-|      ≤ 128 |        64 |    23.2 KB |     0.1% | ▊                |
-|      ≤ 256 |        28 |    25.3 KB |     0.1% | ▎                |
-|      ≤ 512 |        10 |    15.4 KB |     0.1% | ▏                |
-|    ≤ 1,024 |        18 |    62.2 KB |     0.3% | ▏                |
-|    ≤ 2,048 |         5 |    32.8 KB |     0.2% | ▏                |
-|    ≤ 4,096 |         5 |    57.3 KB |     0.3% | ▏                |
-|    ≤ 8,192 |         1 |    31.0 KB |     0.2% | ▏                |
-|   ≤ 65,536 |         1 |   256.0 KB |     1.3% | ▏                |
-|  ≤ 131,072 |         2 |     1.0 MB |     5.2% | ▏                |
-|  **Total** | **4,539** | **1.7 MB** | **9.0%** |                  |
+| Max Length |   Objects |     Shallow |   % Heap |                  |
+| ---------: | --------: | ----------: | -------: | ---------------- |
+|        ≤ 1 |       704 |    16.5 KiB |     0.1% | ████████▌        |
+|        ≤ 2 |       558 |    13.1 KiB |     0.1% | ██████▊          |
+|        ≤ 4 |       674 |    21.1 KiB |     0.1% | ████████▏        |
+|        ≤ 8 |       657 |    27.3 KiB |     0.1% | ████████         |
+|       ≤ 16 |     1,314 |    85.3 KiB |     0.4% | ████████████████ |
+|       ≤ 32 |       341 |    39.2 KiB |     0.2% | ████▏            |
+|       ≤ 64 |       157 |    34.6 KiB |     0.2% | █▉               |
+|      ≤ 128 |        64 |    23.2 KiB |     0.1% | ▊                |
+|      ≤ 256 |        28 |    25.3 KiB |     0.1% | ▎                |
+|      ≤ 512 |        10 |    15.4 KiB |     0.1% | ▏                |
+|    ≤ 1,024 |        18 |    62.2 KiB |     0.3% | ▏                |
+|    ≤ 2,048 |         5 |    32.8 KiB |     0.2% | ▏                |
+|    ≤ 4,096 |         5 |    57.3 KiB |     0.3% | ▏                |
+|    ≤ 8,192 |         1 |    31.0 KiB |     0.2% | ▏                |
+|   ≤ 65,536 |         1 |   256.0 KiB |     1.3% | ▏                |
+|  ≤ 131,072 |         2 |     1.0 MiB |     5.2% | ▏                |
+|  **Total** | **4,539** | **1.7 MiB** | **9.0%** |                  |
 
 ### Primitive Arrays
 
-| Max Length |     Objects |    Shallow |    % Heap |                  |
-| ---------: | ----------: | ---------: | --------: | ---------------- |
-|        ≤ 1 |         502 |    11.8 KB |      0.1% | ▏                |
-|        ≤ 2 |         685 |    16.1 KB |      0.1% | ▏                |
-|        ≤ 4 |       1,421 |    33.7 KB |      0.2% | ▏                |
-|        ≤ 8 |       2,455 |    59.0 KB |      0.3% | ▎                |
-|       ≤ 16 |       4,350 |   143.8 KB |      0.7% | ▋                |
-|       ≤ 32 |       5,819 |   260.5 KB |      1.3% | ▊                |
-|       ≤ 64 |     106,511 |     7.2 MB |     37.7% | ████████████████ |
-|      ≤ 128 |         875 |    87.3 KB |      0.4% | ▏                |
-|      ≤ 256 |         185 |    42.0 KB |      0.2% | ▏                |
-|      ≤ 512 |         269 |   102.7 KB |      0.5% | ▏                |
-|    ≤ 1,024 |          73 |    53.8 KB |      0.3% | ▏                |
-|    ≤ 2,048 |          15 |    50.4 KB |      0.3% | ▏                |
-|    ≤ 4,096 |           3 |     9.6 KB |     <0.1% | ▏                |
-|    ≤ 8,192 |           7 |    66.2 KB |      0.3% | ▏                |
-|   ≤ 16,384 |           3 |    61.2 KB |      0.3% | ▏                |
-|   ≤ 65,536 |           2 |   104.0 KB |      0.5% | ▏                |
-|  ≤ 131,072 |           2 |     1.0 MB |      5.2% | ▏                |
-|  ≤ 262,144 |           1 |   255.1 KB |      1.3% | ▏                |
-|  **Total** | **123,178** | **9.5 MB** | **49.8%** |                  |
+| Max Length |     Objects |     Shallow |    % Heap |                  |
+| ---------: | ----------: | ----------: | --------: | ---------------- |
+|        ≤ 1 |         502 |    11.8 KiB |      0.1% | ▏                |
+|        ≤ 2 |         685 |    16.1 KiB |      0.1% | ▏                |
+|        ≤ 4 |       1,421 |    33.7 KiB |      0.2% | ▏                |
+|        ≤ 8 |       2,455 |    59.0 KiB |      0.3% | ▎                |
+|       ≤ 16 |       4,350 |   143.8 KiB |      0.7% | ▋                |
+|       ≤ 32 |       5,819 |   260.5 KiB |      1.3% | ▊                |
+|       ≤ 64 |     106,511 |     7.2 MiB |     37.7% | ████████████████ |
+|      ≤ 128 |         875 |    87.3 KiB |      0.4% | ▏                |
+|      ≤ 256 |         185 |    42.0 KiB |      0.2% | ▏                |
+|      ≤ 512 |         269 |   102.7 KiB |      0.5% | ▏                |
+|    ≤ 1,024 |          73 |    53.8 KiB |      0.3% | ▏                |
+|    ≤ 2,048 |          15 |    50.4 KiB |      0.3% | ▏                |
+|    ≤ 4,096 |           3 |     9.6 KiB |     <0.1% | ▏                |
+|    ≤ 8,192 |           7 |    66.2 KiB |      0.3% | ▏                |
+|   ≤ 16,384 |           3 |    61.2 KiB |      0.3% | ▏                |
+|   ≤ 65,536 |           2 |   104.0 KiB |      0.5% | ▏                |
+|  ≤ 131,072 |           2 |     1.0 MiB |      5.2% | ▏                |
+|  ≤ 262,144 |           1 |   255.1 KiB |      1.3% | ▏                |
+|  **Total** | **123,178** | **9.5 MiB** | **49.8%** |                  |
 
 Zero-length arrays: 2,125
 
@@ -16642,88 +17117,88 @@ _Collection fill ratios, map load factors, and constant-value primitive array gr
 
 | Kind      |     Count | Total Elements | Max Elements | Total Shallow |                  |
 | --------- | --------: | -------------: | -----------: | ------------: | ---------------- |
-| list      |       610 |          1,473 |          463 |       14.3 KB | ▏                |
-| map       |     3,372 |        109,644 |       65,000 |      204.0 KB | ████████████████ |
-| **Total** | **3,982** |    **111,117** |              |  **218.3 KB** |                  |
+| list      |       610 |          1,473 |          463 |      14.3 KiB | ▏                |
+| map       |     3,372 |        109,644 |       65,000 |     204.0 KiB | ████████████████ |
+| **Total** | **3,982** |    **111,117** |              | **218.3 KiB** |                  |
 
 ### Collection Fill Ratio
 
 _Fraction of each collection's capacity in use — low fill wastes backing-array memory. 3,982 collections analyzed (1,138 non-empty tracked)._
 
-|      Fill % | Collections |     Shallow |       Wasted |                  |
-| ----------: | ----------: | ----------: | -----------: | ---------------- |
-|       0–10% |         621 |     20.3 KB |      54.7 KB | ████████████████ |
-|      10–20% |         233 |      8.6 KB |      21.9 KB | ██████           |
-|      20–30% |          69 |      2.7 KB |      18.1 KB | █▊               |
-|      30–40% |          64 |      2.9 KB |      37.1 KB | █▋               |
-|      40–50% |          66 |      3.3 KB |     820.0 KB | █▋               |
-|      50–60% |          16 |       800 B |       7.3 KB | ▍                |
-|      60–70% |          19 |      1016 B |      18.6 KB | ▍                |
-|      70–80% |          10 |       424 B |       9.8 KB | ▎                |
-|      80–90% |           2 |        48 B |        752 B | ▏                |
-|     90–100% |           0 |         0 B |          0 B |                  |
-| 100% (full) |          38 |       912 B |          0 B | ▉                |
-|   **Total** |   **1,138** | **41.0 KB** | **988.3 KB** |                  |
+|      Fill % | Collections |      Shallow |        Wasted |                  |
+| ----------: | ----------: | -----------: | ------------: | ---------------- |
+|       0–10% |         621 |     20.3 KiB |      54.7 KiB | ████████████████ |
+|      10–20% |         233 |      8.6 KiB |      21.9 KiB | ██████           |
+|      20–30% |          69 |      2.7 KiB |      18.1 KiB | █▊               |
+|      30–40% |          64 |      2.9 KiB |      37.1 KiB | █▋               |
+|      40–50% |          66 |      3.3 KiB |     820.0 KiB | █▋               |
+|      50–60% |          16 |        800 B |       7.3 KiB | ▍                |
+|      60–70% |          19 |       1016 B |      18.6 KiB | ▍                |
+|      70–80% |          10 |        424 B |       9.8 KiB | ▎                |
+|      80–90% |           2 |         48 B |         752 B | ▏                |
+|     90–100% |           0 |          0 B |           0 B |                  |
+| 100% (full) |          38 |        912 B |           0 B | ▉                |
+|   **Total** |   **1,138** | **41.0 KiB** | **988.3 KiB** |                  |
 
 ### Collections by Size
 
 _Element-count distribution of collections, bucketed by size — 3,982 tracked; 2,950 empty._
 
-|    Size ≤ | Collections |     Shallow |                  |
-| --------: | ----------: | ----------: | ---------------- |
-|       ≤ 1 |         576 |     17.8 KB | ████████████████ |
-|       ≤ 2 |         191 |      5.9 KB | █████▎           |
-|       ≤ 4 |         137 |      5.0 KB | ███▊             |
-|       ≤ 8 |          38 |      1.9 KB | █                |
-|      ≤ 16 |          31 |      1.5 KB | ▊                |
-|      ≤ 32 |          30 |      1.4 KB | ▊                |
-|      ≤ 64 |           8 |       392 B | ▏                |
-|     ≤ 128 |           5 |       272 B | ▏                |
-|     ≤ 256 |           5 |       304 B | ▏                |
-|     ≤ 512 |           4 |       168 B | ▏                |
-|   ≤ 1,024 |           3 |       144 B | ▏                |
-|   ≤ 4,096 |           2 |        96 B | ▏                |
-|  ≤ 32,768 |           1 |        48 B | ▏                |
-|  ≤ 65,536 |           1 |        48 B | ▏                |
-| **Total** |   **1,032** | **34.9 KB** |                  |
+|    Size ≤ | Collections |      Shallow |                  |
+| --------: | ----------: | -----------: | ---------------- |
+|       ≤ 1 |         576 |     17.8 KiB | ████████████████ |
+|       ≤ 2 |         191 |      5.9 KiB | █████▎           |
+|       ≤ 4 |         137 |      5.0 KiB | ███▊             |
+|       ≤ 8 |          38 |      1.9 KiB | █                |
+|      ≤ 16 |          31 |      1.5 KiB | ▊                |
+|      ≤ 32 |          30 |      1.4 KiB | ▊                |
+|      ≤ 64 |           8 |        392 B | ▏                |
+|     ≤ 128 |           5 |        272 B | ▏                |
+|     ≤ 256 |           5 |        304 B | ▏                |
+|     ≤ 512 |           4 |        168 B | ▏                |
+|   ≤ 1,024 |           3 |        144 B | ▏                |
+|   ≤ 4,096 |           2 |         96 B | ▏                |
+|  ≤ 32,768 |           1 |         48 B | ▏                |
+|  ≤ 65,536 |           1 |         48 B | ▏                |
+| **Total** |   **1,032** | **34.9 KiB** |                  |
 
 ### Array Fill Ratio
 
 _Non-null element fraction of object arrays — low fill leaves most slots empty. 4,539 tracked._
 
-|      Fill % |    Arrays |    Shallow |     Wasted |                  |
-| ----------: | --------: | ---------: | ---------: | ---------------- |
-|       0–10% |     1,343 |   109.3 KB |   168.3 KB | █████████▍       |
-|      10–20% |       287 |    31.0 KB |    44.5 KB | ██               |
-|      20–30% |       109 |    18.4 KB |    24.4 KB | ▊                |
-|      30–40% |       149 |   819.2 KB |   999.2 KB | █                |
-|      40–50% |       246 |    99.8 KB |   101.2 KB | █▋               |
-|      50–60% |        41 |     9.9 KB |     8.6 KB | ▎                |
-|      60–70% |        36 |     4.7 KB |     2.9 KB | ▎                |
-|      70–80% |        28 |     3.2 KB |     1.5 KB | ▏                |
-|      80–90% |        14 |     4.2 KB |     1.2 KB | ▏                |
-|     90–100% |        15 |    36.5 KB |     2.1 KB | ▏                |
-| 100% (full) |     2,271 |   627.9 KB |        0 B | ████████████████ |
-|   **Total** | **4,539** | **1.7 MB** | **1.3 MB** |                  |
+|      Fill % |    Arrays |     Shallow |      Wasted |                  |
+| ----------: | --------: | ----------: | ----------: | ---------------- |
+|       0–10% |     1,343 |   109.3 KiB |   168.3 KiB | █████████▍       |
+|      10–20% |       287 |    31.0 KiB |    44.5 KiB | ██               |
+|      20–30% |       109 |    18.4 KiB |    24.4 KiB | ▊                |
+|      30–40% |       149 |   819.2 KiB |   999.2 KiB | █                |
+|      40–50% |       246 |    99.8 KiB |   101.2 KiB | █▋               |
+|      50–60% |        41 |     9.9 KiB |     8.6 KiB | ▎                |
+|      60–70% |        36 |     4.7 KiB |     2.9 KiB | ▎                |
+|      70–80% |        28 |     3.2 KiB |     1.5 KiB | ▏                |
+|      80–90% |        14 |     4.2 KiB |     1.2 KiB | ▏                |
+|     90–100% |        15 |    36.5 KiB |     2.1 KiB | ▏                |
+| 100% (full) |     2,271 |   627.9 KiB |         0 B | ████████████████ |
+|   **Total** | **4,539** | **1.7 MiB** | **1.3 MiB** |                  |
 
 ### Map Load Factor
 
 _Load factor (occupied slots ÷ capacity) for 520 of 3,372 maps; high values (≥ 90%) signal dense packing and longer bucket chains per lookup._
 
-|      Load % |    Maps |     Shallow |                  |
-| ----------: | ------: | ----------: | ---------------- |
-|       0–10% |     223 |     11.1 KB | ████████████████ |
-|      10–20% |     121 |      6.0 KB | ████████▋        |
-|      20–30% |      39 |      2.2 KB | ██▊              |
-|      30–40% |      73 |      3.8 KB | █████▏           |
-|      40–50% |      50 |      2.7 KB | ███▌             |
-|      50–60% |       9 |       496 B | ▋                |
-|      60–70% |       2 |       128 B | ▏                |
-|      70–80% |       3 |       160 B | ▏                |
-|      80–90% |       0 |         0 B |                  |
-|     90–100% |       0 |         0 B |                  |
-| 100% (full) |       0 |         0 B |                  |
-|   **Total** | **520** | **26.5 KB** |                  |
+|      Load % |    Maps |      Shallow |                  |
+| ----------: | ------: | -----------: | ---------------- |
+|       0–10% |     223 |     11.1 KiB | ████████████████ |
+|      10–20% |     121 |      6.0 KiB | ████████▋        |
+|      20–30% |      39 |      2.2 KiB | ██▊              |
+|      30–40% |      73 |      3.8 KiB | █████▏           |
+|      40–50% |      50 |      2.7 KiB | ███▌             |
+|      50–60% |       9 |        496 B | ▋                |
+|      60–70% |       2 |        128 B | ▏                |
+|      70–80% |       3 |        160 B | ▏                |
+|      80–90% |       0 |          0 B |                  |
+|     90–100% |       0 |          0 B |                  |
+| 100% (full) |       0 |          0 B |                  |
+|   **Total** | **520** | **26.5 KiB** |                  |
 
 ### Constant Primitive Arrays
 
@@ -16731,104 +17206,104 @@ _Primitive arrays whose every element is identical — possible candidates for d
 
 _(33 trivial groups hidden.)_
 
-| Array Class |  Length | Value | Objects |  Shallow |                  |
-| ----------- | ------: | ----: | ------: | -------: | ---------------- |
-| `int[]`     | 131,064 |     0 |       1 | 512.0 KB | ▌                |
-| `char[]`    |   8,192 |     0 |       1 |  16.0 KB | ▌                |
-| `int[]`     |     766 |     0 |       1 |   3.0 KB | ▌                |
-| `long[]`    |      32 |     0 |       4 |   1.1 KB | ██               |
-| `byte[]`    |     512 |     0 |       2 |   1.0 KB | █                |
-| `byte[]`    |       2 |    49 |      31 |    744 B | ████████████████ |
-| `int[]`     |      32 |     0 |       4 |    576 B | ██               |
-| `byte[]`    |     256 |     0 |       2 |    544 B | █                |
-| `short[]`   |      32 |     0 |       4 |    320 B | ██               |
-| `int[]`     |       2 |     0 |      11 |    264 B | █████▋           |
-| `int[]`     |      10 |     0 |       4 |    224 B | ██               |
-| `byte[]`    |       8 |     0 |       7 |    168 B | ███▌             |
-| `char[]`    |      26 |     0 |       2 |    144 B | █                |
-| `byte[]`    |     128 |     0 |       1 |    144 B | ▌                |
-| `int[]`     |      20 |     0 |       1 |     96 B | ▌                |
-| `byte[]`    |      63 |    48 |       1 |     80 B | ▌                |
-| `byte[]`    |      10 |    32 |       1 |     32 B | ▌                |
-| `byte[]`    |      13 |    48 |       1 |     32 B | ▌                |
-| `byte[]`    |      16 |     0 |       1 |     32 B | ▌                |
-| `byte[]`    |       8 |    32 |       1 |     24 B | ▌                |
-| `byte[]`    |       8 |    48 |       1 |     24 B | ▌                |
+| Array Class |  Length | Value | Objects |   Shallow |                  |
+| ----------- | ------: | ----: | ------: | --------: | ---------------- |
+| `int[]`     | 131,064 |     0 |       1 | 512.0 KiB | ▌                |
+| `char[]`    |   8,192 |     0 |       1 |  16.0 KiB | ▌                |
+| `int[]`     |     766 |     0 |       1 |   3.0 KiB | ▌                |
+| `long[]`    |      32 |     0 |       4 |   1.1 KiB | ██               |
+| `byte[]`    |     512 |     0 |       2 |   1.0 KiB | █                |
+| `byte[]`    |       2 |    49 |      31 |     744 B | ████████████████ |
+| `int[]`     |      32 |     0 |       4 |     576 B | ██               |
+| `byte[]`    |     256 |     0 |       2 |     544 B | █                |
+| `short[]`   |      32 |     0 |       4 |     320 B | ██               |
+| `int[]`     |       2 |     0 |      11 |     264 B | █████▋           |
+| `int[]`     |      10 |     0 |       4 |     224 B | ██               |
+| `byte[]`    |       8 |     0 |       7 |     168 B | ███▌             |
+| `char[]`    |      26 |     0 |       2 |     144 B | █                |
+| `byte[]`    |     128 |     0 |       1 |     144 B | ▌                |
+| `int[]`     |      20 |     0 |       1 |      96 B | ▌                |
+| `byte[]`    |      63 |    48 |       1 |      80 B | ▌                |
+| `byte[]`    |      10 |    32 |       1 |      32 B | ▌                |
+| `byte[]`    |      13 |    48 |       1 |      32 B | ▌                |
+| `byte[]`    |      16 |     0 |       1 |      32 B | ▌                |
+| `byte[]`    |       8 |    32 |       1 |      24 B | ▌                |
+| `byte[]`    |       8 |    48 |       1 |      24 B | ▌                |
 
 ### Top Arrays (primitive)
 
 _Largest primitive arrays by shallow size — individual instances and class totals._
 
-| Array Class |  Length |    Shallow | Owner (Class#field)                    |                  |
-| ----------- | ------: | ---------: | -------------------------------------- | ---------------- |
-| `int[]`     | 131,064 |   512.0 KB | —                                      | ████████████████ |
-| `int[]`     | 131,064 |   512.0 KB | —                                      | ████████████████ |
-| `byte[]`    | 261,187 |   255.1 KB | `java.util.zip.ZipFile$Source#cen`     | ███████▉         |
-| `byte[]`    |  60,231 |    58.8 KB | `java.util.zip.ZipFile$Source#cen`     | █▊               |
-| `byte[]`    |  46,187 |    45.1 KB | `java.util.zip.ZipFile$Source#cen`     | █▍               |
-| `int[]`     |   8,781 |    34.3 KB | `java.util.zip.ZipFile$Source#entries` | █                |
-| `char[]`    |   8,192 |    16.0 KB | `java.io.BufferedWriter#cb`            | ▌                |
-| `char[]`    |   8,192 |    16.0 KB | `java.io.BufferedWriter#cb`            | ▌                |
-| `byte[]`    |  15,354 |    15.0 KB | `java.util.zip.ZipFile$Source#cen`     | ▍                |
-| `byte[]`    |  12,096 |    11.8 KB | `java.lang.String#value`               | ▎                |
-| **Total**   |         | **1.4 MB** |                                        |                  |
+| Array Class |  Length |     Shallow | Owner (Class#field)                    |                  |
+| ----------- | ------: | ----------: | -------------------------------------- | ---------------- |
+| `int[]`     | 131,064 |   512.0 KiB | —                                      | ████████████████ |
+| `int[]`     | 131,064 |   512.0 KiB | —                                      | ████████████████ |
+| `byte[]`    | 261,187 |   255.1 KiB | `java.util.zip.ZipFile$Source#cen`     | ███████▉         |
+| `byte[]`    |  60,231 |    58.8 KiB | `java.util.zip.ZipFile$Source#cen`     | █▊               |
+| `byte[]`    |  46,187 |    45.1 KiB | `java.util.zip.ZipFile$Source#cen`     | █▍               |
+| `int[]`     |   8,781 |    34.3 KiB | `java.util.zip.ZipFile$Source#entries` | █                |
+| `char[]`    |   8,192 |    16.0 KiB | `java.io.BufferedWriter#cb`            | ▌                |
+| `char[]`    |   8,192 |    16.0 KiB | `java.io.BufferedWriter#cb`            | ▌                |
+| `byte[]`    |  15,354 |    15.0 KiB | `java.util.zip.ZipFile$Source#cen`     | ▍                |
+| `byte[]`    |  12,096 |    11.8 KiB | `java.lang.String#value`               | ▎                |
+| **Total**   |         | **1.4 MiB** |                                        |                  |
 
 #### Top Array Classes (primitive)
 
-| Array Class |   Instances |    Shallow |                  |
-| ----------- | ----------: | ---------: | ---------------- |
-| `byte[]`    |     122,254 |     8.4 MB | ████████████████ |
-| `int[]`     |       2,475 |     1.1 MB | ██▏              |
-| `char[]`    |         223 |    55.7 KB | ▏                |
-| `long[]`    |          16 |    14.2 KB | ▏                |
-| `boolean[]` |           9 |     1.9 KB | ▏                |
-| `double[]`  |           7 |      672 B | ▏                |
-| `short[]`   |           6 |      352 B | ▏                |
-| `float[]`   |           3 |       96 B | ▏                |
-| **Total**   | **124,993** | **9.6 MB** |                  |
+| Array Class |   Instances |     Shallow |                  |
+| ----------- | ----------: | ----------: | ---------------- |
+| `byte[]`    |     122,254 |     8.4 MiB | ████████████████ |
+| `int[]`     |       2,475 |     1.1 MiB | ██▏              |
+| `char[]`    |         223 |    55.7 KiB | ▏                |
+| `long[]`    |          16 |    14.2 KiB | ▏                |
+| `boolean[]` |           9 |     1.9 KiB | ▏                |
+| `double[]`  |           7 |       672 B | ▏                |
+| `short[]`   |           6 |       352 B | ▏                |
+| `float[]`   |           3 |        96 B | ▏                |
+| **Total**   | **124,993** | **9.6 MiB** |                  |
 
 ### Top Arrays (object)
 
 _Largest object arrays by shallow size — individual instances and class totals._
 
-| Array Class                                     |  Length |   Used / Length |    Shallow | Owner (Class#field)                            |                  |
-| ----------------------------------------------- | ------: | --------------: | ---------: | ---------------------------------------------- | ---------------- |
-| `java.lang.Object[]`                            | 131,072 | 131,072/131,072 |   512.0 KB | —                                              | ████████████████ |
-| `java.util.HashMap$Node[]`                      | 131,072 |  51,370/131,072 |   512.0 KB | `java.util.HashMap#table`                      | ████████████████ |
-| `java.util.HashMap$Node[]`                      |  65,536 |   25,551/65,536 |   256.0 KB | `java.util.HashMap#table`                      | ████████         |
-| `java.lang.Object[]`                            |   7,937 |     7,706/7,937 |    31.0 KB | —                                              | ▉                |
-| `java.util.HashMap$Node[]`                      |   4,096 |     2,048/4,096 |    16.0 KB | `java.util.HashMap#table`                      | ▌                |
-| `java.util.HashMap$Node[]`                      |   4,096 |     1,889/4,096 |    16.0 KB | `java.util.HashMap#table`                      | ▌                |
-| `java.lang.Object[]`                            |   2,285 |       356/2,285 |     8.9 KB | —                                              | ▎                |
-| `java.lang.Object[]`                            |   2,126 |     1,063/2,126 |     8.3 KB | `java.util.ImmutableCollections$SetN#elements` | ▎                |
-| `scala.math.BigInt[]`                           |   2,049 |         0/2,049 |     8.0 KB | —                                              | ▎                |
-| `java.util.concurrent.ConcurrentHashMap$Node[]` |   2,048 |       544/2,048 |     8.0 KB | `java.util.concurrent.ConcurrentHashMap#table` | ▎                |
-| **Total**                                       |         |                 | **1.3 MB** |                                                |                  |
+| Array Class                                     |  Length |   Used / Length |     Shallow | Owner (Class#field)                            |                  |
+| ----------------------------------------------- | ------: | --------------: | ----------: | ---------------------------------------------- | ---------------- |
+| `java.lang.Object[]`                            | 131,072 | 131,072/131,072 |   512.0 KiB | —                                              | ████████████████ |
+| `java.util.HashMap$Node[]`                      | 131,072 |  51,370/131,072 |   512.0 KiB | `java.util.HashMap#table`                      | ████████████████ |
+| `java.util.HashMap$Node[]`                      |  65,536 |   25,551/65,536 |   256.0 KiB | `java.util.HashMap#table`                      | ████████         |
+| `java.lang.Object[]`                            |   7,937 |     7,706/7,937 |    31.0 KiB | —                                              | ▉                |
+| `java.util.HashMap$Node[]`                      |   4,096 |     2,048/4,096 |    16.0 KiB | `java.util.HashMap#table`                      | ▌                |
+| `java.util.HashMap$Node[]`                      |   4,096 |     1,889/4,096 |    16.0 KiB | `java.util.HashMap#table`                      | ▌                |
+| `java.lang.Object[]`                            |   2,285 |       356/2,285 |     8.9 KiB | —                                              | ▎                |
+| `java.lang.Object[]`                            |   2,126 |     1,063/2,126 |     8.3 KiB | `java.util.ImmutableCollections$SetN#elements` | ▎                |
+| `scala.math.BigInt[]`                           |   2,049 |         0/2,049 |     8.0 KiB | —                                              | ▎                |
+| `java.util.concurrent.ConcurrentHashMap$Node[]` |   2,048 |       544/2,048 |     8.0 KiB | `java.util.concurrent.ConcurrentHashMap#table` | ▎                |
+| **Total**                                       |         |                 | **1.3 MiB** |                                                |                  |
 
 #### Top Array Classes (object)
 
-| Array Class                                     | Instances |    Shallow |                  |
-| ----------------------------------------------- | --------: | ---------: | ---------------- |
-| `java.util.HashMap$Node[]`                      |       423 |   875.0 KB | ████████████████ |
-| `java.lang.Object[]`                            |     2,391 |   726.6 KB | █████████████▎   |
-| `java.util.concurrent.ConcurrentHashMap$Node[]` |        93 |    54.1 KB | ▉                |
-| `java.lang.ref.SoftReference[]`                 |       274 |    20.3 KB | ▎                |
-| `java.lang.Class[]`                             |       557 |    16.0 KB | ▎                |
-| `java.lang.String[]`                            |       208 |    13.4 KB | ▏                |
-| `scala.math.BigInt[]`                           |         1 |     8.0 KB | ▏                |
-| `java.lang.invoke.MethodHandle[]`               |        48 |     7.8 KB | ▏                |
-| `java.util.concurrent.ForkJoinTask[]`           |        27 |     7.2 KB | ▏                |
-| `java.lang.invoke.LambdaForm$Name[]`            |       145 |     6.1 KB | ▏                |
-| **Total**                                       | **4,167** | **1.7 MB** |                  |
+| Array Class                                     | Instances |     Shallow |                  |
+| ----------------------------------------------- | --------: | ----------: | ---------------- |
+| `java.util.HashMap$Node[]`                      |       423 |   875.0 KiB | ████████████████ |
+| `java.lang.Object[]`                            |     2,391 |   726.6 KiB | █████████████▎   |
+| `java.util.concurrent.ConcurrentHashMap$Node[]` |        93 |    54.1 KiB | ▉                |
+| `java.lang.ref.SoftReference[]`                 |       274 |    20.3 KiB | ▎                |
+| `java.lang.Class[]`                             |       557 |    16.0 KiB | ▎                |
+| `java.lang.String[]`                            |       208 |    13.4 KiB | ▏                |
+| `scala.math.BigInt[]`                           |         1 |     8.0 KiB | ▏                |
+| `java.lang.invoke.MethodHandle[]`               |        48 |     7.8 KiB | ▏                |
+| `java.util.concurrent.ForkJoinTask[]`           |        27 |     7.2 KiB | ▏                |
+| `java.lang.invoke.LambdaForm$Name[]`            |       145 |     6.1 KiB | ▏                |
+| **Total**                                       | **4,167** | **1.7 MiB** |                  |
 
 ## Collection Waste Budget
 
 _Memory tied up in avoidable objects — duplicate strings, duplicate primitive arrays, boxed primitives, and empty/singleton collection overhead. Fix the biggest category first for the highest impact. Figures are approximate._
 
-| Waste Type                   |      Wasted |   Objects | Fix Suggestion                                                                          |
-| ---------------------------- | ----------: | --------: | --------------------------------------------------------------------------------------- |
-| Boxed Primitives (footprint) |     20.4 KB |     1,177 | Use primitive arrays, or Eclipse Collections / Koloboke for primitive-typed collections |
-| **Total**                    | **20.4 KB** | **1,177** |                                                                                         |
+| Waste Type                   |       Wasted |   Objects | Fix Suggestion                                                                          |
+| ---------------------------- | -----------: | --------: | --------------------------------------------------------------------------------------- |
+| Boxed Primitives (footprint) |     20.4 KiB |     1,177 | Use primitive arrays, or Eclipse Collections / Koloboke for primitive-typed collections |
+| **Total**                    | **20.4 KiB** | **1,177** |                                                                                         |
 
 ## Top Retainers
 
@@ -16836,15 +17311,15 @@ _Combined ranking of `Class#field` references and stack-frame locals by retained
 
 | Name                                                                          | Kind        | Retained |
 | ----------------------------------------------------------------------------- | ----------- | -------: |
-| java.util.concurrent.ForkJoinTask#awaitDone()                                 | Stack Frame |   4.2 MB |
-| java.util.concurrent.ForkJoinTask#invoke()                                    | Stack Frame |   4.2 MB |
-| java.util.concurrent.ForkJoinPool#awaitWork()                                 | Stack Frame |  36.9 KB |
-| java.util.concurrent.ForkJoinPool#runWorker()                                 | Stack Frame |  11.5 KB |
-| java.util.concurrent.ForkJoinWorkerThread#run()                               | Stack Frame |  11.5 KB |
-| org.renaissance.jdk.streams.MnemonicsCoderWithStream#parallelEncode()         | Stack Frame |   3.0 KB |
-| org.renaissance.jdk.streams.MnemonicsCoderWithStream#encode()                 | Stack Frame |   2.9 KB |
-| org.renaissance.jdk.streams.MnemonicsCoderWithStream#parallelTranslate()      | Stack Frame |   2.9 KB |
-| java.util.stream.Collectors#lambda$groupingBy$53()                            | Stack Frame |   1.9 KB |
+| java.util.concurrent.ForkJoinTask#awaitDone()                                 | Stack Frame |  4.2 MiB |
+| java.util.concurrent.ForkJoinTask#invoke()                                    | Stack Frame |  4.2 MiB |
+| java.util.concurrent.ForkJoinPool#awaitWork()                                 | Stack Frame | 36.9 KiB |
+| java.util.concurrent.ForkJoinPool#runWorker()                                 | Stack Frame | 11.5 KiB |
+| java.util.concurrent.ForkJoinWorkerThread#run()                               | Stack Frame | 11.5 KiB |
+| org.renaissance.jdk.streams.MnemonicsCoderWithStream#parallelEncode()         | Stack Frame |  3.0 KiB |
+| org.renaissance.jdk.streams.MnemonicsCoderWithStream#encode()                 | Stack Frame |  2.9 KiB |
+| org.renaissance.jdk.streams.MnemonicsCoderWithStream#parallelTranslate()      | Stack Frame |  2.9 KiB |
+| java.util.stream.Collectors#lambda$groupingBy$53()                            | Stack Frame |  1.9 KiB |
 | java.util.Spliterators$ArraySpliterator#forEachRemaining()                    | Stack Frame |    192 B |
 | java.util.stream.AbstractPipeline#copyInto()                                  | Stack Frame |    184 B |
 | java.lang.StringLatin1$CharsSpliterator#forEachRemaining()                    | Stack Frame |    176 B |
@@ -16874,20 +17349,20 @@ _220 reference instances._
 
 #### Referent Classes
 
-| Class                                    | Objects | Shallow | Retained |                  |
-| ---------------------------------------- | ------: | ------: | -------: | ---------------- |
-| `java.lang.invoke.LambdaForm`            |     131 |  6.1 KB |  59.0 KB | █▌               |
-| `java.lang.Class$ReflectionData`         |      22 |  1.4 KB |   1.4 KB | ▏                |
-| `java.lang.invoke.DirectMethodHandle`    |      21 |   840 B |    840 B | ▏                |
-| `sun.util.locale.BaseLocale`             |      20 |   640 B |   1.2 KB | ▏                |
-| `java.util.Locale`                       |      10 |   320 B |    320 B | ▏                |
-| `java.util.jar.Manifest`                 |       6 |   144 B | 590.2 KB | ████████████████ |
-| `java.util.concurrent.ConcurrentHashMap` |       4 |   256 B |   1.7 KB | ▏                |
-| `java.lang.Object[]`                     |       2 |    64 B |     64 B | ▏                |
-| `java.util.ArrayList`                    |       1 |    24 B |     80 B | ▏                |
-| `sun.text.resources.cldr.FormatData`     |       1 |    40 B |  28.3 KB | ▊                |
-| `sun.text.resources.cldr.FormatData_en`  |       1 |    40 B |  20.0 KB | ▌                |
-| `sun.util.resources.Bundles$1`           |       1 |    40 B |     40 B | ▏                |
+| Class                                    | Objects | Shallow |  Retained |                  |
+| ---------------------------------------- | ------: | ------: | --------: | ---------------- |
+| `java.lang.invoke.LambdaForm`            |     131 | 6.1 KiB |  59.0 KiB | █▌               |
+| `java.lang.Class$ReflectionData`         |      22 | 1.4 KiB |   1.4 KiB | ▏                |
+| `java.lang.invoke.DirectMethodHandle`    |      21 |   840 B |     840 B | ▏                |
+| `sun.util.locale.BaseLocale`             |      20 |   640 B |   1.2 KiB | ▏                |
+| `java.util.Locale`                       |      10 |   320 B |     320 B | ▏                |
+| `java.util.jar.Manifest`                 |       6 |   144 B | 590.2 KiB | ████████████████ |
+| `java.util.concurrent.ConcurrentHashMap` |       4 |   256 B |   1.7 KiB | ▏                |
+| `java.lang.Object[]`                     |       2 |    64 B |      64 B | ▏                |
+| `java.util.ArrayList`                    |       1 |    24 B |      80 B | ▏                |
+| `sun.text.resources.cldr.FormatData`     |       1 |    40 B |  28.3 KiB | ▊                |
+| `sun.text.resources.cldr.FormatData_en`  |       1 |    40 B |  20.0 KiB | ▌                |
+| `sun.util.resources.Bundles$1`           |       1 |    40 B |      40 B | ▏                |
 
 #### Only Softly Retained
 
@@ -16895,7 +17370,7 @@ _Referents reachable only through soft references — no strong path. GC clears 
 
 | Class                            | Objects | Shallow | Retained |                  |
 | -------------------------------- | ------: | ------: | -------: | ---------------- |
-| `java.lang.Class$ReflectionData` |      22 |  1.4 KB |   1.4 KB | ████████████████ |
+| `java.lang.Class$ReflectionData` |      22 | 1.4 KiB |  1.4 KiB | ████████████████ |
 
 ### Weak References
 
@@ -16905,28 +17380,28 @@ _757 reference instances. 19 instances have a null referent — referent collect
 
 #### Referent Classes
 
-| Class                                                             | Objects | Shallow | Retained |                  |
-| ----------------------------------------------------------------- | ------: | ------: | -------: | ---------------- |
-| `java.lang.invoke.MethodType`                                     |     692 | 27.0 KB |  85.8 KB | ████████████████ |
-| `java.util.logging.Level`                                         |       9 |   288 B |    288 B | ▏                |
-| `java.util.logging.Logger`                                        |       8 |   448 B |   4.3 KB | ▊                |
-| `java.lang.Module`                                                |       4 |   192 B |  21.8 KB | ████             |
-| `java.util.logging.LogManager$RootLogger`                         |       4 |   256 B |   1.4 KB | ▎                |
-| `java.lang.ClassValue$Version`                                    |       3 |    72 B |    168 B | ▏                |
-| `java.lang.ClassValue$Identity`                                   |       2 |    32 B |     32 B | ▏                |
-| `sun.security.provider.FileInputStreamPool$UnclosableInputStream` |       2 |    32 B |     32 B | ▏                |
-| `java.lang.ClassLoader`                                           |       1 |    16 B |      0 B |                  |
-| `java.lang.ThreadGroup`                                           |       1 |    48 B |     48 B | ▏                |
-| `java.net.URLClassLoader`                                         |       1 |     8 B |      0 B |                  |
-| `java.security.Provider$Service`                                  |       1 |     8 B |      0 B |                  |
-| `java.security.SecureClassLoader`                                 |       1 |     0 B |      0 B |                  |
-| `jdk.internal.loader.BuiltinClassLoader`                          |       1 |    16 B |      0 B |                  |
-| `jdk.internal.loader.ClassLoaders$AppClassLoader`                 |       1 |     8 B |      0 B |                  |
-| `jdk.internal.loader.ClassLoaders$PlatformClassLoader`            |       1 |     8 B |      0 B |                  |
-| `jdk.internal.misc.TerminatingThreadLocal$1`                      |       1 |    16 B |     16 B | ▏                |
-| `jdk.internal.vm.SharedThreadContainer`                           |       1 |    40 B |     40 B | ▏                |
-| `org.renaissance.core.Launcher`                                   |       1 |    24 B |      0 B |                  |
-| `scala.reflect.ManifestFactory$ObjectManifest`                    |       1 |    32 B |     32 B | ▏                |
+| Class                                                             | Objects |  Shallow | Retained |                  |
+| ----------------------------------------------------------------- | ------: | -------: | -------: | ---------------- |
+| `java.lang.invoke.MethodType`                                     |     692 | 27.0 KiB | 85.8 KiB | ████████████████ |
+| `java.util.logging.Level`                                         |       9 |    288 B |    288 B | ▏                |
+| `java.util.logging.Logger`                                        |       8 |    448 B |  4.3 KiB | ▊                |
+| `java.lang.Module`                                                |       4 |    192 B | 21.8 KiB | ████             |
+| `java.util.logging.LogManager$RootLogger`                         |       4 |    256 B |  1.4 KiB | ▎                |
+| `java.lang.ClassValue$Version`                                    |       3 |     72 B |    168 B | ▏                |
+| `java.lang.ClassValue$Identity`                                   |       2 |     32 B |     32 B | ▏                |
+| `sun.security.provider.FileInputStreamPool$UnclosableInputStream` |       2 |     32 B |     32 B | ▏                |
+| `java.lang.ClassLoader`                                           |       1 |     16 B |      0 B |                  |
+| `java.lang.ThreadGroup`                                           |       1 |     48 B |     48 B | ▏                |
+| `java.net.URLClassLoader`                                         |       1 |      8 B |      0 B |                  |
+| `java.security.Provider$Service`                                  |       1 |      8 B |      0 B |                  |
+| `java.security.SecureClassLoader`                                 |       1 |      0 B |      0 B |                  |
+| `jdk.internal.loader.BuiltinClassLoader`                          |       1 |     16 B |      0 B |                  |
+| `jdk.internal.loader.ClassLoaders$AppClassLoader`                 |       1 |      8 B |      0 B |                  |
+| `jdk.internal.loader.ClassLoaders$PlatformClassLoader`            |       1 |      8 B |      0 B |                  |
+| `jdk.internal.misc.TerminatingThreadLocal$1`                      |       1 |     16 B |     16 B | ▏                |
+| `jdk.internal.vm.SharedThreadContainer`                           |       1 |     40 B |     40 B | ▏                |
+| `org.renaissance.core.Launcher`                                   |       1 |     24 B |      0 B |                  |
+| `scala.reflect.ManifestFactory$ObjectManifest`                    |       1 |     32 B |     32 B | ▏                |
 _… 2 more classes (2 objects, 32 B shallow, 32 B retained)._
 
 #### Only Weakly Retained
@@ -16943,15 +17418,15 @@ _29 reference instances. 1 instance has a null referent — referent collected, 
 
 #### Referent Classes
 
-| Class                                 | Objects | Shallow | Retained |                  |
-| ------------------------------------- | ------: | ------: | -------: | ---------------- |
-| `java.io.FileDescriptor`              |       9 |   360 B |    360 B | ▏                |
-| `java.util.zip.Inflater`              |       8 |   512 B |    512 B | ▏                |
-| `java.util.jar.JarFile`               |       7 |   448 B | 592.8 KB | ████████████████ |
-| `java.lang.ref.Cleaner`               |       1 |    16 B |     16 B | ▏                |
-| `java.nio.DirectByteBuffer`           |       1 |    72 B |     72 B | ▏                |
-| `sun.net.www.protocol.jar.URLJarFile` |       1 |    80 B |    344 B | ▏                |
-| `sun.nio.fs.NativeBuffer`             |       1 |    32 B |     64 B | ▏                |
+| Class                                 | Objects | Shallow |  Retained |                  |
+| ------------------------------------- | ------: | ------: | --------: | ---------------- |
+| `java.io.FileDescriptor`              |       9 |   360 B |     360 B | ▏                |
+| `java.util.zip.Inflater`              |       8 |   512 B |     512 B | ▏                |
+| `java.util.jar.JarFile`               |       7 |   448 B | 592.8 KiB | ████████████████ |
+| `java.lang.ref.Cleaner`               |       1 |    16 B |      16 B | ▏                |
+| `java.nio.DirectByteBuffer`           |       1 |    72 B |      72 B | ▏                |
+| `sun.net.www.protocol.jar.URLJarFile` |       1 |    80 B |     344 B | ▏                |
+| `sun.nio.fs.NativeBuffer`             |       1 |    32 B |      64 B | ▏                |
 
 #### Only Phantom-Retained
 
@@ -16963,63 +17438,63 @@ _None found — no objects are exclusively reachable via this reference kind._
 
 _Objects that are no longer reachable from any GC root but have not yet been collected. A small unreachable fraction (< 5%) is normal between GC cycles; a large one suggests the dump was taken mid-collection._
 
-_3,908 unreachable objects, 1.1 MB shallow heap. Top 30 classes by shallow heap._
+_3,908 unreachable objects, 1.1 MiB shallow heap. Top 30 classes by shallow heap._
 
 _Unreachable objects are eligible for collection but have not yet been reclaimed. At 5.6% of heap total (reachable + unreachable) this is elevated — the dump was likely taken before a full GC cycle completed. GC reclaims this memory automatically; it is not a leak. Confirm: trigger a full GC (`jcmd <pid> GC.run`) then re-dump; if the count drops sharply, it was pre-GC garbage._
 
-| Kind             | Objects | Shallow |                  |
-| ---------------- | ------: | ------: | ---------------- |
-| Instances        |   1,226 | 37.3 KB | ▌                |
-| Object Arrays    |      41 |  1.8 KB | ▏                |
-| Primitive Arrays |   2,533 |  1.1 MB | ████████████████ |
-| Class Objects    |     108 |     0 B |                  |
+| Kind             | Objects |  Shallow |                  |
+| ---------------- | ------: | -------: | ---------------- |
+| Instances        |   1,226 | 37.3 KiB | ▌                |
+| Object Arrays    |      41 |  1.8 KiB | ▏                |
+| Primitive Arrays |   2,533 |  1.1 MiB | ████████████████ |
+| Class Objects    |     108 |      0 B |                  |
 
 _Shallow heap is additive; retained sets overlap — nested subtrees are counted once per ancestor, so summing retained across classes overstates the total reclaimable memory._
 
-| Class                                                  | Objects | Shallow | Retained |                  |
-| ------------------------------------------------------ | ------: | ------: | -------: | ---------------- |
-| `int[]`                                                |   1,576 |  1.0 MB |   1.0 MB | ████████████████ |
-| `byte[]`                                               |     957 | 52.8 KB |  52.8 KB | ▊                |
-| `java.lang.String`                                     |     955 | 22.4 KB |  75.1 KB | ▎                |
-| `java.lang.reflect.Field`                              |     101 |  7.1 KB |  12.2 KB | ▏                |
-| `java.lang.reflect.Method`                             |      18 |  1.5 KB |   3.2 KB | ▏                |
-| `java.lang.Class$ReflectionData`                       |      22 |  1.4 KB |  19.8 KB | ▏                |
-| `java.lang.ref.SoftReference`                          |      22 |   880 B |  20.6 KB | ▏                |
-| `java.lang.invoke.MemberName`                          |      21 |   840 B |    904 B | ▏                |
-| `java.lang.reflect.Constructor`                        |       9 |   648 B |   2.0 KB | ▏                |
-| `java.lang.reflect.Field[]`                            |       5 |   496 B |  12.6 KB | ▏                |
-| `java.lang.invoke.DirectMethodHandle$Constructor`      |       8 |   384 B |   1.1 KB | ▏                |
-| `java.lang.ClassValue$Entry[]`                         |       2 |   288 B |    288 B | ▏                |
-| `java.lang.reflect.Method[]`                           |      10 |   248 B |   3.4 KB | ▏                |
-| `java.lang.reflect.Constructor[]`                      |      10 |   240 B |   2.3 KB | ▏                |
-| `java.util.HashMap$Node`                               |       7 |   224 B |    224 B | ▏                |
-| `java.lang.Class[]`                                    |       9 |   216 B |    216 B | ▏                |
-| `java.lang.Thread`                                     |       2 |   208 B |    520 B | ▏                |
-| `java.lang.invoke.ResolvedMethodName`                  |      12 |   192 B |    192 B | ▏                |
-| `jdk.internal.reflect.DirectConstructorHandleAccessor` |       8 |   192 B |   1.4 KB | ▏                |
-| `java.lang.invoke.DirectMethodHandle`                  |       4 |   160 B |    384 B | ▏                |
-| `java.lang.invoke.BoundMethodHandle$Species_L`         |       4 |   160 B |    544 B | ▏                |
-| `java.util.WeakHashMap$Entry[]`                        |       2 |   160 B |    240 B | ▏                |
-| `jdk.internal.reflect.DirectMethodHandleAccessor`      |       4 |   128 B |    672 B | ▏                |
-| `java.lang.ClassValue$ClassValueMap`                   |       2 |   128 B |    992 B | ▏                |
-| `java.security.AccessControlContext`                   |       2 |    80 B |     80 B | ▏                |
-| `java.lang.Thread$FieldHolder`                         |       2 |    80 B |     80 B | ▏                |
-| `java.lang.invoke.BoundMethodHandle$Species_LL`        |       2 |    80 B |    224 B | ▏                |
-| `java.util.WeakHashMap$Entry`                          |       2 |    80 B |     80 B | ▏                |
-| `java.util.HashMap$Node[]`                             |       1 |    80 B |    304 B | ▏                |
-| `java.lang.ref.ReferenceQueue`                         |       2 |    64 B |    208 B | ▏                |
+| Class                                                  | Objects |  Shallow | Retained |                  |
+| ------------------------------------------------------ | ------: | -------: | -------: | ---------------- |
+| `int[]`                                                |   1,576 |  1.0 MiB |  1.0 MiB | ████████████████ |
+| `byte[]`                                               |     957 | 52.8 KiB | 52.8 KiB | ▊                |
+| `java.lang.String`                                     |     955 | 22.4 KiB | 75.1 KiB | ▎                |
+| `java.lang.reflect.Field`                              |     101 |  7.1 KiB | 12.2 KiB | ▏                |
+| `java.lang.reflect.Method`                             |      18 |  1.5 KiB |  3.2 KiB | ▏                |
+| `java.lang.Class$ReflectionData`                       |      22 |  1.4 KiB | 19.8 KiB | ▏                |
+| `java.lang.ref.SoftReference`                          |      22 |    880 B | 20.6 KiB | ▏                |
+| `java.lang.invoke.MemberName`                          |      21 |    840 B |    904 B | ▏                |
+| `java.lang.reflect.Constructor`                        |       9 |    648 B |  2.0 KiB | ▏                |
+| `java.lang.reflect.Field[]`                            |       5 |    496 B | 12.6 KiB | ▏                |
+| `java.lang.invoke.DirectMethodHandle$Constructor`      |       8 |    384 B |  1.1 KiB | ▏                |
+| `java.lang.ClassValue$Entry[]`                         |       2 |    288 B |    288 B | ▏                |
+| `java.lang.reflect.Method[]`                           |      10 |    248 B |  3.4 KiB | ▏                |
+| `java.lang.reflect.Constructor[]`                      |      10 |    240 B |  2.3 KiB | ▏                |
+| `java.util.HashMap$Node`                               |       7 |    224 B |    224 B | ▏                |
+| `java.lang.Class[]`                                    |       9 |    216 B |    216 B | ▏                |
+| `java.lang.Thread`                                     |       2 |    208 B |    520 B | ▏                |
+| `java.lang.invoke.ResolvedMethodName`                  |      12 |    192 B |    192 B | ▏                |
+| `jdk.internal.reflect.DirectConstructorHandleAccessor` |       8 |    192 B |  1.4 KiB | ▏                |
+| `java.lang.invoke.DirectMethodHandle`                  |       4 |    160 B |    384 B | ▏                |
+| `java.lang.invoke.BoundMethodHandle$Species_L`         |       4 |    160 B |    544 B | ▏                |
+| `java.util.WeakHashMap$Entry[]`                        |       2 |    160 B |    240 B | ▏                |
+| `jdk.internal.reflect.DirectMethodHandleAccessor`      |       4 |    128 B |    672 B | ▏                |
+| `java.lang.ClassValue$ClassValueMap`                   |       2 |    128 B |    992 B | ▏                |
+| `java.security.AccessControlContext`                   |       2 |     80 B |     80 B | ▏                |
+| `java.lang.Thread$FieldHolder`                         |       2 |     80 B |     80 B | ▏                |
+| `java.lang.invoke.BoundMethodHandle$Species_LL`        |       2 |     80 B |    224 B | ▏                |
+| `java.util.WeakHashMap$Entry`                          |       2 |     80 B |     80 B | ▏                |
+| `java.util.HashMap$Node[]`                             |       1 |     80 B |    304 B | ▏                |
+| `java.lang.ref.ReferenceQueue`                         |       2 |     64 B |    208 B | ▏                |
 
 ### Garbage-Root Dominator Trees
 
 _Top garbage-root subtrees by retained heap — unreachable objects with no reachable predecessor. Each node shows retained heap within its subtree. Tree depth is capped._
 
-1. **int[]** — 512.0 KB (1 object in subtree) ████████████████
+1. **int[]** — 512.0 KiB (1 object in subtree) ████████████████
 
-2. **int[]** — 512.0 KB (1 object in subtree) ████████████████
+2. **int[]** — 512.0 KiB (1 object in subtree) ████████████████
 
-3. **java.lang.ref.SoftReference** — 6.7 KB (154 objects in subtree) ▏               
-   └─ java.lang.Class$ReflectionData — 6.7 KB ▏               
-        └─ java.lang.reflect.Field[] — 6.6 KB ▏               
+3. **java.lang.ref.SoftReference** — 6.7 KiB (154 objects in subtree) ▏               
+   └─ java.lang.Class$ReflectionData — 6.7 KiB ▏               
+        └─ java.lang.reflect.Field[] — 6.6 KiB ▏               
              ├─ java.lang.reflect.Field — 232 B ▏               
              │    ├─ java.lang.String — 112 B ▏               
              │    │    └─ byte[] — 88 B ▏               
@@ -17047,9 +17522,9 @@ _Top garbage-root subtrees by retained heap — unreachable objects with no reac
                   └─ java.lang.String — 56 B ▏               
                        └─ byte[] — 32 B ▏               
 
-4. **java.lang.ref.SoftReference** — 3.2 KB (70 objects in subtree) ▏               
-   └─ java.lang.Class$ReflectionData — 3.2 KB ▏               
-        └─ java.lang.reflect.Field[] — 3.1 KB ▏               
+4. **java.lang.ref.SoftReference** — 3.2 KiB (70 objects in subtree) ▏               
+   └─ java.lang.Class$ReflectionData — 3.2 KiB ▏               
+        └─ java.lang.reflect.Field[] — 3.1 KiB ▏               
              ├─ java.lang.reflect.Field — 200 B ▏               
              │    └─ jdk.internal.reflect.MethodHandleObjectFieldAccessorImpl — 128 B ▏               
              │         └─ java.lang.invoke.DirectMethodHandle$StaticAccessor — 96 B ▏               
@@ -17075,13 +17550,13 @@ _Top garbage-root subtrees by retained heap — unreachable objects with no reac
                   └─ java.lang.String — 64 B ▏               
                        └─ byte[] — 40 B ▏               
 
-5. **int[]** — 3.0 KB (1 object in subtree) ▏               
+5. **int[]** — 3.0 KiB (1 object in subtree) ▏               
 
-6. **int[]** — 2.2 KB (1 object in subtree) ▏               
+6. **int[]** — 2.2 KiB (1 object in subtree) ▏               
 
-7. **java.lang.ref.SoftReference** — 1.6 KB (36 objects in subtree) ▏               
-   └─ java.lang.Class$ReflectionData — 1.6 KB ▏               
-        └─ java.lang.reflect.Field[] — 1.5 KB ▏               
+7. **java.lang.ref.SoftReference** — 1.6 KiB (36 objects in subtree) ▏               
+   └─ java.lang.Class$ReflectionData — 1.6 KiB ▏               
+        └─ java.lang.reflect.Field[] — 1.5 KiB ▏               
              ├─ java.lang.reflect.Field — 136 B ▏               
              │    └─ java.lang.String — 64 B ▏               
              │         └─ byte[] — 40 B ▏               
@@ -17107,10 +17582,10 @@ _Top garbage-root subtrees by retained heap — unreachable objects with no reac
                   └─ java.lang.String — 48 B ▏               
                        └─ byte[] — 24 B ▏               
 
-8. **int[]** — 1.3 KB (1 object in subtree) ▏               
+8. **int[]** — 1.3 KiB (1 object in subtree) ▏               
 
-9. **java.lang.ref.SoftReference** — 1.1 KB (26 objects in subtree) ▏               
-   └─ java.lang.Class$ReflectionData — 1.1 KB ▏               
+9. **java.lang.ref.SoftReference** — 1.1 KiB (26 objects in subtree) ▏               
+   └─ java.lang.Class$ReflectionData — 1.1 KiB ▏               
         └─ java.lang.reflect.Field[] — 1016 B ▏               
              ├─ java.lang.reflect.Field — 200 B ▏               
              │    ├─ java.lang.String — 80 B ▏               
@@ -17212,10 +17687,10 @@ _Half of all live objects sit within 7 hops of a GC root; the deepest chain is 2
 
 _Point-in-time counts for known Java leak patterns. Non-zero values are not always bugs — see the **What to Check** column for how to triage each one._
 
-| Indicator                            |    Value | What to Check                                                                                                                                         |
-| ------------------------------------ | -------: | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Anonymous/generated classes          |      176 | High counts signal class-loader leaks (e.g. dynamic proxies accumulating per request). In Top Consumers, filter by `$` to find the biggest offenders. |
-| `DirectByteBuffer` off-heap capacity | 134.3 MB | Native memory, excluded from JVM heap totals. Check for NIO buffer pools that leak on close, or Netty/gRPC allocators missing a buffer cap.           |
+| Indicator                            |                                       Value | What to Check                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ------------------------------------ | ------------------------------------------: | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Anonymous/generated classes          |                                         176 | High counts signal class-loader leaks (e.g. dynamic proxies accumulating per request). In Top Consumers, filter by `$` to find the biggest offenders.                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `DirectByteBuffer` off-heap capacity | 134.3 MiB (sum) / 134.3 MiB (de-duplicated) | Native memory, excluded from JVM heap totals. Two figures, two scopes: the **sum** adds up the `capacity` of all 8 `DirectByteBuffer` instances, so memory shared between a buffer and its `duplicate()`/`slice()` views is counted once per view; the **de-duplicated** figure merges those overlapping ranges and is the one to compare against process RSS (MAT's `direct` reports the same quantity). A large gap between them means the app is view-heavy, not that it holds that much native memory. Check for NIO buffer pools that leak on close, or Netty/gRPC allocators missing a buffer cap. |
 
 ## Glossary
 
@@ -17258,6 +17733,16 @@ _Definitions for the heap analysis terms used throughout this report._
 - **Instance vs. class**: an *instance* is one object; a *class* row aggregates
   every instance of that type. "Largest" in the histogram is the shallow size of
   the single biggest instance of a class.
+- **Instance counts — three scopes**: the report counts instances at three
+  different scopes, so the same class legitimately shows three different numbers.
+  (1) `Instances (heap)` in the Class Histogram is the **class total**: every
+  reachable instance of that class. (2) `Top Dominators` in
+  "Biggest Classes by Retained Heap" counts only the objects of that class whose
+  immediate dominator is a GC root — a class with millions of instances can have
+  a handful of top-level dominators. (3) `In Subtree` under a leak suspect's
+  "Accumulated objects by class" counts only the instances **inside that one
+  suspect's dominated subtree**. None of the three is a subset relation you can
+  read off directly, and none of them should be expected to match.
 - **Collection fill ratio**: the fraction of a collection's backing-array capacity
   that is actually occupied by elements — `elements / capacity`. A fill ratio near
   0 means the backing array is mostly empty (wasted memory). A ratio near 1 means
@@ -17274,7 +17759,7 @@ _Definitions for the heap analysis terms used throughout this report._
   ReferenceQueue.
 - **Compressed OOPs** (Compressed Ordinary Object Pointers): a JVM optimization
   where object references are stored as 32-bit integers instead of 64-bit pointers,
-  halving reference-field overhead on heaps ≤ ~32 GB. Visible in the Heap Summary
+  halving reference-field overhead on heaps ≤ ~32 GiB. Visible in the Heap Summary
   as `Compressed OOPs: yes`.
 - **Class#field**: the notation used throughout this report to identify a specific
   field — `HolderClass#fieldName`. For example `java.util.HashMap#table` names the
