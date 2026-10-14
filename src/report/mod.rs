@@ -1553,14 +1553,18 @@ mod tests {
                 thread_serial: 7,
                 thread_obj_idx: 0,
                 frames: vec!["java.lang.Object.wait (Object.java:1)".to_string()],
+                mat_frames: vec![
+                    "  at java.lang.Object.wait()V (Object.java(Native Method))".to_string(),
+                ],
             },
             crate::pass2::ThreadStack {
                 thread_serial: 9,
                 thread_obj_idx: u32::MAX,
                 frames: vec!["x.y (Unknown Source)".to_string()],
+                mat_frames: vec!["  at x.y (Unknown Source)".to_string()],
             },
         ];
-        let ov = build_thread_overview(&g, 0);
+        let ov = build_thread_overview(&g, 0, 20);
         assert_eq!(ov.threads.len(), 2);
         assert_eq!(ov.threads[0].thread_serial, 7);
         assert_eq!(

@@ -51,6 +51,14 @@ pub struct ThreadLocalRoot {
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct StackFrame {
     pub method_name_id: u64,
+    /// JVM method descriptor (e.g. `(Ljava/lang/Object;)V`). MAT prints it
+    /// between the method name and the source location in the `.threads` file
+    /// (`Pass1Parser.StackFrame.toString`: `className + "." + method +
+    /// methodSignature + " (" + sourceLocation + ")"`), so it must survive into
+    /// pass 2's frame rendering. `#[serde(default)]` keeps caches written before
+    /// this field existed loadable (they lose only the signature).
+    #[serde(default)]
+    pub method_sig_id: u64,
     pub source_file_id: u64,
     pub class_serial: u32,
     pub line_number: i32,
@@ -277,7 +285,7 @@ impl Pass1 {
                     // + source_file_id(id) + class_serial(u4) + line_number(u4)
                     let frame_id = r.id()?;
                     let method_name_id = r.id()?;
-                    let _method_sig_id = r.id()?;
+                    let method_sig_id = r.id()?;
                     let source_file_id = r.id()?;
                     let class_serial = r.u4()?;
                     let line_number = r.u4()? as i32;
@@ -285,6 +293,7 @@ impl Pass1 {
                         frame_id,
                         StackFrame {
                             method_name_id,
+                            method_sig_id,
                             source_file_id,
                             class_serial,
                             line_number,

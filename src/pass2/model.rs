@@ -35,7 +35,15 @@ pub struct ThreadStack {
     /// Object index of the owning `java.lang.Thread` (u32::MAX = unresolved).
     pub thread_obj_idx: u32,
     /// Frames top-first, each pre-rendered as `class.method (source:line)`.
+    /// This is the report's form (see `render_frame`).
     pub frames: Vec<String>,
+    /// The same frames rendered in MAT's `.threads` form, which carries the JVM
+    /// method descriptor and MAT's own source-location wording:
+    /// `class.method(sig) (source:line)`. Kept as a second, small Vec (one entry
+    /// per stack frame, a few thousand in total) so the report keeps emitting
+    /// its own frame text while the MAT cache stays byte-comparable with MAT's.
+    /// Empty for a trace with no frames.
+    pub mat_frames: Vec<String>,
 }
 
 /// Per-thread properties decoded from the `java.lang.Thread` instance blob

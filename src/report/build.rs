@@ -635,7 +635,7 @@ pub fn build_model(
         build_system_overview(g, depth_counts, opts.top_consumers, opts.hist_root_path_top);
     t_bm!("system_overview");
     crate::trace::probe("build_model: after system_overview aggregates");
-    let stack_held_via = build_stack_held_via(g);
+    let stack_held_via = build_stack_held_via(g, opts.thread_locals_per_thread);
     let top = build_top_consumers(
         g,
         opts.top_consumers,
@@ -644,7 +644,7 @@ pub fn build_model(
         overview.total_shallow,
     );
     t_bm!("top_consumers");
-    let threads = build_thread_overview(g, overview.total_shallow);
+    let threads = build_thread_overview(g, overview.total_shallow, opts.thread_locals_per_thread);
     t_bm!("thread_overview");
     crate::trace::probe("build_model: after thread_overview aggregates");
     let top_components = build_top_components(&overview);
@@ -2080,10 +2080,18 @@ pub(crate) fn build_alloc_sites_from<I: Iterator<Item = u32>>(
 /// Resolve each thread stack into a `ThreadInfo`. The thread's class name is
 /// looked up via its object index (`u32::MAX` = unresolved). Small: one entry
 /// per stack trace.
-pub(crate) fn build_thread_overview(g: &Graph, total_shallow: u64) -> ThreadOverview {
+pub(crate) fn build_thread_overview(
+    g: &Graph,
+    total_shallow: u64,
+    locals_cap: usize,
+) -> ThreadOverview {
     let threads = g
         .thread_stacks
         .iter()
+        // The Thread Overview lists threads that have a stack. A stack-less
+        // thread is still kept in `thread_stacks` so the MAT `.threads` file can
+        // carry MAT's header-only block for it, but it has nothing to show here.
+        .filter(|t| !t.frames.is_empty())
         .map(|t| {
             let class_name = if t.thread_obj_idx == u32::MAX {
                 None
@@ -2150,7 +2158,7 @@ pub(crate) fn build_thread_overview(g: &Graph, total_shallow: u64) -> ThreadOver
 
             // Gated per-frame significant locals (only when --thread-locals ran).
             let (significant_frames, max_local_retained) =
-                build_significant_frames(g, t, total_shallow);
+                build_significant_frames(g, t, total_shallow, locals_cap);
 
             ThreadInfo {
                 thread_serial: t.thread_serial,
@@ -2200,11 +2208,17 @@ fn build_significant_frames(
     g: &Graph,
     t: &crate::pass2::ThreadStack,
     total_shallow: u64,
+    locals_cap: usize,
 ) -> (Vec<SignificantFrame>, u64) {
     use std::collections::BTreeMap;
     let Some(pairs) = g.thread_local_frame_samples.get(&t.thread_serial) else {
         return (Vec::new(), 0);
     };
+    // `thread_local_frame_samples` now holds EVERY local of the thread, because
+    // MAT's `.threads` file needs the complete set. The report's `--detail` cap
+    // is applied here instead — to the first `locals_cap` pairs, which is exactly
+    // the slice this function used to be handed.
+    let pairs = &pairs[..pairs.len().min(locals_cap)];
     if pairs.is_empty() {
         return (Vec::new(), 0);
     }
@@ -3996,9 +4010,10 @@ pub(crate) fn build_size_distribution(retained_desc: &[u64]) -> TopSizeDistribut
 /// Build a dense-object-index → "ClassName#methodName()" map for every object
 /// that appears as a significant local in any thread's stack frames. Used to
 /// annotate `ObjRow::held_via` for objects held by stack frames rather than
-/// fields. Returns an empty map when `--thread-locals` was not set (the gated
-/// `thread_local_frame_samples` map is empty).
-fn build_stack_held_via(g: &Graph) -> std::collections::HashMap<u32, String> {
+/// fields. `thread_local_frame_samples` is complete (MAT parity); the report's
+/// `--detail` cap is applied here per thread, exactly as it used to be applied
+/// when the map was built.
+fn build_stack_held_via(g: &Graph, locals_cap: usize) -> std::collections::HashMap<u32, String> {
     use std::collections::HashMap;
     let mut out: HashMap<u32, String> = HashMap::new();
     for (&_thread_serial, pairs) in &g.thread_local_frame_samples {
@@ -4007,7 +4022,7 @@ fn build_stack_held_via(g: &Graph) -> std::collections::HashMap<u32, String> {
             .thread_stacks
             .iter()
             .find(|ts| pairs.iter().any(|_| ts.thread_serial == _thread_serial));
-        for &(frame_number, local_idx) in pairs {
+        for &(frame_number, local_idx) in pairs.iter().take(locals_cap) {
             if out.contains_key(&local_idx) {
                 continue; // first writer wins — highest-retained frame
             }

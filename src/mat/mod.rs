@@ -870,23 +870,35 @@ impl MatEmitter {
         Ok(())
     }
 
-    /// Emit the MAT `.threads` plain-text file. Each thread is written as:
+    /// Emit the MAT `.threads` plain-text file, byte-for-byte the shape
+    /// `Pass1Parser.dumpThreads` produces. Each thread is written as:
     /// ```text
     /// Thread 0x<addr>
-    ///   at class.method(sig) (source:line)
+    ///   at class.method(sig) (source:line)<CR><LF>
     ///   ...
-    ///
+    /// <blank>
     ///   locals:
     ///     objectId=0x<addr>, line=<frame_number>
     ///     ...
+    /// <blank>
     /// ```
-    /// `thread_stacks`: resolved thread stacks from `g.thread_stacks`.
+    /// The frame lines end with CRLF (MAT builds them with `StackTrace.toString`,
+    /// which hard-codes `\r\n`) while every other line ends with a bare LF. The
+    /// `  locals:` header is written for EVERY thread, even one with no locals —
+    /// the reader (`ThreadStackHelper.loadThreadsData`) probes the line after the
+    /// frames for `locals`, and when the section is missing it consumes the next
+    /// thread's header as that probe, silently dropping the thread.
+    ///
+    /// `thread_stacks`: resolved thread stacks from `g.thread_stacks`. A thread
+    /// whose object could not be resolved (`u32::MAX`) is skipped, mirroring
+    /// MAT's `if (tid == null) continue;`. A thread with an empty stack is still
+    /// written as a header-only block, again as MAT does.
     /// `thread_addrs`: dense-id → object address for the thread objects and
     ///   frame locals this file names. `MatIdMap` deliberately does not store
     ///   addresses (they cost ~4 GB on a large heap), so the caller captures
     ///   this small side table while the dense address table is still resident.
-    /// `local_frame_samples`: optional per-thread `(frame_number, old_dense_idx)`
-    ///   pairs; `None` or empty means no locals section is emitted.
+    /// `local_frame_samples`: per-thread `(frame_number, old_dense_idx)` pairs,
+    ///   complete (not a sample) — MAT lists every local of every thread.
     pub fn emit_threads(
         &self,
         thread_stacks: &[ThreadStack],
@@ -897,9 +909,6 @@ impl MatEmitter {
         let path = self.dir.join(format!("{}.threads", self.prefix));
         let mut f = BufWriter::new(File::create(&path)?);
         for ts in thread_stacks {
-            if ts.frames.is_empty() {
-                continue;
-            }
             // Thread header: the *address* of the thread object, which is what
             // MAT writes (`Pass1Parser.dumpThreads`: `"0x" + hex(tid)`) and what
             // the reader's `mapAddressToId` resolves. A thread whose object we
@@ -911,33 +920,36 @@ impl MatEmitter {
                 continue;
             };
             writeln!(f, "Thread 0x{:x}", thread_addr)?;
-            for frame in &ts.frames {
-                writeln!(f, "  at {}", frame)?;
+            // Frames. MAT writes `out.println(stack)` where `StackTrace.toString`
+            // appends `\r\n` after each frame, so frame lines carry CRLF.
+            for frame in &ts.mat_frames {
+                writeln!(f, "{frame}\r")?;
             }
-            // Locals section (only when samples were captured).
+            // The blank line `out.println(stack)` leaves after the last frame.
+            writeln!(f)?;
+            // Locals header — unconditional, exactly as MAT writes it.
+            writeln!(f, "  locals:")?;
             if let Some(locals) = local_frame_samples.get(&ts.thread_serial) {
-                if !locals.is_empty() {
-                    writeln!(f, "\n  locals:")?;
-                    for &(frame_num, old_idx) in locals {
-                        let local_addr = thread_addrs.get(&old_idx).copied().unwrap_or(0);
-                        // MAT writes the raw `JavaLocal.lineNumber`, which is the
-                        // *frame index* inside the stack trace, not a source line:
-                        // its reader (`ThreadStackHelper.buildFrames`) groups locals
-                        // by this value and looks them up per frame index `i`. The
-                        // `u32::MAX` sentinel (JNI local / native stack / thread
-                        // block, which carry no frame) becomes -1, exactly what MAT
-                        // writes when `hasLineInfo` is false — and the reader skips
-                        // any negative value. Adding 1 here (as this used to) moved
-                        // every local one frame down.
-                        let line: i64 = if frame_num == u32::MAX {
-                            -1
-                        } else {
-                            i64::from(frame_num)
-                        };
-                        writeln!(f, "    objectId=0x{:x}, line={}", local_addr, line)?;
-                    }
+                for &(frame_num, old_idx) in locals {
+                    let local_addr = thread_addrs.get(&old_idx).copied().unwrap_or(0);
+                    // MAT writes the raw `JavaLocal.lineNumber`, which is the
+                    // *frame index* inside the stack trace, not a source line:
+                    // its reader (`ThreadStackHelper.buildFrames`) groups locals
+                    // by this value and looks them up per frame index `i`. The
+                    // `u32::MAX` sentinel (JNI local / native stack / thread
+                    // block, which carry no frame) becomes -1, exactly what MAT
+                    // writes when `hasLineInfo` is false — and the reader skips
+                    // any negative value. Adding 1 here (as this used to) moved
+                    // every local one frame down.
+                    let line: i64 = if frame_num == u32::MAX {
+                        -1
+                    } else {
+                        i64::from(frame_num)
+                    };
+                    writeln!(f, "    objectId=0x{:x}, line={}", local_addr, line)?;
                 }
             }
+            // The blank line `out.println()` leaves after each thread block.
             writeln!(f)?;
         }
         f.into_inner().map_err(|e| e.into_error())?.sync_all()?;
@@ -2462,6 +2474,7 @@ mod tests {
             thread_serial: serial,
             thread_obj_idx,
             frames: frames.iter().map(|s| s.to_string()).collect(),
+            mat_frames: frames.iter().map(|s| format!("  at {s}")).collect(),
         }
     }
 
@@ -2484,16 +2497,51 @@ mod tests {
     }
 
     #[test]
-    fn emit_threads_skips_stack_with_no_frames() {
-        // A ThreadStack with empty frames vec should be silently skipped.
+    fn emit_threads_writes_header_only_block_for_empty_stack() {
+        // A thread with an empty stack is still a thread MAT writes: it gets a
+        // header, no frames, and an (empty) locals section. Dropping it lost the
+        // thread from MAT entirely.
         let ts = make_thread_stack(1, 0, &[]); // no frames
         let tmp = std::env::temp_dir().join("mat_threads_skip_noframe");
         let _ = std::fs::remove_dir_all(&tmp);
         let e = MatEmitter::new(&tmp, "dump_", None).unwrap();
         e.emit_threads(&[ts], &addr_map(&[(0, 0x10)]), &HashMap::new())
             .unwrap();
-        let bytes = std::fs::read(tmp.join("dump_.threads")).unwrap();
-        assert!(bytes.is_empty(), "thread with no frames should be skipped");
+        let content = std::fs::read_to_string(tmp.join("dump_.threads")).unwrap();
+        assert_eq!(
+            content, "Thread 0x10\n\n  locals:\n\n",
+            "empty-stack thread must be written as a header-only block"
+        );
+    }
+
+    #[test]
+    fn emit_threads_always_writes_locals_header() {
+        // The `  locals:` header is unconditional. The MAT reader probes the
+        // line after the frames for `locals`; when it is missing, the reader
+        // consumes the NEXT thread's header as the probe and drops that thread.
+        let stacks = vec![
+            make_thread_stack(1, 0, &["a.A.run(A.java:1)"]),
+            make_thread_stack(2, 1, &["b.B.run(B.java:2)"]),
+        ];
+        let tmp = std::env::temp_dir().join("mat_threads_locals_header");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let e = MatEmitter::new(&tmp, "dump_", None).unwrap();
+        // No locals for either thread.
+        e.emit_threads(&stacks, &addr_map(&[(0, 0x10), (1, 0x20)]), &HashMap::new())
+            .unwrap();
+        let content = std::fs::read_to_string(tmp.join("dump_.threads")).unwrap();
+        let headers = content.lines().filter(|l| l.starts_with("Thread ")).count();
+        let locals = content.lines().filter(|l| l.trim() == "locals:").count();
+        assert_eq!(headers, 2, "{content}");
+        assert_eq!(
+            locals, headers,
+            "every thread block needs a locals header:\n{content}"
+        );
+        // Frame lines end with CRLF, exactly as MAT writes them.
+        assert!(
+            content.contains("  at a.A.run(A.java:1)\r\n"),
+            "{content:?}"
+        );
     }
 
     #[test]

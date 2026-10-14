@@ -441,16 +441,22 @@ impl Pass2 {
         // by #threads only (bounded), so it stays off the per-object RSS budget.
         let mut thread_local_counts: std::collections::HashMap<u32, u64> =
             std::collections::HashMap::new();
-        // Bounded per-thread sample of local object indices. Only populated when
-        // the opt-in `--thread-locals` flag is set; empty otherwise (zero cost on
-        // the default path).
+        // Bounded per-thread sample of local object indices. Used only by the
+        // report's per-thread "local objects" list, which is capped at
+        // `opts.thread_locals_per_thread`. Bounded by #threads * cap.
         let mut thread_local_samples: std::collections::HashMap<u32, Vec<u32>> =
             std::collections::HashMap::new();
-        // Gated frame→local map: per-thread (frame_number, local_idx) pairs, used
-        // to build MAT's per-frame significant-locals interleave. Only populated
-        // when `--thread-locals` is set; `u32::MAX` frame_number = no frame (JNI
-        // local / native stack / thread block). Bounded per thread by the same
-        // per-thread cap. Zero cost on the default path.
+        // Complete per-thread (frame_number, local object index) pairs — every
+        // resolved thread-local root, NOT a capped sample. MAT's `.threads` file
+        // lists every local of every thread (`Pass1Parser.dumpThreads` walks
+        // `thread2locals`), so the cache is only byte-comparable with MAT when
+        // this is complete. The cost is bounded by pass 1's `thread_local_pairs`
+        // vector, which is already fully resident — this map is a re-index of it,
+        // not a new traversal of the object graph, so it does not touch the
+        // per-object RSS budget. Consumers that want MAT's cap apply it when
+        // rendering (see `report::build::build_significant_frames`).
+        // `u32::MAX` frame_number = no frame (JNI local / native stack / thread
+        // block).
         let mut thread_local_frame_samples: std::collections::HashMap<u32, Vec<(u32, u32)>> =
             std::collections::HashMap::new();
         for tlr in &p1.thread_local_pairs {
@@ -478,12 +484,11 @@ impl Pass2 {
                 if sample.len() < opts.thread_locals_per_thread {
                     sample.push(local_idx);
                 }
-                if opts.thread_locals_per_thread > 0 {
-                    let fs = thread_local_frame_samples.entry(thread_serial).or_default();
-                    if fs.len() < opts.thread_locals_per_thread {
-                        fs.push((frame_number, local_idx));
-                    }
-                }
+                // Uncapped: the `.threads` emitter needs every local to match MAT.
+                thread_local_frame_samples
+                    .entry(thread_serial)
+                    .or_default()
+                    .push((frame_number, local_idx));
             }
         }
         // Dedup synthetic edges (same thread may reference same local multiple times)

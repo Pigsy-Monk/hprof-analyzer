@@ -19,8 +19,11 @@ type HolderOffsets = (Option<usize>, Option<usize>, Option<usize>);
 /// Resolve pass1's STACK_TRACE/STACK_FRAME tables into pre-rendered thread
 /// stacks. Each frame becomes `class.method (source:line)`; unresolved string
 /// ids fall back to their hex id, unknown/negative line numbers are rendered
-/// per HPROF convention. Traces with no frames are dropped. Output is sorted by
-/// `thread_serial` for determinism. Small (one entry per thread trace).
+/// per HPROF convention. Traces with no frames are KEPT: MAT writes a
+/// header-only block for a thread whose stack is empty (`Pass1Parser.dumpThreads`
+/// iterates every StackTrace, empty or not), and dropping them here lost those
+/// threads from the MAT `.threads` file. Output is sorted by `thread_serial` for
+/// determinism. Small (one entry per thread trace).
 pub(crate) fn build_thread_stacks(p1: &Pass1) -> Vec<ThreadStack> {
     let resolve = |id: u64| -> Option<&str> { p1.strings.get(&id).map(|s| s.as_str()) };
     let class_name_of = |serial: u32| -> Option<&str> {
@@ -31,9 +34,6 @@ pub(crate) fn build_thread_stacks(p1: &Pass1) -> Vec<ThreadStack> {
 
     let mut out: Vec<ThreadStack> = Vec::new();
     for (&stack_serial, frame_ids) in p1.stack_traces.iter() {
-        if frame_ids.is_empty() {
-            continue;
-        }
         let thread_serial = p1
             .stack_trace_thread
             .get(&stack_serial)
@@ -47,9 +47,11 @@ pub(crate) fn build_thread_stacks(p1: &Pass1) -> Vec<ThreadStack> {
             .unwrap_or(u32::MAX);
 
         let mut frames = Vec::with_capacity(frame_ids.len());
+        let mut mat_frames = Vec::with_capacity(frame_ids.len());
         for &fid in frame_ids {
             let Some(f) = p1.stack_frames.get(&fid) else {
                 frames.push(format!("<unknown frame {fid:#x}>"));
+                mat_frames.push(format!("  at <unknown frame {fid:#x}>"));
                 continue;
             };
             let class = class_name_of(f.class_serial).map(pretty_binary_name);
@@ -62,11 +64,19 @@ pub(crate) fn build_thread_stacks(p1: &Pass1) -> Vec<ThreadStack> {
                 f.class_serial,
                 f.line_number,
             ));
+            mat_frames.push(render_frame_mat(
+                class.as_deref(),
+                method,
+                resolve(f.method_sig_id),
+                source,
+                f.line_number,
+            ));
         }
         out.push(ThreadStack {
             thread_serial,
             thread_obj_idx,
             frames,
+            mat_frames,
         });
     }
     out.sort_by_key(|t| t.thread_serial);
@@ -1233,6 +1243,49 @@ pub(crate) fn render_frame(
         _ => source.to_string(),
     };
     format!("{class}.{method} ({loc})")
+}
+
+/// Render one frame the way MAT's `Pass1Parser` writes it into the `.threads`
+/// file: `  at <class>.<method><signature> (<sourceLocation>)`.
+///
+/// The signature is the JVM method descriptor (`(Ljava/lang/Object;)V`) carried
+/// from the HPROF STACK_FRAME record, and the source location follows MAT's
+/// `Pass1Parser.StackFrame.toString` exactly:
+///   * a real line number → `file:line`
+///   * `0` / `-1`         → the bare file name, or `Unknown Source` if none
+///   * `-2`               → `file(Compiled Code)` (MAT's wording, not "Compiled
+///     Method"), or `(Compiled Code)` if no file
+///   * `-3`               → `file(Native Method)`, or `(Native Method)` if none
+///   * anything else      → empty (MAT leaves `sourceLocation` at `""`)
+///
+/// Java renders a null String as `null` when concatenated, so an absent source
+/// file becomes the literal `null` — that is what MAT writes, reproduced here.
+///
+/// The `  at ` prefix is included so the caller can write the line verbatim.
+pub(crate) fn render_frame_mat(
+    class: Option<&str>,
+    method: Option<&str>,
+    signature: Option<&str>,
+    source: Option<&str>,
+    line_number: i32,
+) -> String {
+    let class = class.unwrap_or("<UNKNOWN CLASS>");
+    let method = method.unwrap_or("<method>");
+    let src = source.unwrap_or("null");
+    let loc = match line_number {
+        n if n > 0 => format!("{src}:{n}"),
+        -2 => format!("{src}(Compiled Code)"),
+        -3 => format!("{src}(Native Method)"),
+        0 | -1 => {
+            if source.is_some() {
+                src.to_string()
+            } else {
+                "Unknown Source".to_string()
+            }
+        }
+        _ => String::new(),
+    };
+    format!("  at {class}.{method}{} ({loc})", signature.unwrap_or(""))
 }
 
 /// Convert an internal binary class name (`Lfoo/Bar;` or `foo/Bar`) into the
