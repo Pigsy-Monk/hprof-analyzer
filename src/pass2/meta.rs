@@ -1258,8 +1258,12 @@ pub(crate) fn render_frame(
 ///   * `-3`               → `file(Native Method)`, or `(Native Method)` if none
 ///   * anything else      → empty (MAT leaves `sourceLocation` at `""`)
 ///
-/// Java renders a null String as `null` when concatenated, so an absent source
-/// file becomes the literal `null` — that is what MAT writes, reproduced here.
+/// MAT builds the location with `sourceFile + ...`, and its `sourceFile` is
+/// `getString(sourceFileId)` — an empty String (not null) when the frame
+/// carries no usable source-file id, which is what MAT's own `.threads` shows
+/// for hidden/lambda classes (`at pkg.Foo$$Lambda+0x…run()V ()`). Reproduce
+/// that: an absent source is the empty string, so a frame with no line info
+/// renders `()` rather than `(Unknown Source)`.
 ///
 /// The `  at ` prefix is included so the caller can write the line verbatim.
 pub(crate) fn render_frame_mat(
@@ -1271,18 +1275,12 @@ pub(crate) fn render_frame_mat(
 ) -> String {
     let class = class.unwrap_or("<UNKNOWN CLASS>");
     let method = method.unwrap_or("<method>");
-    let src = source.unwrap_or("null");
+    let src = source.unwrap_or("");
     let loc = match line_number {
         n if n > 0 => format!("{src}:{n}"),
         -2 => format!("{src}(Compiled Code)"),
         -3 => format!("{src}(Native Method)"),
-        0 | -1 => {
-            if source.is_some() {
-                src.to_string()
-            } else {
-                "Unknown Source".to_string()
-            }
-        }
+        0 | -1 => src.to_string(),
         _ => String::new(),
     };
     format!("  at {class}.{method}{} ({loc})", signature.unwrap_or(""))

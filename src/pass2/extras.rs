@@ -484,12 +484,18 @@ impl Pass2 {
                 if sample.len() < opts.thread_locals_per_thread {
                     sample.push(local_idx);
                 }
-                // Uncapped: the `.threads` emitter needs every local to match MAT.
-                thread_local_frame_samples
-                    .entry(thread_serial)
-                    .or_default()
-                    .push((frame_number, local_idx));
             }
+            // Uncapped, and INCLUDING a thread's self-referencing locals: the MAT
+            // `.threads` file lists every `JavaLocal` of the thread, and MAT's own
+            // file shows e.g. `Thread 0x…` with a local whose objectId is the
+            // thread's own address. The self-edge is kept out of `synthetic_edges`
+            // only so the forward CSR — and the dominator tree — stay unchanged;
+            // it is NOT absent from the thread's locals. The report's consumers
+            // drop it again (see `report::build::build_significant_frames`).
+            thread_local_frame_samples
+                .entry(thread_serial)
+                .or_default()
+                .push((frame_number, local_idx));
         }
         // Dedup synthetic edges (same thread may reference same local multiple times)
         synthetic_edges.sort_unstable();

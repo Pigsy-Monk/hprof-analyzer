@@ -2215,11 +2215,16 @@ fn build_significant_frames(
         return (Vec::new(), 0);
     };
     // `thread_local_frame_samples` now holds EVERY local of the thread, because
-    // MAT's `.threads` file needs the complete set. The report's `--detail` cap
-    // is applied here instead — to the first `locals_cap` pairs, which is exactly
-    // the slice this function used to be handed.
-    let pairs = &pairs[..pairs.len().min(locals_cap)];
-    if pairs.is_empty() {
+    // MAT's `.threads` file needs the complete set (including a thread's
+    // self-referencing locals). The report keeps its historical view: the
+    // self-referencing locals are skipped and the `--detail` cap is applied, both
+    // on the same leading slice this function used to be handed.
+    let mut pairs = pairs
+        .iter()
+        .filter(|&&(_, local_idx)| local_idx != t.thread_obj_idx)
+        .take(locals_cap)
+        .peekable();
+    if pairs.peek().is_none() {
         return (Vec::new(), 0);
     }
     // Group local indices by frame_number (u32::MAX = no-frame bucket, rendered last).
@@ -4022,7 +4027,15 @@ fn build_stack_held_via(g: &Graph, locals_cap: usize) -> std::collections::HashM
             .thread_stacks
             .iter()
             .find(|ts| pairs.iter().any(|_| ts.thread_serial == _thread_serial));
-        for &(frame_number, local_idx) in pairs.iter().take(locals_cap) {
+        // The map now includes a thread's self-referencing locals (MAT's
+        // `.threads` file needs them); the report's held-via column historically
+        // excluded them, so they are skipped here along with the `--detail` cap.
+        let self_idx = stack.map(|ts| ts.thread_obj_idx);
+        for &(frame_number, local_idx) in pairs
+            .iter()
+            .filter(|&&(_, li)| Some(li) != self_idx)
+            .take(locals_cap)
+        {
             if out.contains_key(&local_idx) {
                 continue; // first writer wins — highest-retained frame
             }
