@@ -338,6 +338,15 @@ enum Cmd {
         /// cache was written with `--with-graph` — are unaffected either way.
         #[arg(long)]
         allow_rescan: bool,
+        /// Deprecated no-op, accepted for compatibility.
+        ///
+        /// Refusing to re-read the dump is the default now (see `--allow-rescan`
+        /// above), so this flag no longer changes anything. It is kept so that
+        /// existing scripts and notes that still pass `--no-rescan` keep working
+        /// instead of failing with `unexpected argument`. Prefer the default, or
+        /// `--allow-rescan` to opt back into the escalated re-run.
+        #[arg(long)]
+        no_rescan: bool,
         /// Print resident-set size (RSS) at each labeled pipeline stage to
         /// stderr while the analysis runs — the same `[trace-rss] <stage>
         /// RSS=N MB (peak N MB)` lines the CLI prints with `--trace-rss`.
@@ -1149,6 +1158,7 @@ fn main() {
             input,
             port,
             allow_rescan,
+            no_rescan,
             trace_rss,
             progress,
         }) => {
@@ -1156,6 +1166,14 @@ fn main() {
                 fail(format!(
                     "'{input}' is not an HPROF dump; the `server` subcommand needs a .hprof[.gz/.zip/.tar.gz] file"
                 ));
+            }
+            // `--no-rescan` is a deprecated no-op: refusing the re-read is the
+            // default now, so the flag only earns a stderr note (never stdout,
+            // which carries the banner) telling the caller it is unnecessary.
+            if no_rescan {
+                eprintln!(
+                    "note: --no-rescan is the default now; the flag is accepted for compatibility"
+                );
             }
             // The analysis runs on a background thread inside `serve`, but both
             // of these are process-global switches, so setting them here covers
@@ -2392,6 +2410,9 @@ fn analyze_to_report_inner(
 /// dump *while the analysis stays resident*, roughly doubling peak memory — the
 /// 32 GiB OOM this default exists to prevent. See [`Cmd::Server`]'s
 /// `allow_rescan` for the full rationale.
+///
+/// The old `--no-rescan` flag (the inverse, opt-in switch) is now a deprecated
+/// no-op accepted for compatibility; it does not feed into this function.
 fn server_no_rescan(allow_rescan: bool) -> bool {
     !allow_rescan
 }
@@ -7227,6 +7248,49 @@ mod cli_tests {
             !server_no_rescan(allow_rescan),
             "--allow-rescan must permit the escalated re-run"
         );
+    }
+
+    /// `--no-rescan` is a deprecated no-op. Deleting an existing flag is a
+    /// breaking change — scripts and notes still pass it — so it must parse,
+    /// must not error, and must leave the policy at the default (refuse the
+    /// re-read).
+    #[test]
+    fn server_no_rescan_is_accepted_as_a_deprecated_noop() {
+        let cli = Cli::try_parse_from(["hprof-analyzer", "server", "heap.hprof", "--no-rescan"])
+            .expect("--no-rescan must still be accepted");
+        let (allow_rescan, no_rescan) = match cli.cmd {
+            Some(Cmd::Server {
+                allow_rescan,
+                no_rescan,
+                ..
+            }) => (allow_rescan, no_rescan),
+            _ => panic!("expected the server subcommand"),
+        };
+        assert!(no_rescan, "--no-rescan must be recorded, not dropped");
+        assert!(
+            !allow_rescan,
+            "--no-rescan must not turn on the escape hatch"
+        );
+        assert!(
+            server_no_rescan(allow_rescan),
+            "--no-rescan must leave the policy at the default: refuse the re-read"
+        );
+    }
+
+    /// The no-op claim, pinned: `--no-rescan` and no flag at all must produce
+    /// the *same* policy.
+    #[test]
+    fn server_no_rescan_matches_the_default_policy() {
+        let policy = |cli: Cli| match cli.cmd {
+            Some(Cmd::Server { allow_rescan, .. }) => server_no_rescan(allow_rescan),
+            _ => panic!("expected the server subcommand"),
+        };
+        let with =
+            Cli::try_parse_from(["hprof-analyzer", "server", "heap.hprof", "--no-rescan"]).unwrap();
+        let without = Cli::try_parse_from(["hprof-analyzer", "server", "heap.hprof"]).unwrap();
+        let (with_policy, default_policy) = (policy(with), policy(without));
+        assert!(default_policy, "the default must be to refuse the re-read");
+        assert_eq!(with_policy, default_policy, "--no-rescan must be a no-op");
     }
 
     #[test]

@@ -30,8 +30,11 @@ All notable changes to hprof-analyzer are documented here.
   the safe behavior had to be remembered — and on a 32 GB box the unsafe default
   cost a live server. The default is now to refuse such a query up front with
   `{"kind":"rescan_refused"}`, naming the capability it wanted. Start the server
-  with `--allow-rescan` (replacing the old `--no-rescan`, which is gone) to
-  restore the escalated re-run on a box with memory to spare. Queries the
+  with `--allow-rescan` (the explicit escape hatch) to restore the escalated
+  re-run on a box with memory to spare. The old `--no-rescan` flag is now a
+  deprecated no-op — still accepted so existing scripts keep working, but it
+  changes nothing (refusing is the default) and prints a one-line note on
+  stderr. Queries the
   resident cache can answer — counts, histograms, plain class projections,
   `@retainedHeapSize`, and edges from a `--with-graph` cache — are unaffected.
 

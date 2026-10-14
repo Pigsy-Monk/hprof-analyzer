@@ -100,6 +100,51 @@ fn start_server(hprof: &str) -> (Child, u16) {
     start_server_with(hprof, &[])
 }
 
+/// Read `r` line by line on a background thread, forwarding each line to the
+/// returned channel. Draining the pipe keeps it open for the child's lifetime —
+/// a closed read end would make the child's next `println!` fail on EPIPE.
+fn pump_lines<R: std::io::Read + Send + 'static>(r: R) -> std::sync::mpsc::Receiver<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let mut reader = std::io::BufReader::new(r);
+        let mut buf = String::new();
+        while let Ok(n) = reader.read_line(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            if tx.send(buf.trim_end().to_string()).is_err() {
+                break;
+            }
+            buf.clear();
+        }
+    });
+    rx
+}
+
+/// Wait until the server on `port` answers `/status` (its accept loop is up),
+/// up to 60 s — the same wait `start_server_with` performs.
+fn wait_accepting(port: u16) {
+    let url = format!("http://127.0.0.1:{port}/status");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        if std::time::Instant::now() > deadline {
+            panic!("server on port {port} did not start within 60 s");
+        }
+        let ok = Command::new("curl")
+            .args(["-s", "--max-time", "1", &url])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 /// GET `path` from the server on `port`.
 /// Returns `(http_status_code, response_body)`.
 fn curl_get(port: u16, path: &str) -> (u32, String) {
@@ -563,6 +608,96 @@ fn server_refuses_an_escalating_query_by_default() {
         body.contains("--allow-rescan"),
         "the refusal must name the escape hatch, got: {}",
         &body[..body.len().min(500)]
+    );
+}
+
+/// `--no-rescan` is a deprecated no-op kept for compatibility: old scripts and
+/// notes still pass it, and deleting a flag is a breaking change. The server
+/// must accept it, keep the default policy (refuse the re-read), and announce
+/// the deprecation on **stderr** — never on stdout, which carries the banner.
+#[test]
+fn server_treats_no_rescan_as_a_deprecated_noop() {
+    let Some(hprof) = philosophers() else { return };
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let mut child = Command::new(BIN)
+        .args(["server", &hprof, "--port", &port.to_string(), "--no-rescan"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn server");
+    let out_rx = pump_lines(child.stdout.take().unwrap());
+    let err_rx = pump_lines(child.stderr.take().unwrap());
+
+    // The banner is written before the analysis thread starts, so reading it
+    // does not wait on the pipeline.
+    let mut banner = String::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        match out_rx.recv_timeout(std::time::Duration::from_millis(200)) {
+            Ok(line) => {
+                banner.push_str(&line);
+                banner.push('\n');
+                if line.contains("listening on") {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    assert!(
+        banner.contains("listening on"),
+        "the server never printed its banner; stdout was: {banner}"
+    );
+    assert!(
+        !banner.contains("--no-rescan"),
+        "the deprecation note must not pollute stdout: {banner}"
+    );
+
+    wait_accepting(port);
+
+    // Behaviour must equal the default: a scan-bound query is refused, not run.
+    let (status, body) = curl_post(
+        port,
+        "/",
+        "SELECT @displayName, COUNT(*) AS n FROM INSTANCEOF java.lang.Object \
+         GROUP BY @displayName ORDER BY n DESC LIMIT 5",
+    );
+    child.kill().ok();
+    child.wait().ok();
+    assert_eq!(
+        status, 400,
+        "--no-rescan must keep the default refusal, got {status}: {body}"
+    );
+    assert!(
+        body.contains("rescan_refused"),
+        "the refusal must be a rescan_refused, got: {}",
+        &body[..body.len().min(500)]
+    );
+
+    // The note must be on stderr, not stdout.
+    let mut notes = String::new();
+    let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match err_rx.recv_timeout(std::time::Duration::from_millis(200)) {
+            Ok(line) => {
+                notes.push_str(&line);
+                notes.push('\n');
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if std::time::Instant::now() > drain_deadline {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    assert!(
+        notes.contains("--no-rescan is the default now"),
+        "the deprecation note must be on stderr, got: {notes}"
     );
 }
 

@@ -229,8 +229,8 @@ pub fn run_query_json_policy(
         // is then one `seek` into the dump instead of a full re-scan (the same
         // trick `heap inspect` uses). `blob_cache_eligible` is the cache-free
         // half; the cache-dependent half is the offsets check below, so without
-        // `offsets.bin` these queries still refuse loudly under `--no-rescan`
-        // rather than quietly answering Null.
+        // `offsets.bin` these queries still refuse loudly under the default
+        // rescan policy rather than quietly answering Null.
         let blob = crate::query::repl::blob_cache_eligible(&q, &plan);
         if eligible || object_from || blob {
             if cache.is_none() {
