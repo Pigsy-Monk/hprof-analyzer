@@ -416,6 +416,12 @@ pub fn compute_instance_sizes(meta: &MatClassMeta, object_align: i32) -> HashMap
 /// `old_to_mat[old_id]` = mat-id (1..=reachable_count), or -1 for unreachable
 /// objects and sentinel values. MAT id 0 is the synthetic root (address 0x0),
 /// never present in `old_to_mat`.
+///
+/// **Addresses are deliberately not stored here.** A dense `mat-id -> address`
+/// table costs ~4 GB on a 366M-object heap and is freed as soon as the index is
+/// emitted. Consumers that need an address must capture it from the dense
+/// address table while that is still resident — see the `.threads` side table
+/// built in `main.rs` (`mat_thread_addrs`).
 pub struct MatIdMap {
     /// old dense-id -> mat-id (1-based for real objects, -1 for unreachable)
     old_to_mat: Vec<i32>,
@@ -466,12 +472,6 @@ impl MatIdMap {
     /// `sorted()[i]` has mat-id `i + 1`.
     pub fn sorted(&self) -> &[u32] {
         &self.sorted
-    }
-
-    /// Address of the object with the given mat-id (1-based). Returns 0 since
-    /// address data is no longer stored in MatIdMap (was freed to save ~4 GB RSS).
-    pub fn addr_at_mat(&self, _mat_id: i32) -> u64 {
-        0
     }
 }
 
@@ -881,13 +881,16 @@ impl MatEmitter {
     ///     ...
     /// ```
     /// `thread_stacks`: resolved thread stacks from `g.thread_stacks`.
-    /// `mm`: the MAT id map (for translating `thread_obj_idx` → address).
+    /// `thread_addrs`: dense-id → object address for the thread objects and
+    ///   frame locals this file names. `MatIdMap` deliberately does not store
+    ///   addresses (they cost ~4 GB on a large heap), so the caller captures
+    ///   this small side table while the dense address table is still resident.
     /// `local_frame_samples`: optional per-thread `(frame_number, old_dense_idx)`
     ///   pairs; `None` or empty means no locals section is emitted.
     pub fn emit_threads(
         &self,
         thread_stacks: &[ThreadStack],
-        mm: &MatIdMap,
+        thread_addrs: &HashMap<u32, u64>,
         local_frame_samples: &HashMap<u32, Vec<(u32, u32)>>,
     ) -> io::Result<()> {
         let _mt = MatTimer::new("threads");
@@ -897,12 +900,15 @@ impl MatEmitter {
             if ts.frames.is_empty() {
                 continue;
             }
-            // Thread header: address of the thread object.
-            let thread_mat = mm.translate(ts.thread_obj_idx as i32);
-            let thread_addr = if thread_mat > 0 {
-                mm.addr_at_mat(thread_mat)
-            } else {
-                0
+            // Thread header: the *address* of the thread object, which is what
+            // MAT writes (`Pass1Parser.dumpThreads`: `"0x" + hex(tid)`) and what
+            // the reader's `mapAddressToId` resolves. A thread whose object we
+            // could not resolve has no address to write, so it is skipped
+            // outright — mirroring MAT's `if (tid == null) continue;`. Writing a
+            // 0x0 placeholder here would make the reader drop the thread anyway
+            // (and was the bug: every line read `Thread 0x0`).
+            let Some(&thread_addr) = thread_addrs.get(&ts.thread_obj_idx) else {
+                continue;
             };
             writeln!(f, "Thread 0x{:x}", thread_addr)?;
             for frame in &ts.frames {
@@ -913,16 +919,20 @@ impl MatEmitter {
                 if !locals.is_empty() {
                     writeln!(f, "\n  locals:")?;
                     for &(frame_num, old_idx) in locals {
-                        let local_mat = mm.translate(old_idx as i32);
-                        let local_addr = if local_mat > 0 {
-                            mm.addr_at_mat(local_mat)
+                        let local_addr = thread_addrs.get(&old_idx).copied().unwrap_or(0);
+                        // MAT writes the raw `JavaLocal.lineNumber`, which is the
+                        // *frame index* inside the stack trace, not a source line:
+                        // its reader (`ThreadStackHelper.buildFrames`) groups locals
+                        // by this value and looks them up per frame index `i`. The
+                        // `u32::MAX` sentinel (JNI local / native stack / thread
+                        // block, which carry no frame) becomes -1, exactly what MAT
+                        // writes when `hasLineInfo` is false — and the reader skips
+                        // any negative value. Adding 1 here (as this used to) moved
+                        // every local one frame down.
+                        let line: i64 = if frame_num == u32::MAX {
+                            -1
                         } else {
-                            0
-                        };
-                        let line = if frame_num == u32::MAX {
-                            0
-                        } else {
-                            frame_num + 1
+                            i64::from(frame_num)
                         };
                         writeln!(f, "    objectId=0x{:x}, line={}", local_addr, line)?;
                     }
@@ -999,8 +1009,9 @@ impl MatEmitter {
         }
 
         // --- invert class_obj_class_idx: old_classobj_id → histogram row (addr keyed) ---
-        // We need to go old_dense_id → class-object address for ClassImpl.address.
-        // mm.addr_at_mat(mm.translate(old_id)) gives us the address.
+        // Class-object addresses reach us through `meta.class_addr_to_mat` /
+        // `meta.class_mat_to_addr`, resolved by the caller while the dense
+        // address table was still resident (MatIdMap stores no addresses).
 
         let mut ser = Ser::new();
 
@@ -2362,7 +2373,6 @@ mod tests {
         assert_eq!(map.mat_count(), 1);
         assert_eq!(map.sorted(), &[] as &[u32]);
         assert_eq!(map.translate(0), -1);
-        assert_eq!(map.addr_at_mat(0), 0);
     }
 
     #[test]
@@ -2374,20 +2384,6 @@ mod tests {
         assert_eq!(map.sorted(), &[] as &[u32]);
         assert_eq!(map.translate(0), -1);
         assert_eq!(map.translate(1), -1);
-    }
-
-    #[test]
-    fn mat_id_map_addr_at_mat_bounds() {
-        let addrs = [0xAAu64, 0xBB, 0xCC];
-        let idom = vec![3u32, 3, 3, 3];
-        let map = MatIdMap::build(3, &idom, |i| addrs[i]);
-        // addr_at_mat always returns 0 (addresses not stored to save 4 GB RAM)
-        assert_eq!(map.addr_at_mat(0), 0);
-        assert_eq!(map.addr_at_mat(1), 0);
-        assert_eq!(map.addr_at_mat(2), 0);
-        assert_eq!(map.addr_at_mat(3), 0);
-        assert_eq!(map.addr_at_mat(4), 0);
-        assert_eq!(map.addr_at_mat(-1), 0);
     }
 
     #[test]
@@ -2469,15 +2465,20 @@ mod tests {
         }
     }
 
+    /// Build the small `dense-id → address` side table `emit_threads` takes
+    /// (the caller captures it from the dense address table while that is live).
+    fn addr_map(pairs: &[(u32, u64)]) -> HashMap<u32, u64> {
+        pairs.iter().copied().collect()
+    }
+
     #[test]
     fn emit_threads_empty_produces_empty_file() {
         // No thread stacks at all → file should be empty (0 bytes, no content).
-        let idom = vec![0u32, 0];
-        let mm = MatIdMap::build(2, &idom, |i| (i as u64 + 1) * 0x10);
         let tmp = std::env::temp_dir().join("mat_threads_empty");
         let _ = std::fs::remove_dir_all(&tmp);
         let e = MatEmitter::new(&tmp, "dump_", None).unwrap();
-        e.emit_threads(&[], &mm, &HashMap::new()).unwrap();
+        e.emit_threads(&[], &HashMap::new(), &HashMap::new())
+            .unwrap();
         let bytes = std::fs::read(tmp.join("dump_.threads")).unwrap();
         assert!(bytes.is_empty(), "no threads → empty file");
     }
@@ -2486,26 +2487,18 @@ mod tests {
     fn emit_threads_skips_stack_with_no_frames() {
         // A ThreadStack with empty frames vec should be silently skipped.
         let ts = make_thread_stack(1, 0, &[]); // no frames
-        let idom = vec![0u32, 0];
-        let mm = MatIdMap::build(2, &idom, |i| (i as u64 + 1) * 0x10);
         let tmp = std::env::temp_dir().join("mat_threads_skip_noframe");
         let _ = std::fs::remove_dir_all(&tmp);
         let e = MatEmitter::new(&tmp, "dump_", None).unwrap();
-        e.emit_threads(&[ts], &mm, &HashMap::new()).unwrap();
+        e.emit_threads(&[ts], &addr_map(&[(0, 0x10)]), &HashMap::new())
+            .unwrap();
         let bytes = std::fs::read(tmp.join("dump_.threads")).unwrap();
         assert!(bytes.is_empty(), "thread with no frames should be skipped");
     }
 
     #[test]
     fn emit_threads_single_thread_address_and_frames() {
-        // Thread obj_idx=0 (mat-id 1). Two frames.
-        // addr_at_mat always returns 0 (addresses not stored to save 4 GB RAM).
-        let addrs = [0x10u64, 0x20];
-        let idom = vec![2u32, 2, 2]; // vroot at idx 2
-        let mm = MatIdMap::build(2, &idom, |i| addrs[i]);
-        // dense-id 0 → mat-id 1
-        assert_eq!(mm.translate(0), 1);
-
+        // Thread obj_idx=0 → its *real* address 0x10, not the old 0x0 placeholder.
         let ts = make_thread_stack(
             1,
             0,
@@ -2517,10 +2510,11 @@ mod tests {
         let tmp = std::env::temp_dir().join("mat_threads_single");
         let _ = std::fs::remove_dir_all(&tmp);
         let e = MatEmitter::new(&tmp, "dump_", None).unwrap();
-        e.emit_threads(&[ts], &mm, &HashMap::new()).unwrap();
+        e.emit_threads(&[ts], &addr_map(&[(0, 0x10)]), &HashMap::new())
+            .unwrap();
         let content = std::fs::read_to_string(tmp.join("dump_.threads")).unwrap();
         let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines[0], "Thread 0x0"); // addr_at_mat always 0
+        assert_eq!(lines[0], "Thread 0x10");
         assert_eq!(lines[1], "  at com.example.Foo.bar(Foo.java:42)");
         assert_eq!(lines[2], "  at com.example.Main.main(Main.java:10)");
         // trailing blank line
@@ -2528,55 +2522,104 @@ mod tests {
     }
 
     #[test]
-    fn emit_threads_unreachable_thread_uses_addr_zero() {
-        // Thread obj_idx=99 (out of range / unreachable) → thread addr should be 0.
-        let idom = vec![0u32, 0]; // only 2 objects
-        let mm = MatIdMap::build(2, &idom, |i| (i as u64 + 1) * 0x100);
-        let ts = make_thread_stack(5, 99, &["java.lang.Thread.run(Thread.java:1)"]);
-        let tmp = std::env::temp_dir().join("mat_threads_unreachable");
+    fn emit_threads_skips_thread_with_unresolved_object() {
+        // A thread whose object never resolved (our `u32::MAX` sentinel — the
+        // analogue of MAT's `tid == null`) has no address to write, so the whole
+        // block is skipped. MAT's `dumpThreads` does the same `continue`, and a
+        // `0x0` placeholder would be unmappable for its reader anyway.
+        let ts = make_thread_stack(5, u32::MAX, &["java.lang.Thread.run(Thread.java:1)"]);
+        let tmp = std::env::temp_dir().join("mat_threads_unresolved");
         let _ = std::fs::remove_dir_all(&tmp);
         let e = MatEmitter::new(&tmp, "dump_", None).unwrap();
-        e.emit_threads(&[ts], &mm, &HashMap::new()).unwrap();
+        e.emit_threads(&[ts], &HashMap::new(), &HashMap::new())
+            .unwrap();
         let content = std::fs::read_to_string(tmp.join("dump_.threads")).unwrap();
         assert!(
-            content.starts_with("Thread 0x0\n"),
-            "unreachable thread obj → addr 0, got: {content:?}"
+            content.is_empty(),
+            "unresolved thread object → block skipped, got: {content:?}"
+        );
+    }
+
+    #[test]
+    fn emit_threads_writes_real_addresses_never_zero() {
+        // Regression for the `Thread 0x0` bug: `emit_threads` used to write a zero
+        // address for every thread *and* every local, because `MatIdMap` no longer
+        // stores addresses. MAT's `ThreadStackHelper` then failed
+        // `mapAddressToId(0x0)` on every line, leaving `threadId2stack` empty so
+        // `getThreadStack` returned null for every thread. This asserts the
+        // addresses are real and resolvable — not merely that the file exists.
+        let addrs = addr_map(&[
+            (0, 0x7e41c01c5608),
+            (1, 0x7e41c01c5700),
+            (2, 0x7e41c01c5800),
+        ]);
+        let stacks = vec![
+            make_thread_stack(1, 0, &["a.A.run(A.java:1)"]),
+            make_thread_stack(2, 1, &["b.B.run(B.java:2)"]),
+        ];
+        let mut locals: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
+        locals.insert(1, vec![(0u32, 2u32)]);
+        let tmp = std::env::temp_dir().join("mat_threads_real_addrs");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let e = MatEmitter::new(&tmp, "dump_", None).unwrap();
+        e.emit_threads(&stacks, &addrs, &locals).unwrap();
+        let content = std::fs::read_to_string(tmp.join("dump_.threads")).unwrap();
+
+        assert!(
+            !content.contains("Thread 0x0"),
+            "no thread may be written with a zero address:\n{content}"
+        );
+        // Every "Thread 0x<hex>" line must name an address present in the index.
+        let known: std::collections::HashSet<String> =
+            addrs.values().map(|a| format!("Thread 0x{a:x}")).collect();
+        let mut seen = 0usize;
+        for line in content.lines().filter(|l| l.starts_with("Thread ")) {
+            assert!(
+                known.contains(line),
+                "thread address {line:?} maps to no object in the index"
+            );
+            seen += 1;
+        }
+        assert_eq!(seen, 2, "expected both threads to be written:\n{content}");
+        // Same for the locals section.
+        assert!(
+            !content.contains("objectId=0x0,"),
+            "no local may be written with a zero address:\n{content}"
+        );
+        assert!(
+            content.contains("objectId=0x7e41c01c5800, line=0"),
+            "local should carry its real address and its frame index:\n{content}"
         );
     }
 
     #[test]
     fn emit_threads_with_locals() {
         // Thread with locals section: frame_num and local object addresses.
-        // addr_at_mat always returns 0 — objectId fields are always 0x0.
-        let addrs = [0x100u64, 0x200, 0x300];
-        let idom = vec![3u32, 3, 3, 3];
-        let mm = MatIdMap::build(3, &idom, |i| addrs[i]);
-        // old_id 0 → mat-id 1, old_id 2 → mat-id 3
+        let addrs = addr_map(&[(0, 0x100), (1, 0x200), (2, 0x300)]);
         let ts = make_thread_stack(1, 0, &["frame1(A.java:1)"]);
         let mut locals: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
-        // serial=1, frame_num=0 (→ line 1), local old_idx=2
+        // serial=1, frame_num=0 → line 0 (0-based frame index);
+        // frame_num=MAX (no frame) → line -1, as MAT writes it.
         locals.insert(1, vec![(0u32, 2u32), (u32::MAX, 1u32)]);
         let tmp = std::env::temp_dir().join("mat_threads_locals");
         let _ = std::fs::remove_dir_all(&tmp);
         let e = MatEmitter::new(&tmp, "dump_", None).unwrap();
-        e.emit_threads(&[ts], &mm, &locals).unwrap();
+        e.emit_threads(&[ts], &addrs, &locals).unwrap();
         let content = std::fs::read_to_string(tmp.join("dump_.threads")).unwrap();
         assert!(content.contains("locals:"), "should have locals section");
         assert!(
-            content.contains("objectId=0x0, line=1"),
-            "frame_num=0 → line 1, local at 0x0 (addr not stored)"
+            content.contains("objectId=0x300, line=0"),
+            "frame_num=0 → line 0 (frame index), real address:\n{content}"
         );
         assert!(
-            content.contains("objectId=0x0, line=0"),
-            "frame_num=MAX → line 0"
+            content.contains("objectId=0x200, line=-1"),
+            "frame_num=MAX (no frame) → line -1, real address:\n{content}"
         );
     }
 
     #[test]
     fn emit_threads_multiple_threads_separated_by_blank_lines() {
-        let addrs = [0x10u64, 0x20, 0x30];
-        let idom = vec![3u32, 3, 3, 3];
-        let mm = MatIdMap::build(3, &idom, |i| addrs[i]);
+        let addrs = addr_map(&[(0, 0x10), (1, 0x20), (2, 0x30)]);
         let stacks = vec![
             make_thread_stack(1, 0, &["a.A.run(A.java:1)"]),
             make_thread_stack(2, 1, &["b.B.run(B.java:2)"]),
@@ -2584,14 +2627,13 @@ mod tests {
         let tmp = std::env::temp_dir().join("mat_threads_multi");
         let _ = std::fs::remove_dir_all(&tmp);
         let e = MatEmitter::new(&tmp, "dump_", None).unwrap();
-        e.emit_threads(&stacks, &mm, &HashMap::new()).unwrap();
+        e.emit_threads(&stacks, &addrs, &HashMap::new()).unwrap();
         let content = std::fs::read_to_string(tmp.join("dump_.threads")).unwrap();
-        // addr_at_mat always returns 0; both threads show as Thread 0x0
-        let thread_count = content.lines().filter(|l| *l == "Thread 0x0").count();
-        assert_eq!(
-            thread_count, 2,
-            "expected 2 Thread 0x0 lines, got:\n{content}"
-        );
+        // Each thread gets its own real address, not the old shared 0x0.
+        assert!(content.contains("Thread 0x10\n"), "{content}");
+        assert!(content.contains("Thread 0x20\n"), "{content}");
+        let thread_count = content.lines().filter(|l| l.starts_with("Thread ")).count();
+        assert_eq!(thread_count, 2, "expected 2 threads, got:\n{content}");
         // Each thread block ends with a blank line → content has at least 2 blank lines
         let blank_lines = content.lines().filter(|l| l.is_empty()).count();
         assert!(

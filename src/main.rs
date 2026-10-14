@@ -5105,12 +5105,36 @@ fn run(
     // while the address table is live; consumed later, where `class_idx` is
     // live, to find every class-loader instance in the heap.
     let mut mat_row_is_loader: Vec<bool> = Vec::new();
+    // Dense-id -> address for the *few* objects the MAT `.threads` file names:
+    // the thread objects and their stack-frame locals. `MatIdMap` deliberately
+    // stores no addresses (a dense table costs ~4 GB on a large heap and is
+    // dropped as soon as `idx` is emitted), so they are captured below, in the
+    // one window where the dense address table is resident. Bounded by #threads
+    // (hundreds) + #threads × the thread-locals cap, i.e. a few hundred KB —
+    // this does NOT re-introduce the address table the optimization removed.
+    let mut mat_thread_addrs: std::collections::HashMap<u32, u64> =
+        std::collections::HashMap::new();
     let mat_map: Option<mat::MatIdMap> = if let Some(addrs_c) = mat_addrs_c {
         // Restore idom only for MatIdMap::build, then drop immediately after.
         if let Some(ref c) = mat_idom_c {
             g.idom = c.restore()?;
         }
         let addrs = addrs_c.restore()?;
+        // Capture the `.threads` addresses while `addrs` is resident — this is
+        // the last moment the thread objects' and their locals' addresses exist
+        // (the dense table is dropped at the end of this block). Small by
+        // construction: one entry per thread plus a bounded per-thread local
+        // sample, not one per object.
+        for ts in &g.thread_stacks {
+            if ts.thread_obj_idx != u32::MAX {
+                mat_thread_addrs.insert(ts.thread_obj_idx, addrs[ts.thread_obj_idx as usize]);
+            }
+        }
+        for locals in g.thread_local_frame_samples.values() {
+            for &(_, old_idx) in locals {
+                mat_thread_addrs.insert(old_idx, addrs[old_idx as usize]);
+            }
+        }
         let mm = mat::MatIdMap::build(g.n, &g.idom, |i| addrs[i]);
         // Drop idom immediately after build; mm.sorted holds old-ids in addr order.
         g.idom = Vec::new();
@@ -6645,8 +6669,14 @@ fn run(
         // column too large (and its rows mis-ordered). MAT recomputes the cache
         // itself when the file is absent, so leaving it out restores parity.
 
-        // .threads: thread stacks (addresses from mm).
-        m.emit_threads(&g.thread_stacks, mm, &g.thread_local_frame_samples)?;
+        // .threads: thread stacks. Addresses come from `mat_thread_addrs`, the
+        // small side table captured while the dense address table was live —
+        // `MatIdMap` no longer carries addresses.
+        m.emit_threads(
+            &g.thread_stacks,
+            &mat_thread_addrs,
+            &g.thread_local_frame_samples,
+        )?;
 
         // .index: master Java serialization stream.
         if let Some(ref meta) = mat_class_meta {
