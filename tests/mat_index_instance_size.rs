@@ -21,6 +21,12 @@
 //! shallow size, so they are checkable without MAT installed.
 //!
 //! The expected values are frozen with the fixture dump and never drift.
+//!
+//! A second test in this file (`index_folds_alias_rows_into_one_class_impl`)
+//! uses the same decoder to check `ClassImpl.instanceCount`: histogram rows
+//! that resolve to the same class object (a canonical row plus per-loader
+//! "alias" rows) must fold into ONE `ClassImpl` with their counts summed,
+//! otherwise MAT's histogram loses a whole class's worth of instances.
 
 use std::path::Path;
 use std::process::Command;
@@ -62,24 +68,9 @@ fn index_instance_size_uses_the_detected_reference_width() {
     }
 
     let out = std::env::temp_dir().join("hprof_mat_index_instsize");
-    let _ = std::fs::remove_dir_all(&out);
-    std::fs::create_dir_all(&out).expect("create out dir");
-
-    let bin = env!("CARGO_BIN_EXE_hprof-analyzer");
-    let status = Command::new(bin)
-        // Relative path from the crate root keeps `SnapshotInfo.path` stable.
-        .arg(FIXTURE)
-        .arg(out.join("report.md"))
-        .arg("--mat")
-        .arg(&out)
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .status()
-        .expect("spawn hprof-analyzer");
-    assert!(status.success(), "hprof-analyzer exited with {status:?}");
-
-    let idx = out.join(format!("{PREFIX}.index"));
-    let bytes =
-        std::fs::read(&idx).unwrap_or_else(|e| panic!("read emitted {}: {e}", idx.display()));
+    let Some(bytes) = emit_index(&out) else {
+        return;
+    };
     let mut r = Reader::new(&bytes);
     r.run();
     assert_eq!(
@@ -103,6 +94,102 @@ fn index_instance_size_uses_the_detected_reference_width() {
         "ClassImpl.instanceSize disagrees with MAT's heapSizePerInstance — \
          `meta.ref_size` must be set to `g.ref_size` BEFORE compute_instance_sizes:\n  {}",
         failures.join("\n  ")
+    );
+}
+
+/// Run the real pipeline over the fixture with `--mat` and return the emitted
+/// `PREFIX.index` bytes, or `None` when the fixture is absent (unhydrated LFS
+/// pointer on a bare checkout).
+fn emit_index(out: &Path) -> Option<Vec<u8>> {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE);
+    match std::fs::metadata(&fixture) {
+        Ok(m) if m.len() >= 1024 => {}
+        _ => {
+            eprintln!(
+                "skip: fixture absent or an LFS pointer at {}",
+                fixture.display()
+            );
+            return None;
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(out);
+    std::fs::create_dir_all(out).expect("create out dir");
+
+    let bin = env!("CARGO_BIN_EXE_hprof-analyzer");
+    let status = Command::new(bin)
+        // Relative path from the crate root keeps `SnapshotInfo.path` stable.
+        .arg(FIXTURE)
+        .arg(out.join("report.md"))
+        .arg("--mat")
+        .arg(out)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .expect("spawn hprof-analyzer");
+    assert!(status.success(), "hprof-analyzer exited with {status:?}");
+
+    let idx = out.join(format!("{PREFIX}.index"));
+    Some(std::fs::read(&idx).unwrap_or_else(|e| panic!("read emitted {}: {e}", idx.display())))
+}
+
+/// `java.lang.Class`'s `ClassImpl` must count BOTH the class objects (the
+/// canonical `JLC_KEY` histogram row) and the heap's real `java.lang.Class`
+/// instances (the per-address alias row). Both rows resolve to the same class
+/// object, so `emit_dot_index` has to fold them into ONE `ClassImpl` with the
+/// counts summed; emitting one entry per row put two values under one mat-id
+/// and let the later row overwrite the earlier one, so MAT's histogram
+/// reported only the real instances (9 on this fixture) and summed exactly
+/// `numberOfClasses` short.
+///
+/// The dump-independent invariant behind it: every object in the index is
+/// counted under exactly one class, so the `instanceCount` of every emitted
+/// `ClassImpl` must sum to `SnapshotInfo.numberOfObjects`.
+#[test]
+fn index_folds_alias_rows_into_one_class_impl() {
+    let out = std::env::temp_dir().join("hprof_mat_index_alias_fold");
+    let Some(bytes) = emit_index(&out) else {
+        return;
+    };
+    let mut r = Reader::new(&bytes);
+    r.run();
+
+    let jlc: Vec<i32> = r
+        .class_counts
+        .iter()
+        .filter(|(n, _)| n == "java.lang.Class")
+        .map(|(_, c)| *c)
+        .collect();
+    assert_eq!(
+        jlc.len(),
+        1,
+        "the class cache must hold exactly one ClassImpl per class object, \
+         but {} ClassImpls are named java.lang.Class",
+        jlc.len()
+    );
+
+    let (n_objects, n_classes) = r
+        .snapshot_info
+        .expect("SnapshotInfo missing from the emitted .index");
+    assert_eq!(
+        r.class_counts.len() as i32,
+        n_classes,
+        "the class cache must hold one ClassImpl per distinct class object"
+    );
+    assert!(
+        jlc[0] >= n_classes,
+        "java.lang.Class counts {} instances, but the dump has {n_classes} class \
+         objects — the canonical JLC_KEY row was overwritten by its alias row",
+        jlc[0]
+    );
+    let sum: i64 = r.class_counts.iter().map(|(_, c)| *c as i64).sum();
+    assert_eq!(
+        sum,
+        n_objects as i64,
+        "the ClassImpl instance counts must sum to numberOfObjects — {} objects, \
+         {} counted: {} lost to an alias-row collision",
+        n_objects,
+        sum,
+        n_objects as i64 - sum
     );
 }
 
@@ -158,6 +245,10 @@ struct Reader<'a> {
     descs: Vec<Desc>,
     /// `(class name, instanceSize)` for every ClassImpl in the stream.
     class_impls: Vec<(String, i32)>,
+    /// `(class name, instanceCount)` for every ClassImpl in the stream.
+    class_counts: Vec<(String, i32)>,
+    /// `SnapshotInfo.numberOfObjects` / `numberOfClasses`, when seen.
+    snapshot_info: Option<(i32, i32)>,
 }
 
 impl<'a> Reader<'a> {
@@ -168,6 +259,8 @@ impl<'a> Reader<'a> {
             handles: Vec::new(),
             descs: Vec::new(),
             class_impls: Vec::new(),
+            class_counts: Vec::new(),
+            snapshot_info: None,
         }
     }
 
@@ -323,18 +416,36 @@ impl<'a> Reader<'a> {
                 self.p += 1;
             }
         }
-        if self.descs[d].name.ends_with("ClassImpl") {
-            let mut name = None;
-            let mut size = None;
-            for (fname, v) in vals {
-                match (fname.as_str(), v) {
-                    ("name", Val::Str(s)) => name = Some(s),
-                    ("instanceSize", Val::Int(i)) => size = Some(i),
-                    _ => {}
-                }
+        // `vals` holds (field name, value) pairs for this object's whole class
+        // chain; pick out whatever this test cares about.
+        let is_class_impl = self.descs[d].name.ends_with("ClassImpl");
+        let is_snapshot_info = self.descs[d].name.ends_with("SnapshotInfo");
+        let mut name: Option<String> = None;
+        let mut size: Option<i32> = None;
+        let mut count: Option<i32> = None;
+        let mut objects: Option<i32> = None;
+        let mut classes: Option<i32> = None;
+        for (fname, v) in &vals {
+            match (fname.as_str(), v) {
+                ("name", Val::Str(s)) => name = Some(s.clone()),
+                ("instanceSize", Val::Int(i)) => size = Some(*i),
+                ("instanceCount", Val::Int(i)) => count = Some(*i),
+                ("numberOfObjects", Val::Int(i)) => objects = Some(*i),
+                ("numberOfClasses", Val::Int(i)) => classes = Some(*i),
+                _ => {}
             }
-            if let (Some(n), Some(s)) = (name, size) {
+        }
+        if is_class_impl {
+            if let (Some(n), Some(s)) = (name.clone(), size) {
                 self.class_impls.push((n, s));
+            }
+            if let (Some(n), Some(c)) = (name, count) {
+                self.class_counts.push((n, c));
+            }
+        }
+        if is_snapshot_info {
+            if let (Some(o), Some(c)) = (objects, classes) {
+                self.snapshot_info = Some((o, c));
             }
         }
     }

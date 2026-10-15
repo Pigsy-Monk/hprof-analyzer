@@ -1346,9 +1346,6 @@ impl MatEmitter {
 
         // --- 2. classcache: HashMapIntObject<ClassImpl> ---
         // Key = class mat-id (int), value = ClassImpl object.
-        // Build the MatIntMap with initial capacity = num_rows (MAT uses HMIO(classMap.size())).
-        let num_classes = num_rows;
-        let mut hm = MatIntMap::new(num_classes as i32);
         // Build ordered list of (mat_id, row) pairs for insertion.
         // MAT inserts classes in pass1 order (class address → class-serial → insertion order).
         // We use mat-id ascending order as a deterministic approximation.
@@ -1366,6 +1363,26 @@ impl MatEmitter {
             })
             .collect();
         class_entries.sort_by_key(|&(mid, _)| mid);
+        // Several histogram rows can resolve to the SAME class object: a canonical
+        // row (JLC_KEY for every class object, PRIM_KEY for primitive-array
+        // classes, the class's own address otherwise) plus per-name "alias" rows
+        // that main.rs's `Patch alias rows` step pointed at the canonical row's
+        // class object. MAT's class cache is keyed by class object, so those rows
+        // must fold into ONE ClassImpl with their counts SUMMED.
+        //
+        // This is not cosmetic. `java.lang.Class`'s canonical JLC_KEY row carries
+        // every class object (37,429 on the jnbs7 dump) while its alias row
+        // carries the heap's real `java.lang.Class` instances (9). Emitting both
+        // put two entries under one mat-id, and `hm.put` below let the later row
+        // overwrite the earlier one — so MAT's histogram reported
+        // `java.lang.Class` = 9 and summed exactly the class count short
+        // (37,429 + 9 = 37,438 is MAT's own number).
+        class_entries = merge_class_entries(&class_entries, &mut instance_count, &mut used_heap);
+        // MAT builds the class cache as `new HashMapIntObject<>(classesByAddress.size())`
+        // (`HprofParserHandlerImpl.beforePass2`) — one slot per *distinct class
+        // object*, which is the merged entry count (not the histogram row count).
+        let num_classes = class_entries.len() as i32;
+        let mut hm = MatIntMap::new(num_classes);
         // The ClassImpl of java.lang.Class: every class's `classInstance`.
         let jlc_key: Option<String> = meta
             .class_name_by_addr
@@ -2078,6 +2095,43 @@ pub fn build_row_to_classobj_id(
     inv
 }
 
+/// Fold histogram rows that resolve to the same class object into one entry.
+///
+/// `entries` must be sorted by mat-id. The caller sorts with
+/// `sort_by_key`, which is *stable*, so rows sharing a mat-id stay in
+/// ascending histogram-row order and the canonical row (the one whose
+/// class object the name is registered under) comes first.
+///
+/// Each entry after the first of a run is merged into that first entry: its
+/// `instance_count` and `used_heap` are **added** to the survivor's, and the
+/// entry itself is dropped from the returned list.
+///
+/// MAT's class cache is keyed by class object — `HprofParserHandlerImpl`
+/// builds it as `new HashMapIntObject<>(classesByAddress.size())` — so a
+/// second row for the same class object must not become a second entry:
+/// the map would hold two values under one key, and whichever the reader
+/// inserted last would win, silently dropping the other row's instances from
+/// every histogram. See `class_rows_that_share_a_class_object_are_summed`.
+pub fn merge_class_entries(
+    entries: &[(i32, usize)],
+    instance_count: &mut [i32],
+    used_heap: &mut [i64],
+) -> Vec<(i32, usize)> {
+    let mut merged: Vec<(i32, usize)> = Vec::with_capacity(entries.len());
+    for &(mat_id, row) in entries {
+        if let Some(&mut (last_mid, last_row)) = merged.last_mut() {
+            if last_mid == mat_id {
+                instance_count[last_row] =
+                    instance_count[last_row].saturating_add(instance_count[row]);
+                used_heap[last_row] = used_heap[last_row].saturating_add(used_heap[row]);
+                continue;
+            }
+        }
+        merged.push((mat_id, row));
+    }
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2125,6 +2179,52 @@ mod tests {
             inv[3], 51,
             "should prefer reachable id 51 over unreachable id 50"
         );
+    }
+
+    /// Two histogram rows can resolve to the SAME class object: the canonical
+    /// row (where the class object is registered — `JLC_KEY` for every class
+    /// object, `PRIM_KEY` for primitive-array classes, the class's own address
+    /// otherwise) and a per-name "alias" row that `main.rs` patched onto the
+    /// canonical row's class object (`Patch alias rows`). MAT's class cache is
+    /// keyed by class object, so those rows must fold into ONE `ClassImpl`.
+    ///
+    /// The real-world case is `java.lang.Class`: the canonical `JLC_KEY` row
+    /// holds every class object (37,429 on the jnbs7 dump) while the alias row
+    /// holds the heap's real `java.lang.Class` instances (9). Letting the later
+    /// row overwrite the map entry dropped the 37,429, so MAT's histogram
+    /// reported `java.lang.Class` = 9 and summed 37,429 short — exactly the
+    /// number of classes.
+    #[test]
+    fn class_rows_that_share_a_class_object_are_summed() {
+        // (mat_id, histogram row): rows 3 and 9 both resolve to class object 7;
+        // row 4 resolves to class object 8. `emit_dot_index` sorts by mat-id, so
+        // the colliding rows arrive adjacent with the canonical row first.
+        let entries = vec![(7i32, 3usize), (7, 9), (8, 4)];
+        let mut instance_count = vec![0i32; 12];
+        let mut used_heap = vec![0i64; 12];
+        instance_count[3] = 37429;
+        used_heap[3] = 37429 * 40;
+        instance_count[9] = 9;
+        used_heap[9] = 9 * 40;
+        instance_count[4] = 5;
+        used_heap[4] = 5 * 16;
+
+        let merged = merge_class_entries(&entries, &mut instance_count, &mut used_heap);
+
+        assert_eq!(merged.len(), 2, "one ClassImpl per class object");
+        assert_eq!(merged[0], (7, 3), "the canonical (first) row survives");
+        assert_eq!(merged[1], (8, 4));
+        assert_eq!(
+            instance_count[3], 37438,
+            "the alias row's 9 instances must be ADDED to the canonical 37,429, \
+             not replace them"
+        );
+        assert_eq!(used_heap[3], (37429 + 9) * 40);
+        // A folded row keeps its own value; it is simply no longer emitted.
+        assert_eq!(instance_count[9], 9);
+        // A row with no twin is untouched.
+        assert_eq!(instance_count[4], 5);
+        assert_eq!(used_heap[4], 5 * 16);
     }
 
     /// `emit_o2c` composes an identity `inv` (row == value) so we can drive it
