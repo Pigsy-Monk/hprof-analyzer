@@ -418,6 +418,7 @@ fn analyze_to_report_inner(
             g.class_names.len(),
             &g.class_obj_class_idx,
             &g.class_names,
+            opts.force_unreachable_dominator,
         )?;
     }
     t_pipe!("unreachable_retained done");
@@ -869,6 +870,7 @@ fn analyze_to_report_inner_with_cache(
             g.class_names.len(),
             &g.class_obj_class_idx,
             &g.class_names,
+            opts.force_unreachable_dominator,
         )?;
     }
 

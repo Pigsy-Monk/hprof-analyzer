@@ -435,19 +435,34 @@ enum Cmd {
         #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
         dump: Option<String>,
     },
-    /// Redact a heap dump: zero primitive array elements while preserving the
-    /// object graph (IDs, class names, reference fields, instance scalar fields).
+    /// Redact a heap dump: zero data values while preserving the object graph
+    /// (IDs, class names, field names, reference fields).
     ///
-    /// Default (lean) mode is a single-pass stream: only PRIM_ARRAY_DUMP element
-    /// bytes are zeroed — this covers byte[], char[], short[], int[], long[],
-    /// float[], double[], and boolean[] arrays. Instance scalar fields (int, long,
-    /// etc. on objects) are left untouched. Add --complete for a two-pass run that
-    /// also zeros those.
+    /// TWO MODES:
+    ///
+    /// Lean (default, single-pass): zeros all primitive array element bytes
+    /// (byte[], char[], int[], long[], float[], double[], short[], boolean[]).
+    /// This covers String values — their char[]/byte[] backing arrays are zeroed.
+    /// Scalar instance fields (int/long/etc. directly on objects) are left in place.
+    /// The JVM symbol table (STRING_IN_UTF8 records) is also left in place, so
+    /// annotation literal strings like @Value("${spring.datasource.url}") and
+    /// @RequestMapping("/api/v1/users") survive in the file verbatim.
+    ///
+    /// Complete (--complete, two-pass): everything lean does, PLUS:
+    ///   - scalar instance fields and CLASS_DUMP static primitive values
+    ///   - non-structural JVM symbol table entries: annotation values (@Value,
+    ///     @RequestMapping, etc.), Spring EL expressions, config key patterns
+    ///
+    ///   Structural names (class names, field names, method names, source file
+    ///   names) are preserved so the dump remains browsable in MAT/jhat.
+    ///
+    /// Use lean for quick sharing where field-level integers can be tolerated.
+    /// Use --complete when annotation-literal strings or scalar field values
+    /// (counters, hashes, enum ordinals) must not leak.
     ///
     /// The output is a valid HPROF file that MAT, jhat, and hprof-analyzer can
     /// open. A custom marker record (tag 0xDE) is prepended so hprof-analyzer
-    /// displays a "Redacted dump" banner and skips analyses that would be
-    /// meaningless on zeroed data.
+    /// displays a "Redacted dump" banner and skips meaningless analyses.
     ///
     /// Output format is inferred from the extension:
     ///   .hprof         raw binary
@@ -460,11 +475,25 @@ enum Cmd {
         /// Output path (.hprof, .hprof.gz, or .hprof.zip).
         #[arg(value_hint = ValueHint::FilePath)]
         output: String,
-        /// Complete (two-pass) mode: also zeros primitive scalar fields on instances
-        /// and static fields on classes. Slower but leaves no primitive values anywhere.
+        /// Complete (two-pass) mode: also zeros scalar instance fields, CLASS_DUMP
+        /// static values, and non-structural JVM symbol table strings (annotation
+        /// literals, Spring EL expressions, URL path constants, etc.).
+        /// Class names, field names, and method names are preserved for browsability.
         /// Default is lean mode (single-pass, zeros only primitive array elements).
         #[arg(long)]
         complete: bool,
+    },
+    /// Check whether a heap dump has already been redacted.
+    ///
+    /// Exits 0 and prints "redacted" if the redaction marker (tag 0xDE) is
+    /// present anywhere in the file. Exits 1 and prints "not redacted" if it
+    /// is absent. Exits 2 on I/O error.
+    ///
+    /// Accepts .hprof, .hprof.gz, .hprof.zip, .tar.gz, .tgz.
+    CheckRedacted {
+        /// Path to the heap dump (.hprof, .hprof.gz, .hprof.zip, .tar.gz, .tgz).
+        #[arg(value_hint = ValueHint::FilePath)]
+        input: String,
     },
     /// Scan a heap dump for secrets: API keys, tokens, passwords, and other
     /// credentials left in JVM memory. Patterns sourced from betterleaks
@@ -895,6 +924,25 @@ fn run_redact(input: &str, output: &str, complete: bool) -> io::Result<()> {
     }
 }
 
+fn run_check_redacted(input: &str) {
+    let source = source::HprofSource::from(input);
+    match pass1::Pass1::run(&source, false) {
+        Ok(p1) => {
+            if p1.redacted {
+                println!("redacted");
+                std::process::exit(0);
+            } else {
+                println!("not redacted");
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
 fn run_detect_secrets(input: &str, progress: ProgressWhen, verbatim: bool, format: SecretsFormat) {
     use hprof_analyzer::query::run::ReplCache;
     use hprof_analyzer::secrets::SecretPatterns;
@@ -937,7 +985,11 @@ fn run_detect_secrets(input: &str, progress: ProgressWhen, verbatim: bool, forma
         eprint!("\r\x1b[K");
     }
 
-    let findings = SecretPatterns::new().scan(&string_values, &attribution);
+    let findings = SecretPatterns::new().scan_with_symbol_table(
+        &string_values,
+        &attribution,
+        &cache.p1.strings,
+    );
 
     if findings.is_empty() {
         eprintln!("No secrets found.");
@@ -1388,6 +1440,9 @@ fn main() {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
+        }
+        Some(Cmd::CheckRedacted { input }) => {
+            run_check_redacted(&input);
         }
         Some(Cmd::DetectSecrets {
             input,
@@ -1964,6 +2019,7 @@ fn run_default(cli: Cli) {
             ref_paths: cli.ref_paths,
             field_stats: cli.field_stats,
             obj_graph: cli.obj_graph.is_some() || cli.full_analysis,
+            force_unreachable_dominator: cli.full_analysis,
             dev_report: cli.dev || cli.bundle_path.is_some(),
             bundle_path: cli.bundle_path.clone(),
             ..opts
@@ -2222,6 +2278,7 @@ fn analyze_to_report_inner(
             g.class_names.len(),
             &g.class_obj_class_idx,
             &g.class_names,
+            opts.force_unreachable_dominator,
         )?;
     }
     t_pipe!("unreachable_retained done");
@@ -4590,6 +4647,7 @@ fn run(
             g.class_names.len(),
             &g.class_obj_class_idx,
             &g.class_names,
+            opts.force_unreachable_dominator,
         )?;
         crate::trace::probe("main: after unreachable_retained (fwd CSR + dfn still alive)");
         log(verbose, "unreachable-retained", t.elapsed().as_secs_f64());

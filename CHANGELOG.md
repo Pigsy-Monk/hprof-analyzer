@@ -249,6 +249,61 @@ All notable changes to hprof-analyzer are documented here.
   on an out-of-bounds decode), and it was producing a plausible, wrong tree
   with exit 0 and no warning. Now checked in the production path (one
   O(count) integer scan, no allocation) and reported as an error.
+## [0.3.2] — 2026-10-15
+
+### Added
+
+- **`hprof-analyzer check-redacted <INPUT>`** — new subcommand that exits 0
+  and prints `redacted` if the dump contains the redaction marker (tag `0xDE`),
+  or exits 1 and prints `not redacted` otherwise. Exits 2 on I/O error.
+  Accepts `.hprof`, `.hprof.gz`, `.hprof.zip`, `.tar.gz`, `.tgz`.
+
+- **`hprof-redact --check <INPUT>`** — same check available in the standalone
+  binary without requiring the full `hprof-analyzer` install.
+
+- **`detect-secrets` now scans JVM symbol table strings.** The JVM symbol
+  table (`STRING_IN_UTF8` records) contains class-file constant pool literals
+  that are separate from heap `java.lang.String` instances: annotation values
+  (`@Value("${spring.datasource.url}")`), `@RequestMapping` URL paths,
+  Spring EL expressions, JDBC URLs embedded in class constants, etc.
+  Previously these were invisible to `detect-secrets`; they are now scanned
+  with the same pattern set. Symbol table findings are attributed as
+  `JVM symbol table / STRING_IN_UTF8` in the output.
+
+### Fixed
+
+- **`redact --complete`: annotation literals and Spring EL expressions now
+  zeroed.** The JVM symbol table (`STRING_IN_UTF8` records) holds string
+  constants from class-file constant pools, including annotation attribute
+  values (`@Value("${spring.datasource.url}")`, `@RequestMapping("/owners")`),
+  Spring EL expressions, and other non-structural literals. These were
+  preserved verbatim by complete mode; they are now zeroed for any ID that is
+  not referenced as a structural name (class name via `LOAD_CLASS`, method/
+  source-file name via `STACK_FRAME`, or field name via `CLASS_DUMP`). Class
+  names, field names, method names, and source file names are kept readable
+  so the dump remains fully browsable in MAT and jhat. Lean mode is unchanged
+  — adding symbol-table selective zeroing to lean mode would require a second
+  pass, contradicting its single-pass design. Use `--complete` when annotation
+  strings must not appear in the shared file. (Fixes #3.)
+
+- **`pass2::fill_heap` pegging one core on clustered heap addresses.** The
+  interpolation search in `IdMap::search_offsets` stalled on non-uniform
+  address distributions (post-GC clusters, ART/J9 allocators) where each
+  probe barely narrowed the range. Added a stagnation guard: if a probe
+  fails to halve the range, fall through to binary search immediately. Zero
+  cost on uniform distributions; eliminates the CPU spike on pathological
+  dumps.
+
+- **Unreachable-forest dominator pass auto-skipped on large unreachable sets.**
+  The iterative CHK dominator over the unreachable subgraph is O(u²) in the
+  worst case. On post-GC dumps where most objects are already unreachable
+  (e.g. 90%+ of a Tomcat dump taken mid-collection) this pass dominated total
+  analysis time. When the unreachable object count exceeds 500 000 the pass is
+  now skipped automatically; the Unreachable Objects section shows
+  shallow-by-class instead of retained-by-class, and a note in the report
+  (Markdown and HTML) explains the skip with a hint to use `--full-analysis`
+  to force the full dominator pass. Zero impact on normal dumps with small
+  garbage fractions.
 
 ## [0.3.1] — 2026-10-02
 
