@@ -1,0 +1,35 @@
+src/mat/mod.rs
+  s_64c5bece8c11a5::t_92872d655535a3 1180-1185
+  s_64c5bece8c11a5::t_00b41933549f99 137-139,141-145,151,153-156
+src/main.rs
+  s_64c5bece8c11a5::t_0837f7974874f1 6537
+  s_64c5bece8c11a5::t_377a37a0a0eaf8 6506-6513,6523,6534-6536,6538-6539
+tests/mat_index_instance_size.rs
+  s_64c5bece8c11a5::t_f556da0d33806c 25-34
+  s_64c5bece8c11a5::t_9bb4a68cfd6a56 525-526,532-535,543-546,558-562
+  s_64c5bece8c11a5::t_7e562ca0ff3f79 292-293
+  s_64c5bece8c11a5::t_88830dc6763925 524
+  s_64c5bece8c11a5::t_4ffcb9493e9809 207-251,264-265,268-288
+  s_64c5bece8c11a5::t_1ee3cd74d342fd 109-115,133,142
+  s_64c5bece8c11a5::t_8360b6e359b8a5 252-263,266-267
+  s_64c5bece8c11a5::t_77a075449d8d04 344-346
+  s_64c5bece8c11a5::t_c5f6fa0cb2d152 360
+  s_64c5bece8c11a5::t_18c3d011871b33 489-491
+  s_64c5bece8c11a5::t_3b100426b56dcc 330
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.50-trip",
+  "base_commit_sha": "a01c853dc30898f2c551569407e4b655e8a48d39",
+  "prompts": {},
+  "sessions": {
+    "s_64c5bece8c11a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "95e7f153-b111-4980-ab92-edbef0e10eca",
+        "model": "deepseek-v4-1-flash-260910"
+      },
+      "human_author": "zwsong <zwsong@trip.com>"
+    }
+  }
+}
