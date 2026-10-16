@@ -1,0 +1,19 @@
+src/unreachable_retained.rs
+  s_64c5bece8c11a5::t_e539dfdfcd2d67 842
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.50-trip",
+  "base_commit_sha": "69fc7d9a2fd8e312fc37d204ed77d1b21c22e88f",
+  "prompts": {},
+  "sessions": {
+    "s_64c5bece8c11a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "95e7f153-b111-4980-ab92-edbef0e10eca",
+        "model": "deepseek-v4-1-flash-260910"
+      },
+      "human_author": "zwsong <zwsong@trip.com>"
+    }
+  }
+}
