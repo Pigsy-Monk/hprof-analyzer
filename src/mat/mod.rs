@@ -134,23 +134,26 @@ pub struct RootRecord {
 
 /// Per-class aggregates for MAT's `UnreachableObjectsHistogram` property.
 ///
-/// MAT builds it in `GarbageCleaner.createHistogramOfUnreachableObjects`: one
-/// record per class that has unreachable objects, carrying the class name, the
-/// class object's address, the unreachable instance count and their summed
+/// MAT builds it in `GarbageCleaner$CreateHistogramOfUnreachableObjectsChunk`:
+/// one record per class that has unreachable objects, carrying the class name,
+/// the class object's address, the unreachable instance count and their summed
 /// size. The per-object size is the array size when non-zero (`a2size`), else —
-/// for a *class object* — the used heap size of the class it represents, else
-/// the class's `heapSizePerInstance` (our `shallow`). Only the class-object case
-/// needs data the caller does not have, so those are passed as the row of the
-/// class each one represents.
+/// for a *class object* — the shallow size of the class object ITSELF (MAT's
+/// `ClassImpl.getUsedHeapSize`, i.e. its static-field bytes), else the class's
+/// `heapSizePerInstance` (our `shallow`). MAT keys a class object's record by
+/// the class object's own class (`r.clazz`), i.e. `java.lang.Class`, so those
+/// sizes are summed into one dedicated field rather than a histogram row.
 #[derive(Default)]
 pub struct MatUnreachableHist {
     /// row -> number of unreachable objects of that class.
     pub count: Vec<i32>,
     /// row -> summed size of that class's unreachable objects, excluding class
-    /// objects (whose size is the represented class's used heap size instead).
+    /// objects (whose size is the class object's own shallow instead).
     pub shallow: Vec<i64>,
-    /// For every unreachable *class object*: the row of the class it represents.
-    pub classobj_rows: Vec<i32>,
+    /// Summed shallow size of every unreachable *class object* — the class
+    /// object's own shallow, not that of the class it represents. Added to the
+    /// `java.lang.Class` record.
+    pub classobj_shallow: i64,
 }
 
 /// Everything the master `.index` needs for its roots / rootsPerThread /
@@ -1174,15 +1177,12 @@ impl MatEmitter {
             let jlc_row = class_names
                 .iter()
                 .position(|n| mat_class_name(n) == "java.lang.Class");
-            // A class object contributes the *used heap size of the class it
-            // represents* (MAT's `ClassImpl.getUsedHeapSize`), not its own
-            // shallow size — which is why golden's `java.lang.Class` record
-            // shows a size of 0 for classes with no instances.
-            let classobj_shallow: i64 = unreach
-                .classobj_rows
-                .iter()
-                .map(|&r| used_heap.get(r as usize).copied().unwrap_or(0))
-                .sum();
+            // A class object contributes the shallow size of the CLASS OBJECT
+            // ITSELF (MAT's `ClassImpl.getUsedHeapSize` = its static-field
+            // bytes), not that of the class it represents — a dropped class has
+            // no retained instances, so the represented class's size would be
+            // 0. `MatUnreachableHist::classobj_shallow` already summed it.
+            let classobj_shallow: i64 = unreach.classobj_shallow;
             let mut by_addr: HashMap<u64, (String, i32, i64)> = HashMap::new();
             for row in 0..num_rows {
                 let count = unreach.count.get(row).copied().unwrap_or(0);

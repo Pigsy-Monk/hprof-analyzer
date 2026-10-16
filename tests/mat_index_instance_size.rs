@@ -22,11 +22,16 @@
 //!
 //! The expected values are frozen with the fixture dump and never drift.
 //!
-//! A second test in this file (`index_folds_alias_rows_into_one_class_impl`)
-//! uses the same decoder to check `ClassImpl.instanceCount`: histogram rows
-//! that resolve to the same class object (a canonical row plus per-loader
-//! "alias" rows) must fold into ONE `ClassImpl` with their counts summed,
-//! otherwise MAT's histogram loses a whole class's worth of instances.
+//! Two further tests in this file use the same decoder:
+//!
+//! * `index_folds_alias_rows_into_one_class_impl` checks
+//!   `ClassImpl.instanceCount`: histogram rows that resolve to the same class
+//!   object (a canonical row plus per-loader "alias" rows) must fold into ONE
+//!   `ClassImpl` with their counts summed, otherwise MAT's histogram loses a
+//!   whole class's worth of instances.
+//! * `unreachable_class_objects_use_the_class_objects_own_shallow` checks the
+//!   `UnreachableObjectsHistogram` `SnapshotInfo` property record by record
+//!   against MAT's own master `.index` for the `dump_7_gauss-mix` fixture.
 
 use std::path::Path;
 use std::process::Command;
@@ -101,7 +106,13 @@ fn index_instance_size_uses_the_detected_reference_width() {
 /// `PREFIX.index` bytes, or `None` when the fixture is absent (unhydrated LFS
 /// pointer on a bare checkout).
 fn emit_index(out: &Path) -> Option<Vec<u8>> {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE);
+    emit_index_for(FIXTURE, PREFIX, out)
+}
+
+/// As `emit_index`, for an arbitrary fixture (relative to the crate root) whose
+/// emitted master index is named `<prefix>.index`.
+fn emit_index_for(fixture_rel: &str, prefix: &str, out: &Path) -> Option<Vec<u8>> {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join(fixture_rel);
     match std::fs::metadata(&fixture) {
         Ok(m) if m.len() >= 1024 => {}
         _ => {
@@ -119,7 +130,7 @@ fn emit_index(out: &Path) -> Option<Vec<u8>> {
     let bin = env!("CARGO_BIN_EXE_hprof-analyzer");
     let status = Command::new(bin)
         // Relative path from the crate root keeps `SnapshotInfo.path` stable.
-        .arg(FIXTURE)
+        .arg(fixture_rel)
         .arg(out.join("report.md"))
         .arg("--mat")
         .arg(out)
@@ -128,7 +139,7 @@ fn emit_index(out: &Path) -> Option<Vec<u8>> {
         .expect("spawn hprof-analyzer");
     assert!(status.success(), "hprof-analyzer exited with {status:?}");
 
-    let idx = out.join(format!("{PREFIX}.index"));
+    let idx = out.join(format!("{prefix}.index"));
     Some(std::fs::read(&idx).unwrap_or_else(|e| panic!("read emitted {}: {e}", idx.display())))
 }
 
@@ -193,11 +204,93 @@ fn index_folds_alias_rows_into_one_class_impl() {
     );
 }
 
+/// `UnreachableObjectsHistogram`: an unreachable *class object* contributes the
+/// shallow size of the class object ITSELF — MAT's `ClassImpl.getUsedHeapSize`,
+/// i.e. its static-field bytes — and MAT records it under the class object's own
+/// class, `java.lang.Class`.
+///
+/// This used to accumulate the used heap size of the class each class object
+/// *represents* (its retained instances' shallow sum), which is 0 for a class
+/// with no retained instances — so every unreachable class object contributed
+/// nothing and our `java.lang.Class` record read `452 / 0` where MAT has
+/// `452 / 552`.
+///
+/// Oracle: MAT's own master `.index` for this fixture, committed alongside the
+/// dump as `tests/fixtures/dump_7_gauss-mix.index`. Every histogram record —
+/// class name, class-object address, unreachable count, summed shallow size —
+/// must match MAT's, so the check is not limited to the one record the bug hit.
+#[test]
+fn unreachable_class_objects_use_the_class_objects_own_shallow() {
+    const F: &str = "tests/fixtures/dump_7_gauss-mix.hprof";
+    const P: &str = "dump_7_gauss-mix";
+    const ORACLE: &str = "tests/fixtures/dump_7_gauss-mix.index";
+
+    let out = std::env::temp_dir().join("hprof_mat_index_unreach_hist");
+    let Some(bytes) = emit_index_for(F, P, &out) else {
+        return;
+    };
+    let mut ours = Reader::new(&bytes);
+    ours.run();
+
+    // MAT's own master index for the same dump — the ground truth.
+    let oracle_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(ORACLE);
+    let oracle_bytes = std::fs::read(&oracle_path)
+        .unwrap_or_else(|e| panic!("read oracle {}: {e}", oracle_path.display()));
+    let mut mat = Reader::new(&oracle_bytes);
+    mat.run();
+
+    assert!(
+        !mat.uoh_records.is_empty(),
+        "the oracle {} carries no UnreachableObjectsHistogram records",
+        oracle_path.display()
+    );
+
+    let mut ours_sorted = ours.uoh_records.clone();
+    let mut mat_sorted = mat.uoh_records.clone();
+    ours_sorted.sort();
+    mat_sorted.sort();
+    // Report only the differing records: a whole-list dump buries the one entry
+    // a regression touched.
+    let missing: Vec<_> = mat_sorted
+        .iter()
+        .filter(|r| !ours_sorted.contains(r))
+        .collect();
+    let extra: Vec<_> = ours_sorted
+        .iter()
+        .filter(|r| !mat_sorted.contains(r))
+        .collect();
+    assert!(
+        missing.is_empty() && extra.is_empty(),
+        "the emitted UnreachableObjectsHistogram must match MAT's own .index \
+         record for record — (class name, class-object address, unreachable \
+         count, summed shallow size).\n  MAT has, we lack: {missing:?}\n  we \
+         emit, MAT lacks: {extra:?}"
+    );
+
+    // Name the one record the class-object rule governs, so a future regression
+    // fails with a pointed message rather than a whole-list dump.
+    let jlc = mat_sorted
+        .iter()
+        .find(|(n, _, _, _)| n == "java.lang.Class")
+        .expect("MAT's histogram has a java.lang.Class record");
+    let ours_jlc = ours_sorted
+        .iter()
+        .find(|(n, _, _, _)| n == "java.lang.Class")
+        .expect("our histogram has a java.lang.Class record");
+    assert_eq!(
+        ours_jlc, jlc,
+        "the java.lang.Class record must carry the unreachable class objects' \
+         OWN shallow sizes (MAT: {} / {}), not the used heap size of the classes \
+         they represent",
+        jlc.2, jlc.3
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Minimal Java object-serialization reader
 //
-// Only what this test needs: walk the stream correctly and collect
-// `(name, instanceSize)` from every `org.eclipse.mat.parser.model.ClassImpl`.
+// Only what these tests need: walk the stream correctly and collect the
+// `ClassImpl` fields and the `UnreachableObjectsHistogram$Record` records.
 // Written against the same grammar as `src/mat/serial.rs`'s writer.
 // ---------------------------------------------------------------------------
 
@@ -234,6 +327,7 @@ struct Desc {
 
 enum Val {
     Int(i32),
+    Long(i64),
     Str(String),
     Other,
 }
@@ -247,6 +341,9 @@ struct Reader<'a> {
     class_impls: Vec<(String, i32)>,
     /// `(class name, instanceCount)` for every ClassImpl in the stream.
     class_counts: Vec<(String, i32)>,
+    /// `(className, classAddress, objectCount, shallowHeapSize)` for every
+    /// `UnreachableObjectsHistogram$Record` in the stream.
+    uoh_records: Vec<(String, u64, i32, i64)>,
     /// `SnapshotInfo.numberOfObjects` / `numberOfClasses`, when seen.
     snapshot_info: Option<(i32, i32)>,
 }
@@ -260,6 +357,7 @@ impl<'a> Reader<'a> {
             descs: Vec::new(),
             class_impls: Vec::new(),
             class_counts: Vec::new(),
+            uoh_records: Vec::new(),
             snapshot_info: None,
         }
     }
@@ -388,6 +486,9 @@ impl<'a> Reader<'a> {
         if ty == b'I' {
             return Val::Int(i32::from_be_bytes(raw.try_into().unwrap()));
         }
+        if ty == b'J' {
+            return Val::Long(i64::from_be_bytes(raw.try_into().unwrap()));
+        }
         Val::Other
     }
 
@@ -420,11 +521,18 @@ impl<'a> Reader<'a> {
         // chain; pick out whatever this test cares about.
         let is_class_impl = self.descs[d].name.ends_with("ClassImpl");
         let is_snapshot_info = self.descs[d].name.ends_with("SnapshotInfo");
+        let is_uoh_record = self.descs[d]
+            .name
+            .ends_with("UnreachableObjectsHistogram$Record");
         let mut name: Option<String> = None;
         let mut size: Option<i32> = None;
         let mut count: Option<i32> = None;
         let mut objects: Option<i32> = None;
         let mut classes: Option<i32> = None;
+        let mut uoh_name: Option<String> = None;
+        let mut uoh_addr: Option<u64> = None;
+        let mut uoh_count: Option<i32> = None;
+        let mut uoh_shallow: Option<i64> = None;
         for (fname, v) in &vals {
             match (fname.as_str(), v) {
                 ("name", Val::Str(s)) => name = Some(s.clone()),
@@ -432,6 +540,10 @@ impl<'a> Reader<'a> {
                 ("instanceCount", Val::Int(i)) => count = Some(*i),
                 ("numberOfObjects", Val::Int(i)) => objects = Some(*i),
                 ("numberOfClasses", Val::Int(i)) => classes = Some(*i),
+                ("className", Val::Str(s)) => uoh_name = Some(s.clone()),
+                ("classAddress", Val::Long(l)) => uoh_addr = Some(*l as u64),
+                ("objectCount", Val::Int(i)) => uoh_count = Some(*i),
+                ("shallowHeapSize", Val::Long(l)) => uoh_shallow = Some(*l),
                 _ => {}
             }
         }
@@ -441,6 +553,13 @@ impl<'a> Reader<'a> {
             }
             if let (Some(n), Some(c)) = (name, count) {
                 self.class_counts.push((n, c));
+            }
+        }
+        if is_uoh_record {
+            if let (Some(n), Some(a), Some(c), Some(s)) =
+                (uoh_name, uoh_addr, uoh_count, uoh_shallow)
+            {
+                self.uoh_records.push((n, a, c, s));
             }
         }
         if is_snapshot_info {

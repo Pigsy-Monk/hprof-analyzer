@@ -6503,12 +6503,14 @@ fn run(
 
     // MAT: the `UnreachableObjectsHistogram` aggregates: per class row, how many
     // unreachable objects it holds and their summed size. MAT's per-object rule
-    // (`GarbageCleaner.createHistogramOfUnreachableObjects`): an array
-    // contributes its array size, a class object the used heap size of the class
-    // it represents, anything else its `heapSizePerInstance` — which is exactly
-    // our `shallow`. Class objects are recorded separately, as the row of the
-    // class each one represents, because only `emit_dot_index` knows those
-    // classes' used heap sizes.
+    // (`GarbageCleaner$CreateHistogramOfUnreachableObjectsChunk.call()`): an
+    // array contributes its array size, a class object the *shallow size of the
+    // class object itself* — MAT's `ClassImpl.getUsedHeapSize()`, i.e. its
+    // static-field bytes, NOT the size of the class it represents — and
+    // anything else its `heapSizePerInstance`, which is exactly our `shallow`.
+    // A class object's size is recorded under its own class's row
+    // (`java.lang.Class`), which is also `class_idx[i]` for every class object,
+    // so it is accumulated in the dedicated `classobj_shallow` field.
     //
     // Computed HERE rather than with the emit that consumes it: this scan reads
     // `g.idom`, and `build_model` — which runs before that emit so the report
@@ -6518,7 +6520,7 @@ fn run(
         let mut unreach = mat::MatUnreachableHist {
             count: vec![0i32; num_rows],
             shallow: vec![0i64; num_rows],
-            classobj_rows: Vec::new(),
+            classobj_shallow: 0,
         };
         for i in 0..g.n {
             if g.idom[i] != u32::MAX {
@@ -6529,9 +6531,12 @@ fn run(
                 continue;
             }
             unreach.count[row] += 1;
-            match g.class_obj_class_idx.get(&(i as u32)) {
-                Some(&crow) => unreach.classobj_rows.push(crow as i32),
-                None => unreach.shallow[row] += g.shallow[i] as i64,
+            if g.class_obj_class_idx.contains_key(&(i as u32)) {
+                // Class object: its own shallow (static-field bytes), summed
+                // into the `java.lang.Class` record.
+                unreach.classobj_shallow += g.shallow[i] as i64;
+            } else {
+                unreach.shallow[row] += g.shallow[i] as i64;
             }
         }
         Some(unreach)
